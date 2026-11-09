@@ -1,0 +1,22 @@
+services:
+  agy-acp-gateway:
+    build: .
+    image: agy-acp-gateway:local
+    container_name: agy-acp-gateway
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 2 vCPU / 8 GB host: each live agy worker ~300 MB
+      AGY_MAX_LIVE_WORKERS: "8"
+    volumes:
+      - ./data:/data
+    ports:
+      # loopback only: 18890 for local debugging, 18891 for the OpenResty /acp/ reverse proxy
+      - "127.0.0.1:18890:18890"
+      - "127.0.0.1:18891:18891"
+    mem_limit: 3200m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

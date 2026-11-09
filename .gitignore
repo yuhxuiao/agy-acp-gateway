@@ -1,0 +1,27 @@
+logs/
+runtime/*.pid
+runtime/mode
+runtime/gateway.db*
+runtime/pure-api-home/antigravity-cli
+runtime/pure-api-home/config/mcp_config.json
+bin/agy-acp-900k
+bin/*.manifest.json
+backups/
+*.bak-*
+bin/agy-acp-gateway
+__pycache__/
+.env
+.env.local
+
+# Internal governance, planning, and research docs (local-only, not published)
+.trellis/
+docs/
+AGENTS.md
+
+# Per-instance process identity and isolated test state
+runtime/control.lock
+runtime/*.start
+runtime/instance-*/
+
+# Immutable upgrade candidates, auth links and validation artifacts
+runtime/upgrades/

@@ -1,0 +1,779 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ACP 网关</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2314161b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M19.07 4.93A10 10 0 0 0 6.99 3.34'/%3E%3Cpath d='M4 6h.01'/%3E%3Cpath d='M2.29 9.62A10 10 0 1 0 21.31 8.35'/%3E%3Cpath d='M16.24 7.76A6 6 0 1 0 8.23 16.67'/%3E%3Cpath d='M12 18h.01'/%3E%3Cpath d='M17.99 11.66A6 6 0 0 1 15.77 16.67'/%3E%3Ccircle cx='12' cy='12' r='2'/%3E%3Cpath d='m13.41 10.59 5.66-5.66'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --paper: #f3f0e8;
+    --paper-hi: #fbfaf6;
+    --card: rgba(255, 254, 250, 0.78);
+    --ink: #14161b;
+    --ink-2: #474b55;
+    --ink-3: #8a8e97;
+    --ink-4: #b9bcc2;
+    --line: rgba(20, 22, 27, 0.08);
+    --line-2: rgba(20, 22, 27, 0.14);
+    --gem: #2c57f5;
+    --gem-soft: rgba(44, 87, 245, 0.1);
+    --cla: #c0532b;
+    --cla-soft: rgba(192, 83, 43, 0.1);
+    --gpt: #0e8a66;
+    --gpt-soft: rgba(14, 138, 102, 0.1);
+    --other: #7a7f8a;
+    --ok: #1d8a5a;
+    --warn: #b7791f;
+    --bad: #c2362f;
+    --display: "Bahnschrift", "DIN Alternate", "Barlow Semi Condensed", "Roboto Condensed", "Arial Narrow", "Noto Sans CJK SC", sans-serif;
+    --sans: "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", "Noto Sans CJK SC", "Noto Sans SC", sans-serif;
+    --mono: "Cascadia Mono", "JetBrains Mono", "SF Mono", "IBM Plex Mono", Consolas, "Noto Sans Mono", monospace;
+    --r: 18px;
+    --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--paper); }
+  body {
+    margin: 0;
+    color: var(--ink);
+    font: 14px/1.5 var(--sans);
+    background:
+      radial-gradient(1100px 520px at 8% -8%, rgba(44, 87, 245, 0.09), transparent 62%),
+      radial-gradient(900px 480px at 96% 4%, rgba(192, 83, 43, 0.08), transparent 60%),
+      radial-gradient(800px 600px at 60% 108%, rgba(14, 138, 102, 0.07), transparent 60%),
+      var(--paper);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.35;
+    mix-blend-mode: multiply;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0.08 0 0 0 0 0.08 0 0 0 0 0.1 0 0 0 0 0.06 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    z-index: 0;
+  }
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 96px 96px;
+    mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.5), transparent 420px);
+    z-index: 0;
+  }
+  .wrap { position: relative; z-index: 1; max-width: 1440px; margin: 0 auto; padding: 22px 36px 64px; }
+
+  svg.ic { width: 16px; height: 16px; flex: none; stroke-width: 1.8; vertical-align: -3px; }
+  .num { font-family: var(--display); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .dim { color: var(--ink-3); }
+
+  /* top bar */
+  .top {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 6px 0 22px; border-bottom: 1px solid var(--line-2);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand-mark {
+    width: 36px; height: 36px; border-radius: 11px; display: grid; place-items: center;
+    background: var(--ink); color: var(--paper-hi);
+    box-shadow: 0 8px 22px -10px rgba(20, 22, 27, 0.6);
+  }
+  .brand-mark svg.ic { width: 19px; height: 19px; }
+  .brand h1 { margin: 0; font: 600 18px/1.1 var(--display); letter-spacing: 0.01em; }
+  .status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 12px;
+    border: 1px solid var(--line-2); border-radius: 999px; background: var(--card);
+    color: var(--ink-2); font-size: 12.5px; backdrop-filter: blur(8px);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 0 rgba(29, 138, 90, 0.5); animation: pulse 2.4s infinite; }
+  .dot.off { background: var(--ink-4); animation: none; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(29, 138, 90, 0.45); } 70% { box-shadow: 0 0 0 9px rgba(29, 138, 90, 0); } 100% { box-shadow: 0 0 0 0 rgba(29, 138, 90, 0); } }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 13px;
+    border-radius: 999px; border: 1px solid var(--line-2); background: var(--card); font-size: 12.5px;
+    transition: transform 0.25s var(--ease), background 0.25s, border-color 0.25s;
+  }
+  .btn:hover { transform: translateY(-1px); border-color: var(--ink-3); }
+  .btn.solid { background: var(--ink); color: var(--paper-hi); border-color: var(--ink); }
+  .btn.spin svg.ic { animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* hero */
+  .hero { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 40px; align-items: end; padding: 36px 0 24px; }
+  .eyebrow { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink-3); letter-spacing: 0.03em; }
+  .hero-num { font: 600 clamp(68px, 8.6vw, 124px)/0.92 var(--display); letter-spacing: -0.035em; margin: 12px 0 10px; font-stretch: condensed; }
+  .hero-num .unit { font-size: 0.34em; margin-left: 8px; color: var(--ink-3); font-weight: 500; letter-spacing: 0; }
+  .hero-cap { color: var(--ink-2); font-size: 13.5px; display: flex; gap: 20px; flex-wrap: wrap; }
+  .hero-cap b { color: var(--ink); font-weight: 600; font-family: var(--display); font-size: 15px; }
+  .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-left: 1px solid var(--line-2); }
+  .stat { padding: 4px 0 4px 22px; }
+  .stat + .stat { border-left: 1px solid var(--line); }
+  .stat .k { font-size: 12px; color: var(--ink-3); display: flex; gap: 6px; align-items: center; }
+  .stat .v { font: 600 40px/1.05 var(--display); margin-top: 8px; letter-spacing: -0.02em; }
+  .stat .v small { font-size: 0.45em; color: var(--ink-3); margin-left: 3px; font-weight: 500; }
+  .stat .s { font-size: 12px; color: var(--ink-3); margin-top: 4px; }
+
+  /* token river */
+  .river { margin: 6px 0 32px; }
+  .river-bar { display: flex; height: 13px; border-radius: 999px; overflow: hidden; background: rgba(20, 22, 27, 0.06); }
+  .river-bar i { display: block; height: 100%; transition: width 1s var(--ease); }
+  .river-legend { display: flex; gap: 26px; flex-wrap: wrap; margin-top: 12px; font-size: 12.5px; color: var(--ink-2); }
+  .river-legend span { display: inline-flex; align-items: center; gap: 8px; }
+  .river-legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .river-legend b { font-family: var(--display); font-size: 15px; color: var(--ink); font-weight: 600; }
+
+  /* modules */
+  .grid { display: grid; gap: 22px; }
+  .module {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--r);
+    backdrop-filter: blur(14px); box-shadow: 0 1px 0 rgba(255, 255, 255, 0.8) inset, 0 24px 48px -36px rgba(20, 22, 27, 0.35);
+    padding: 22px 24px; min-width: 0;
+  }
+  .m-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
+  .m-title { display: flex; align-items: center; gap: 10px; font: 600 16px/1.2 var(--sans); }
+  .m-title .ic-wrap { width: 30px; height: 30px; border-radius: 10px; display: grid; place-items: center; background: rgba(20, 22, 27, 0.06); }
+  .m-note { font-size: 12px; color: var(--ink-3); }
+  .seg { display: inline-flex; padding: 3px; border-radius: 999px; background: rgba(20, 22, 27, 0.05); border: 1px solid var(--line); }
+  .seg button { border: 0; background: transparent; height: 28px; padding: 0 12px; border-radius: 999px; font-size: 12.5px; color: var(--ink-2); transition: background 0.25s, color 0.25s; display: inline-flex; align-items: center; gap: 6px; }
+  .seg button.on { background: var(--ink); color: var(--paper-hi); }
+
+  /* quota */
+  .quota { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+  .pool { padding: 4px 26px 2px 0; }
+  .pool + .pool { padding: 4px 0 2px 26px; border-left: 1px dashed var(--line-2); }
+  .pool-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .pool-name { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; }
+  .swatch { width: 10px; height: 26px; border-radius: 4px; }
+  .pool-models { font-size: 12px; color: var(--ink-3); }
+  .gauges { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 18px 0 14px; }
+  .gauge { display: flex; align-items: center; gap: 16px; }
+  .gauge > svg { width: 104px; height: 104px; transform: rotate(-90deg); flex: none; }
+  .gauge circle { fill: none; stroke-width: 9; }
+  .gauge .track { stroke: rgba(20, 22, 27, 0.07); }
+  .gauge .val { stroke-linecap: round; transition: stroke-dashoffset 1.1s var(--ease), stroke 0.4s; }
+  .g-txt .k { font-size: 12px; color: var(--ink-3); }
+  .g-txt .v { font: 600 34px/1 var(--display); margin: 4px 0 6px; letter-spacing: -0.02em; }
+  .g-txt .v small { font-size: 0.5em; color: var(--ink-3); font-weight: 500; }
+  .g-txt .s { font-size: 12px; color: var(--ink-2); display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .pool-foot { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .pool-foot .k { font-size: 11.5px; color: var(--ink-3); }
+  .pool-foot .v { font: 600 18px/1.3 var(--display); }
+
+  /* models + usage */
+  .mu { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 0; }
+  .lanes { padding-right: 26px; }
+  .lane {
+    display: grid; grid-template-columns: minmax(210px, 1.05fr) minmax(80px, 1fr) 70px 88px 76px 104px; gap: 14px; align-items: center;
+    padding: 13px 10px; border-radius: 12px; transition: background 0.25s;
+  }
+  .lane:hover { background: rgba(20, 22, 27, 0.035); }
+  .lane + .lane { border-top: 1px solid var(--line); }
+  .lane.head { padding-top: 0; padding-bottom: 8px; font-size: 11.5px; color: var(--ink-3); }
+  .lane.head:hover { background: none; }
+  .lane.zero { opacity: 0.45; }
+  .mname { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .mname b { font-weight: 600; white-space: nowrap; }
+  .mname .tag { font-size: 10.5px; color: var(--ink-3); border: 1px solid var(--line-2); border-radius: 999px; padding: 0 6px; line-height: 17px; white-space: nowrap; flex: none; }
+  .mdot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .share { height: 8px; border-radius: 999px; background: rgba(20, 22, 27, 0.06); overflow: hidden; }
+  .share i { display: block; height: 100%; border-radius: 999px; transition: width 0.9s var(--ease); }
+  .lane .r { text-align: right; }
+  .lane .big { font: 600 16px/1.2 var(--display); }
+  .lane .sm { font-size: 11.5px; color: var(--ink-3); }
+  .usage { padding-left: 26px; border-left: 1px dashed var(--line-2); display: flex; flex-direction: column; justify-content: space-between; gap: 16px; }
+  .u-cost { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .u-cost .v { font: 600 44px/1 var(--display); letter-spacing: -0.02em; }
+  .u-cost .v small { font-size: 0.42em; color: var(--ink-3); margin-right: 3px; font-weight: 500; }
+  .u-rows { display: flex; flex-direction: column; gap: 13px; }
+  .u-row { display: grid; grid-template-columns: 22px 1fr auto auto; gap: 10px; align-items: center; }
+  .u-row .lbl { color: var(--ink-2); }
+  .u-row .t { font: 600 15px/1 var(--display); min-width: 74px; text-align: right; }
+  .u-row .c { font-size: 12px; color: var(--ink-3); min-width: 68px; text-align: right; font-family: var(--mono); }
+  .kv-line { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--ink-2); padding-top: 12px; border-top: 1px solid var(--line); }
+  .kv-line b { font-family: var(--display); font-size: 15px; color: var(--ink); }
+
+  /* sessions */
+  .sessions { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  .sess { border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; background: var(--paper-hi); }
+  .sess-top { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .sess-name { font-weight: 600; display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .sess-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .state { font-size: 11.5px; border-radius: 999px; padding: 1px 9px; border: 1px solid; }
+  .state.idle { color: var(--ok); border-color: rgba(29, 138, 90, 0.3); }
+  .state.busy { color: var(--gem); border-color: rgba(44, 87, 245, 0.3); }
+  .state.parked { color: var(--warn); border-color: rgba(183, 121, 31, 0.35); }
+  .sess-meta { display: flex; gap: 12px; flex-wrap: wrap; color: var(--ink-3); font-size: 12px; margin: 8px 0 10px; }
+  .sess-meta span { display: inline-flex; align-items: center; gap: 5px; }
+  .ctx { height: 6px; border-radius: 999px; background: rgba(20, 22, 27, 0.06); overflow: hidden; }
+  .ctx i { display: block; height: 100%; border-radius: 999px; transition: width 0.9s var(--ease); }
+  .ctx-cap { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--ink-3); margin-top: 6px; }
+  .empty { display: flex; align-items: center; gap: 10px; color: var(--ink-3); padding: 14px 4px; }
+  .empty svg.ic { width: 18px; height: 18px; }
+
+  /* log */
+  .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-weight: 500; font-size: 11.5px; color: var(--ink-3); padding: 0 10px 10px; border-bottom: 1px solid var(--line-2); white-space: nowrap; }
+  td { padding: 11px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
+  th.r, td.r { text-align: right; }
+  tr.row { cursor: pointer; transition: background 0.2s; }
+  tr.row:hover { background: rgba(20, 22, 27, 0.03); }
+  tr.row .chev svg.ic { transition: transform 0.3s var(--ease); color: var(--ink-4); }
+  tr.row.open .chev svg.ic { transform: rotate(90deg); color: var(--ink); }
+  tr.detail td { background: var(--paper-hi); padding: 0; }
+  .det { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px 22px; padding: 16px 22px 18px 44px; animation: drop 0.35s var(--ease); }
+  @keyframes drop { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  .det .k { font-size: 11.5px; color: var(--ink-3); }
+  .det .v { font-family: var(--mono); font-size: 13px; margin-top: 2px; }
+  .det .v em { font-style: normal; color: var(--ink-3); margin-left: 6px; font-size: 12px; }
+  .mtag { display: inline-flex; align-items: center; gap: 7px; }
+  .mtag .tier { font-size: 10.5px; color: var(--ink-3); border: 1px solid var(--line-2); border-radius: 999px; padding: 0 6px; line-height: 16px; }
+  .think { display: inline-flex; align-items: center; gap: 5px; color: var(--gem); font-size: 12.5px; }
+  .hit { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
+  .hit .bar { width: 46px; height: 5px; border-radius: 999px; background: rgba(20, 22, 27, 0.07); overflow: hidden; }
+  .hit .bar i { display: block; height: 100%; }
+  .more { display: flex; justify-content: center; margin-top: 16px; }
+
+  /* reveal */
+  .reveal { opacity: 0; transform: translateY(14px); animation: rise 0.9s var(--ease) forwards; animation-delay: var(--d, 0ms); }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .reveal { opacity: 1; transform: none; }
+  }
+  @media (max-width: 1180px) {
+    .hero, .quota, .mu { grid-template-columns: 1fr; }
+    .pool + .pool, .usage { border-left: 0; padding-left: 0; border-top: 1px dashed var(--line-2); padding-top: 20px; margin-top: 18px; }
+    .lanes { padding-right: 0; }
+    .stats { border-left: 0; }
+    .stat:first-child { padding-left: 0; }
+  }
+  @media (max-width: 760px) {
+    .wrap { padding: 16px; }
+    .lane { grid-template-columns: 1fr 70px 80px; }
+    .lane > :nth-child(2), .lane > :nth-child(5), .lane > :nth-child(6) { display: none; }
+    .gauges { grid-template-columns: 1fr; }
+    .det { grid-template-columns: 1fr 1fr; padding-left: 18px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top reveal" style="--d:0ms">
+    <div class="brand">
+      <div class="brand-mark" data-ic="radar"></div>
+      <h1>ACP 网关</h1>
+    </div>
+    <div class="status">
+      <span class="pill"><span class="dot" id="live-dot"></span><span id="live-txt">就绪</span></span>
+      <span class="pill" data-ic-before="clock"><span id="sync-time">--</span></span>
+      <button class="btn" id="auto-btn" onclick="toggleAuto()"><span data-ic="pause" id="auto-ic"></span><span id="auto-txt">自动刷新</span></button>
+      <button class="btn solid" id="sync-btn" onclick="syncQuota()"><span data-ic="refresh-cw"></span>同步额度</button>
+    </div>
+  </header>
+
+  <section class="hero">
+    <div class="reveal" style="--d:80ms">
+      <div class="eyebrow"><span data-ic="layers"></span><span id="hero-win-lbl">24 小时</span>总吞吐 Token</div>
+      <div class="hero-num"><span id="hero-tokens">--</span><span class="unit">Token</span></div>
+      <div class="hero-cap">
+        <span>命中缓存 <b id="hero-cr">--</b></span>
+        <span>新增输入 <b id="hero-in">--</b></span>
+        <span>输出 <b id="hero-out">--</b></span>
+        <span>调用 <b id="hero-steps">--</b> 步</span>
+      </div>
+    </div>
+    <div class="stats reveal" style="--d:160ms">
+      <div class="stat">
+        <div class="k"><span data-ic="database"></span>缓存命中率</div>
+        <div class="v num"><span id="st-hit">--</span><small>%</small></div>
+        <div class="s" id="st-hit-s">--</div>
+      </div>
+      <div class="stat">
+        <div class="k"><span data-ic="timer"></span>平均首字延迟</div>
+        <div class="v num"><span id="st-ttft">--</span><small id="st-ttft-u">秒</small></div>
+        <div class="s" id="st-ttft-s">--</div>
+      </div>
+      <div class="stat">
+        <div class="k"><span data-ic="cpu"></span>驻留会话池</div>
+        <div class="v num"><span id="st-sess">0</span><small id="st-sess-cap">/ 8</small></div>
+        <div class="s" id="st-sess-s">--</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="river reveal" style="--d:220ms">
+    <div class="river-bar" id="river-bar"></div>
+    <div class="river-legend" id="river-legend"></div>
+  </section>
+
+  <div class="grid">
+    <section class="module reveal" style="--d:280ms">
+      <div class="m-head">
+        <div class="m-title"><span class="ic-wrap" data-ic="gauge"></span>额度池</div>
+        <span class="m-note" id="quota-note"></span>
+      </div>
+      <div class="quota">
+        <div class="pool" id="pool-gem"></div>
+        <div class="pool" id="pool-3p"></div>
+      </div>
+    </section>
+
+    <section class="module reveal" style="--d:340ms">
+      <div class="m-head">
+        <div class="m-title"><span class="ic-wrap" data-ic="activity"></span>模型与 Token 统计</div>
+        <div class="seg" id="win-seg">
+          <button data-w="window5h">5 小时</button>
+          <button data-w="last24h">24 小时</button>
+          <button data-w="windowWeekly">7 天</button>
+          <button data-w="allTime">全部</button>
+        </div>
+      </div>
+      <div class="mu">
+        <div class="lanes" id="lanes"></div>
+        <div class="usage" id="usage"></div>
+      </div>
+    </section>
+
+    <section class="module reveal" style="--d:400ms">
+      <div class="m-head">
+        <div class="m-title"><span class="ic-wrap" data-ic="boxes"></span>活跃会话</div>
+        <span class="m-note" id="sess-note"></span>
+      </div>
+      <div id="sessions"></div>
+    </section>
+
+    <section class="module reveal" style="--d:460ms">
+      <div class="m-head">
+        <div class="m-title"><span class="ic-wrap" data-ic="list"></span>调用流水</div>
+        <div class="filters">
+          <div class="seg" id="tab-seg">
+            <button data-t="db" class="on">单步明细</button>
+            <button data-t="gw">网关轮次</button>
+          </div>
+          <div class="seg" id="fam-seg">
+            <button data-f="ALL" class="on">全部模型</button>
+            <button data-f="gemini">Gemini</button>
+            <button data-f="claude">Claude</button>
+            <button data-f="gpt">GPT</button>
+          </div>
+        </div>
+      </div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead id="log-head"></thead>
+          <tbody id="log-body"></tbody>
+        </table>
+      </div>
+      <div class="more"><button class="btn" id="more-btn" onclick="showMore()"><span data-ic="chevron-down"></span><span id="more-txt">显示更多</span></button></div>
+    </section>
+  </div>
+</div>
+
+<script>
+/*__LUCIDE__*/
+const svg = (name, extra = '') => ICONS[name]
+  ? '<svg class="ic ' + extra + '" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ICONS[name] + '</svg>'
+  : '';
+function hydrateIcons(root = document) {
+  root.querySelectorAll('[data-ic]').forEach(el => {
+    if (el.dataset.icDone) return;
+    el.insertAdjacentHTML('afterbegin', svg(el.dataset.ic));
+    el.dataset.icDone = '1';
+  });
+  root.querySelectorAll('[data-ic-before]').forEach(el => {
+    if (el.dataset.icDone) return;
+    el.insertAdjacentHTML('afterbegin', svg(el.dataset.icBefore));
+    el.dataset.icDone = '1';
+  });
+}
+
+const FAM = {
+  gemini: { color: 'var(--gem)', soft: 'var(--gem-soft)' },
+  claude: { color: 'var(--cla)', soft: 'var(--cla-soft)' },
+  gpt: { color: 'var(--gpt)', soft: 'var(--gpt-soft)' },
+  other: { color: 'var(--other)', soft: 'rgba(122,127,138,.1)' },
+};
+const TIER = { low: '低', medium: '中', high: '高' };
+const MODE = { cold_start: '冷启动', parked_mcp_resume: '工具续接', sticky_delta: '增量复用', keepalive_fast_ack: '保活秒回', keepalive_ping: '后台保活', compaction_rollover: '压缩重建' };
+const STOP = { tool_use: '调用工具', end_turn: '完成', max_tokens: '截断' };
+const WIN_LABEL = { window5h: '5 小时', last24h: '24 小时', windowWeekly: '7 天', allTime: '全部' };
+
+const state = {
+  auto: true,
+  win: localStorage.getItem('acp.win') || 'last24h',
+  tab: 'db',
+  fam: 'ALL',
+  limit: 30,
+  open: new Set(),
+  data: null,
+};
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = (n) => Number(n || 0).toLocaleString('en-US');
+const unit = (n) => {
+  n = Number(n || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e8 ? 1 : 2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return fmt(Math.round(n));
+};
+const usd = (n, d = 2) => '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+const dur = (ms) => !ms || ms <= 0 ? '--' : ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
+const hhmm = (iso) => iso ? new Date(iso).toLocaleTimeString('zh-CN', { hour12: false }) : '--';
+const left = (iso) => {
+  if (!iso) return '--';
+  const ms = Date.parse(iso) - Date.now();
+  if (ms <= 0) return '重置中';
+  const d = Math.floor(ms / 864e5), h = Math.floor(ms % 864e5 / 36e5), m = Math.floor(ms % 36e5 / 6e4);
+  return d > 0 ? d + '天' + h + '小时' : h > 0 ? h + '小时' + m + '分' : m + '分';
+};
+const famOf = (id) => /^claude/.test(id || '') ? 'claude' : /^gpt/.test(id || '') ? 'gpt' : /^gemini/.test(id || '') ? 'gemini' : 'other';
+const hitColor = (p) => p >= 95 ? 'var(--ok)' : p >= 60 ? 'var(--warn)' : p > 0 ? 'var(--bad)' : 'var(--ink-4)';
+
+const tweens = new Map();
+function setNum(id, value, format) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const prev = tweens.has(id) ? tweens.get(id) : 0;
+  tweens.set(id, value);
+  if (prev === value) { el.textContent = format(value); return; }
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduce) { el.textContent = format(value); return; }
+  const t0 = performance.now(), D = 900;
+  const step = (t) => {
+    const k = Math.min(1, (t - t0) / D), e = 1 - Math.pow(1 - k, 3);
+    el.textContent = format(prev + (value - prev) * e);
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+function gaugeSvg(id, color) {
+  return '<svg viewBox="0 0 104 104"><circle class="track" cx="52" cy="52" r="42"/>' +
+    '<circle class="val" id="' + id + '" cx="52" cy="52" r="42" stroke="' + color + '" stroke-dasharray="263.9" stroke-dashoffset="263.9"/></svg>';
+}
+function setGauge(id, frac) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const f = Math.max(0, Math.min(1, frac));
+  el.style.strokeDashoffset = String(263.9 * (1 - f));
+  el.style.stroke = f < 0.15 ? 'var(--bad)' : f < 0.35 ? 'var(--warn)' : el.getAttribute('stroke');
+}
+
+/* ---------- quota pools ---------- */
+function buildPools() {
+  const tpl = (key, name, models, color) => `
+    <div class="pool-head">
+      <div class="pool-name"><span class="swatch" style="background:${color}"></span>${name}</div>
+      <span class="pool-models">${models}</span>
+    </div>
+    <div class="gauges">
+      <div class="gauge">${gaugeSvg('g-' + key + '-5h', color)}
+        <div class="g-txt"><div class="k">5 小时剩余</div><div class="v num"><span id="v-${key}-5h">--</span><small>%</small></div><div class="s">${svg('hourglass')}<span id="r-${key}-5h">--</span></div></div>
+      </div>
+      <div class="gauge">${gaugeSvg('g-' + key + '-wk', color)}
+        <div class="g-txt"><div class="k">7 天剩余</div><div class="v num"><span id="v-${key}-wk">--</span><small>%</small></div><div class="s">${svg('hourglass')}<span id="r-${key}-wk">--</span></div></div>
+      </div>
+    </div>
+    <div class="pool-foot" id="f-${key}"></div>`;
+  document.getElementById('pool-gem').innerHTML = tpl('gem', 'Gemini 组', 'Argon · Flash', 'var(--gem)');
+  document.getElementById('pool-3p').innerHTML = tpl('tp', 'Claude / GPT 组', 'Opus · Sonnet · GPT-OSS', 'var(--cla)');
+}
+
+function renderPools(d) {
+  const g = (d.quota.groups || []).find(x => /gemini/i.test(x.name)) || {};
+  const b5 = (g.buckets || []).find(x => x.window === '5h') || {};
+  const bw = (g.buckets || []).find(x => x.window === 'weekly') || {};
+  const ded = d.quota.deduction || {};
+  const r5 = b5.remainingFraction ?? 1, rw = bw.remainingFraction ?? 1;
+  setNum('v-gem-5h', r5 * 100, v => v.toFixed(1));
+  setNum('v-gem-wk', rw * 100, v => v.toFixed(1));
+  setGauge('g-gem-5h', r5); setGauge('g-gem-wk', rw);
+  document.getElementById('r-gem-5h').textContent = left(b5.resetTime);
+  document.getElementById('r-gem-wk').textContent = left(bw.resetTime);
+  document.getElementById('f-gem').innerHTML = `
+    <div><div class="k">5 小时已用</div><div class="v">${usd(ded.poolUsed5hUsd)} <span class="dim" style="font-size:12px">/ $200</span></div></div>
+    <div><div class="k">7 天已用</div><div class="v">${usd(ded.poolUsedWeeklyUsd)} <span class="dim" style="font-size:12px">/ $800</span></div></div>
+    <div><div class="k">5 小时剩余可跑</div><div class="v">${unit(ded.rem5hTokensAt99PctCache)} <span class="dim" style="font-size:12px">Token</span></div></div>`;
+
+  const tp = d.quota.thirdPartyPool || {};
+  const t5 = tp.window5h || {}, tw = tp.windowWeekly || {};
+  const tr5 = t5.remainingFraction ?? 1, trw = tw.remainingFraction ?? 1;
+  setNum('v-tp-5h', tr5 * 100, v => v.toFixed(1));
+  setNum('v-tp-wk', trw * 100, v => v.toFixed(1));
+  setGauge('g-tp-5h', tr5); setGauge('g-tp-wk', trw);
+  document.getElementById('r-tp-5h').textContent = left(t5.reset);
+  document.getElementById('r-tp-wk').textContent = left(tw.reset);
+  document.getElementById('f-tp').innerHTML = `
+    <div><div class="k">5 小时实耗</div><div class="v">${usd(t5.localCostUsd)} <span class="dim" style="font-size:12px">${fmt(t5.steps)} 步</span></div></div>
+    <div><div class="k">7 天实耗</div><div class="v">${usd(tw.localCostUsd)} <span class="dim" style="font-size:12px">${fmt(tw.steps)} 步</span></div></div>
+    <div><div class="k">推算 5 小时上限</div><div class="v">${t5.impliedCapUsd ? '≈ ' + usd(t5.impliedCapUsd) : '<span class="dim" style="font-size:13px">--</span>'}</div></div>`;
+  document.getElementById('quota-note').textContent = d.quota.status === 'ok' ? hhmm(d.quota.updatedAt) : '';
+}
+
+/* ---------- hero ---------- */
+function renderHero(d) {
+  const w = d.windows[state.win];
+  const totTok = (w.alignedCr || 0) + (w.alignedIn || 0) + (w.outTok || 0);
+  document.getElementById('hero-win-lbl').textContent = WIN_LABEL[state.win];
+  document.getElementById('hero-tokens').textContent = unit(totTok);
+  document.getElementById('hero-cr').textContent = unit(w.alignedCr);
+  document.getElementById('hero-in').textContent = unit(w.alignedIn);
+  document.getElementById('hero-out').textContent = unit(w.outTok);
+  document.getElementById('hero-steps').textContent = fmt(w.stepsCount);
+
+  setNum('st-hit', w.alignedHitRate || 0, v => v.toFixed(1));
+  document.getElementById('st-hit-s').textContent = '≥99% 命中 ' + fmt(w.hits99) + ' / ' + fmt(w.stepsCount) + ' 步';
+
+  const t = w.avgTtftMs || 0;
+  setNum('st-ttft', t >= 1000 ? t / 1000 : t, v => t >= 1000 ? v.toFixed(1) : String(Math.round(v)));
+  document.getElementById('st-ttft-u').textContent = t >= 1000 ? '秒' : '毫秒';
+  document.getElementById('st-ttft-s').textContent = '均速 ' + (w.avgTps || 0) + ' tok/s';
+
+  const sessList = d.liveSessions || [];
+  const busyCnt = sessList.filter(s => s.status === 'BUSY').length;
+  const parkedCnt = sessList.filter(s => s.status === 'PARKED').length;
+  const maxW = d.gateway.maxLiveWorkers || 8;
+  document.getElementById('st-sess').textContent = String(sessList.length);
+  document.getElementById('st-sess-cap').textContent = '/ ' + maxW;
+  document.getElementById('st-sess-s').textContent = busyCnt || parkedCnt
+    ? busyCnt + ' 推理中 · ' + parkedCnt + ' 等工具'
+    : sessList.length ? '全部空闲待命' : '空闲休眠中';
+
+  const parts = [
+    ['命中缓存', w.alignedCr, 'var(--ok)'],
+    ['新增输入', w.alignedIn, 'var(--gem)'],
+    ['可见输出', Math.max(0, w.outTok - w.thTok), 'var(--cla)'],
+    ['思考', w.thTok, 'var(--warn)'],
+  ];
+  const tot = parts.reduce((a, p) => a + p[1], 0) || 1;
+  const bar = document.getElementById('river-bar');
+  if (!bar.children.length) bar.innerHTML = parts.map(p => '<i style="width:0;background:' + p[2] + '"></i>').join('');
+  [...bar.children].forEach((el, i) => { el.style.width = (parts[i][1] / tot * 100).toFixed(3) + '%'; });
+  document.getElementById('river-legend').innerHTML =
+    parts.map(p => '<span><i style="background:' + p[2] + '"></i>' + p[0] + ' <b>' + unit(p[1]) + '</b></span>').join('');
+}
+
+/* ---------- models + usage ---------- */
+function renderModels(d) {
+  const w = d.windows[state.win];
+  const reg = d.gateway.models || [];
+  const rows = (w.models || []).slice();
+  for (const m of reg) if (!rows.find(r => r.modelId === m.id)) rows.push({ modelId: m.id, modelLabel: m.label, family: m.family, steps: 0, costUsd: 0 });
+  const maxTok = Math.max(...rows.map(r => (r.rawIn || 0) + (r.rawCr || 0) + (r.outTok || 0)), 1);
+  const head = '<div class="lane head"><span>模型</span><span>Token 占比</span><span class="r">步数</span><span class="r">Token 总量</span><span class="r">命中率</span><span class="r">首字 · 速度</span></div>';
+  document.getElementById('lanes').innerHTML = head + rows.map(r => {
+    const f = FAM[r.family] || FAM.other;
+    const tiers = r.tiers ? Object.entries(r.tiers).sort((a, b) => b[1] - a[1]).map(([k]) => TIER[k] || k).join('/') : '';
+    const mTok = (r.rawIn || 0) + (r.rawCr || 0) + (r.outTok || 0);
+    return `<div class="lane ${r.steps ? '' : 'zero'}">
+      <div class="mname"><span class="mdot" style="background:${f.color}"></span><b>${esc(r.modelLabel)}</b>${tiers ? '<span class="tag">' + tiers + '</span>' : ''}</div>
+      <div class="share"><i style="width:${(mTok / maxTok * 100).toFixed(2)}%;background:${f.color}"></i></div>
+      <div class="r big">${r.steps ? fmt(r.steps) : '--'}</div>
+      <div class="r big">${r.steps ? unit(mTok) : '--'}</div>
+      <div class="r">${r.steps ? '<span class="big" style="color:' + hitColor(r.hitRate) + '">' + r.hitRate + '%</span>' : '--'}</div>
+      <div class="r">${r.steps ? '<span class="big">' + dur(r.avgTtftMs) + '</span><div class="sm">' + r.avgTps + ' tok/s</div>' : '--'}</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('usage').innerHTML = `
+    <div>
+      <div class="m-note">${WIN_LABEL[state.win]}费用合计</div>
+      <div class="u-cost"><div class="v num"><small>$</small>${Number(w.costUsd || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+      <span class="m-note">${fmt(w.stepsCount)} 步</span></div>
+    </div>
+    <div class="u-rows">
+      <div class="u-row"><span style="color:var(--ok)">${svg('database')}</span><span class="lbl">命中缓存</span><span class="t">${unit(w.alignedCr)}</span><span class="c">${usd(w.cacheCostUsd)}</span></div>
+      <div class="u-row"><span style="color:var(--gem)">${svg('arrow-up-right')}</span><span class="lbl">新增输入</span><span class="t">${unit(w.alignedIn)}</span><span class="c">${usd(w.inputCostUsd)}</span></div>
+      <div class="u-row"><span style="color:var(--cla)">${svg('sparkles')}</span><span class="lbl">输出</span><span class="t">${unit(w.outTok)}</span><span class="c">${usd(w.outputCostUsd)}</span></div>
+      <div class="u-row"><span style="color:var(--warn)">${svg('brain')}</span><span class="lbl">思考链</span><span class="t">${unit(w.thTok)}</span><span class="c">${fmt(w.thinkingStepsCount)} 步</span></div>
+    </div>
+    <div class="kv-line"><span>平均缓存命中率</span><b>${w.alignedHitRate}%</b></div>`;
+}
+
+/* ---------- sessions ---------- */
+function renderSessions(d) {
+  const list = d.liveSessions || [];
+  const maxW = d.gateway.maxLiveWorkers || 8;
+  document.getElementById('sess-note').textContent = list.length + ' / ' + maxW;
+  const box = document.getElementById('sessions');
+  if (!list.length) {
+    box.innerHTML = '<div class="empty">' + svg('moon') + '<span>暂无活跃会话</span></div>';
+    return;
+  }
+  box.innerHTML = '<div class="sessions">' + list.map(s => {
+    const f = FAM[famOf(s.model)] || FAM.other;
+    const st = s.status === 'PARKED' ? ['parked', '等待工具'] : s.status === 'BUSY' ? ['busy', '推理中'] : ['idle', '空闲'];
+    const name = (s.convKey || '').startsWith('sid:') ? '会话 ' + s.convKey.split(':')[1].slice(0, 8) : (s.convKey || '').startsWith('util:') ? '轻量任务' : s.convKey;
+    return `<div class="sess">
+      <div class="sess-top"><div class="sess-name">${svg('bot')}<span>${esc(name)}</span></div><span class="state ${st[0]}">${st[1]}</span></div>
+      <div class="sess-meta">
+        <span class="mtag"><span class="mdot" style="background:${f.color}"></span>${esc(s.modelLabel || s.model || '--')}${s.thoughtLevel ? '<span class="tier">' + (TIER[s.thoughtLevel] || s.thoughtLevel) + '</span>' : ''}</span>
+        <span>${svg('history')}${s.messageCount} 条 · 复用 ${s.sessionReuses}</span>
+      </div>
+      <div class="ctx"><i style="width:${Math.min(100, s.contextPct || 0)}%;background:${f.color}"></i></div>
+      <div class="ctx-cap"><span>上下文 ${fmt(s.contextTokens)} / ${unit(s.contextWindow || 1048576)}</span><span>${hhmm(s.lastUsedAt)}</span></div>
+    </div>`;
+  }).join('') + '</div>';
+}
+
+/* ---------- log ---------- */
+function mtag(label, id, tier) {
+  const f = FAM[famOf(id)] || FAM.other;
+  return '<span class="mtag"><span class="mdot" style="background:' + f.color + '"></span>' + esc(label || id || '--') +
+    (tier ? '<span class="tier">' + (TIER[tier] || tier) + '</span>' : '') + '</span>';
+}
+function hitCell(pct) {
+  const c = hitColor(pct);
+  return '<span class="hit"><span class="bar"><i style="width:' + pct + '%;background:' + c + '"></i></span><b style="color:' + c + '">' + pct.toFixed(1) + '%</b></span>';
+}
+function det(k, v, sub) { return '<div><div class="k">' + k + '</div><div class="v">' + v + (sub ? '<em>' + sub + '</em>' : '') + '</div></div>'; }
+
+function renderLog(d) {
+  const head = document.getElementById('log-head');
+  const body = document.getElementById('log-body');
+  let rows, html = '';
+  if (state.tab === 'db') {
+    rows = (d.recentDbSteps || []).filter(r => state.fam === 'ALL' || famOf(r.modelId) === state.fam);
+    head.innerHTML = '<tr><th style="width:28px"></th><th>时间</th><th>模型</th><th class="r">总上下文</th><th class="r">命中缓存</th><th class="r">新增输入</th><th class="r">输出 / 思考</th><th class="r">首字 · 速度</th><th class="r">命中率</th><th class="r">费用</th></tr>';
+    for (const r of rows.slice(0, state.limit)) {
+      const key = 'db:' + r.sessionId + ':' + r.stepIdx;
+      const open = state.open.has(key);
+      const pct = parseFloat(r.alignedHitRate) || 0;
+      html += `<tr class="row ${open ? 'open' : ''}" data-k="${key}">
+        <td class="chev">${svg('chevron-right')}</td>
+        <td class="mono dim">${hhmm(r.ts)}</td>
+        <td>${mtag(r.modelLabel, r.modelId, r.modelTier)}</td>
+        <td class="r mono">${unit(r.totalCtx)}${r.tierMultiplier > 1 ? ' <span class="dim">×' + r.tierMultiplier + '</span>' : ''}</td>
+        <td class="r mono" style="color:var(--ok)">${unit(r.alignedCr)}</td>
+        <td class="r mono">${unit(r.alignedIn)}</td>
+        <td class="r mono">${fmt(r.outTok)}${r.hasThinking ? ' <span class="think">' + svg('brain') + fmt(r.thTok) + '</span>' : ''}</td>
+        <td class="r mono">${dur(r.ttftMs)} <span class="dim">· ${r.tps || 0}/s</span></td>
+        <td class="r">${hitCell(pct)}</td>
+        <td class="r mono"><b>${usd(r.costUsd, 4)}</b></td>
+      </tr>`;
+      if (open) {
+        html += `<tr class="detail"><td colspan="10"><div class="det">
+          ${det('模型', esc(r.modelLabel) + (r.modelTier ? ' · ' + (TIER[r.modelTier] || r.modelTier) + '档' : ''))}
+          ${det('会话 / 步号', esc(r.sessionId.slice(0, 18)), '#' + r.stepIdx)}
+          ${det('首字 / 总耗时', dur(r.ttftMs) + ' / ' + dur(r.elapsedMs), (r.tps || 0) + ' tok/s')}
+          ${det('计费倍率', '×' + r.tierMultiplier, r.quotaGroup === '3p' ? (r.tierMultiplier > 1 ? '超 200K (输入×2 / 输出×1.5 / 缓存×1)' : '200K 内 (1.0x)') : (r.tierMultiplier >= 1.8 ? '超 512K (1.8x)' : r.tierMultiplier > 1 ? '256K~512K (1.3x)' : '256K 内 (1.0x)'))}
+          ${det('命中缓存', fmt(r.alignedCr), usd(r.cacheCostUsd, 4))}
+          ${det('新增输入', fmt(r.alignedIn), usd(r.inputCostUsd, 4))}
+          ${det('输出 (含思考)', fmt(r.outTok), usd(r.outputCostUsd, 4))}
+          ${det('单步费用', usd(r.costUsd, 4))}
+        </div></td></tr>`;
+      }
+    }
+    if (!rows.length) html = '<tr><td colspan="10"><div class="empty">' + svg('inbox') + '<span>暂无调用记录</span></div></td></tr>';
+  } else {
+    rows = (d.gatewayTurns || []).filter(t => state.fam === 'ALL' || famOf(t.model) === state.fam);
+    head.innerHTML = '<tr><th style="width:28px"></th><th>时间 / 轮次</th><th>会话</th><th>模型</th><th>调度</th><th>结果</th><th class="r">首字 / 总耗时</th><th class="r">命中率</th><th class="r">费用</th></tr>';
+    for (const t of rows.slice(0, state.limit)) {
+      const key = 'gw:' + t.convKey + ':' + t.turnIndex;
+      const open = state.open.has(key);
+      const pct = parseFloat(t.cacheHitRate) || 0;
+      const name = (t.convKey || '').startsWith('sid:') ? t.convKey.split(':')[1].slice(0, 10) : (t.convKey || '').slice(0, 14);
+      html += `<tr class="row ${open ? 'open' : ''}" data-k="${esc(key)}">
+        <td class="chev">${svg('chevron-right')}</td>
+        <td class="mono dim">${t.ts ? hhmm(t.ts) + ' ' : ''}#${t.turnIndex}</td>
+        <td class="mono">${esc(name)}</td>
+        <td>${mtag(t.modelLabel, t.model, t.thoughtLevel)}</td>
+        <td>${MODE[t.mode] || esc(t.mode)}</td>
+        <td>${STOP[t.stopReason] || esc(t.stopReason)}</td>
+        <td class="r mono">${dur(t.ttftMs)} <span class="dim">/ ${dur(t.elapsedMs)}</span></td>
+        <td class="r">${hitCell(pct)}</td>
+        <td class="r mono"><b>${usd(t.costUsd, 4)}</b></td>
+      </tr>`;
+      if (open) {
+        html += `<tr class="detail"><td colspan="9"><div class="det">
+          ${det('会话 ID', esc((t.sessionId || '--').slice(0, 18)))}
+          ${det('命中缓存', fmt(t.cachedReadTokens))}
+          ${det('新增输入', fmt(t.inputTokens))}
+          ${det('输出', fmt(t.outputTokens), t.hasThinking ? '思考 ' + fmt(t.thinkingTokens) : '')}
+        </div></td></tr>`;
+      }
+    }
+    if (!rows.length) html = '<tr><td colspan="9"><div class="empty">' + svg('inbox') + '<span>暂无网关轮次</span></div></td></tr>';
+  }
+  body.innerHTML = html;
+  const more = document.getElementById('more-btn');
+  more.style.display = rows.length > state.limit ? '' : 'none';
+  document.getElementById('more-txt').textContent = '显示更多 (' + Math.min(rows.length, state.limit) + ' / ' + rows.length + ')';
+}
+
+/* ---------- top bar ---------- */
+function renderTop(d) {
+  document.getElementById('sync-time').textContent = hhmm(d.now);
+  const n = d.gateway.activeSessionsCount || 0;
+  document.getElementById('live-dot').className = 'dot' + (n ? '' : ' off');
+  document.getElementById('live-txt').textContent = n ? n + ' 驻留' : '待命';
+}
+
+function render(d) {
+  state.data = d;
+  renderTop(d); renderHero(d); renderPools(d); renderModels(d); renderSessions(d); renderLog(d);
+}
+
+async function load(force = false) {
+  try {
+    const base = location.protocol.startsWith('http') ? '' : 'http://127.0.0.1:18891/';
+    const r = await fetch(base + 'api/dashboard' + (force ? '?refresh=1' : ''), { credentials: 'same-origin' });
+    render(await r.json());
+  } catch (e) {
+    document.getElementById('live-txt').textContent = '断开';
+    document.getElementById('live-dot').className = 'dot off';
+  }
+}
+
+/* ---------- interactions ---------- */
+function toggleAuto() {
+  state.auto = !state.auto;
+  const ic = document.getElementById('auto-ic');
+  ic.innerHTML = svg(state.auto ? 'pause' : 'play');
+  document.getElementById('auto-txt').textContent = state.auto ? '自动刷新' : '已暂停';
+}
+async function syncQuota() {
+  const b = document.getElementById('sync-btn');
+  b.classList.add('spin');
+  await load(true);
+  b.classList.remove('spin');
+}
+function showMore() { state.limit += 30; if (state.data) renderLog(state.data); }
+function bindSeg(id, attr, apply) {
+  const el = document.getElementById(id);
+  el.addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    el.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+    apply(b.dataset[attr]);
+  });
+}
+bindSeg('win-seg', 'w', (v) => { state.win = v; localStorage.setItem('acp.win', v); if (state.data) { renderModels(state.data); renderHero(state.data); } });
+bindSeg('tab-seg', 't', (v) => { state.tab = v; state.limit = 30; if (state.data) renderLog(state.data); });
+bindSeg('fam-seg', 'f', (v) => { state.fam = v; state.limit = 30; if (state.data) renderLog(state.data); });
+document.querySelectorAll('#win-seg button').forEach(b => b.classList.toggle('on', b.dataset.w === state.win));
+document.getElementById('log-body').addEventListener('click', (e) => {
+  const tr = e.target.closest('tr.row');
+  if (!tr) return;
+  const k = tr.dataset.k;
+  state.open.has(k) ? state.open.delete(k) : state.open.add(k);
+  if (state.data) renderLog(state.data);
+});
+
+hydrateIcons();
+buildPools();
+load(false);
+setInterval(() => { if (state.auto && !document.hidden) load(false); }, 2500);
+</script>
+</body>
+</html>
