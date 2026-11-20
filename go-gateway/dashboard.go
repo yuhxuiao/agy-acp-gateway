@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -97,6 +98,7 @@ const (
 	QuotaStateKnown      = "known"       // fresh official reading
 	QuotaStateStale      = "stale"       // last good reading, older than quotaStaleAfter or followed by a failed refresh
 	QuotaStateError      = "error"       // no reading at all (first /usage call failed)
+	QuotaStateLoading    = "loading"     // initial background /usage refresh in flight
 	QuotaStateNotEnabled = "not_enabled" // /usage answered but this model group (or every window) is absent
 )
 
@@ -247,6 +249,7 @@ var (
 	quotaMu            sync.Mutex
 	cachedQuota        *QuotaSnapshot
 	cachedQuotaAt      time.Time
+	lastQuotaErr       *QuotaSnapshot
 	lastQuotaAttemptAt time.Time
 	quotaFlightMu      sync.Mutex
 	quotaFlightWait    chan struct{}
@@ -359,27 +362,49 @@ func FetchOfficialQuota(force bool) QuotaSnapshot {
 	if hasCache {
 		snap = *cachedQuota
 	}
+	hasErr := lastQuotaErr != nil
+	var errSnap QuotaSnapshot
+	if hasErr {
+		errSnap = *lastQuotaErr
+	}
 	age := time.Since(cachedQuotaAt)
 	attemptAge := age
-	if !lastQuotaAttemptAt.IsZero() && lastQuotaAttemptAt.After(cachedQuotaAt) {
+	if !lastQuotaAttemptAt.IsZero() && (cachedQuotaAt.IsZero() || lastQuotaAttemptAt.After(cachedQuotaAt)) {
 		attemptAge = time.Since(lastQuotaAttemptAt)
 	}
 	quotaMu.Unlock()
 
 	// Non-blocking stale-while-revalidate for dashboard polling:
-	// If we already have a cached snapshot and force=false, return immediately in 0ms;
-	// trigger a background refresh when >15m old, when >3m old after a new turn, or >=30s after any resetTime passes.
-	if hasCache && !force {
-		lastTurn := lastGatewayTurn.Load()
-		resetPassed := age >= 30*time.Second && quotaHasExpiredReset(snap, time.Now())
-		needBg := attemptAge >= 30*time.Second && (age >= 15*time.Minute || (age >= 3*time.Minute && lastTurn > cachedQuotaAt.Unix()) || resetPassed)
+	// Never block GET /api/dashboard on the 5-22s /usage subprocess when force=false.
+	if !force {
+		if hasCache {
+			lastTurn := lastGatewayTurn.Load()
+			resetPassed := age >= 30*time.Second && quotaHasExpiredReset(snap, time.Now())
+			needBg := attemptAge >= 30*time.Second && (age >= 15*time.Minute || (age >= 3*time.Minute && lastTurn > cachedQuotaAt.Unix()) || resetPassed)
+			if needBg && quotaRefreshing.CompareAndSwap(false, true) {
+				go func() {
+					defer quotaRefreshing.Store(false)
+					_ = fetchOfficialQuotaSync()
+				}()
+			}
+			return snap
+		}
+		// Cold start or previous error: trigger background refresh (with 30s error cooldown) and return immediately.
+		needBg := !hasErr || attemptAge >= 30*time.Second
 		if needBg && quotaRefreshing.CompareAndSwap(false, true) {
 			go func() {
 				defer quotaRefreshing.Store(false)
 				_ = fetchOfficialQuotaSync()
 			}()
 		}
-		return snap
+		if hasErr {
+			return errSnap
+		}
+		return QuotaSnapshot{
+			Status:    QuotaStateLoading,
+			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+			Groups:    []QuotaGroup{},
+		}
 	}
 	return fetchOfficialQuotaSync()
 }
@@ -409,20 +434,64 @@ func fetchOfficialQuotaSync() QuotaSnapshot {
 	return res
 }
 
-func fetchOfficialQuotaDo() QuotaSnapshot {
-	ctx, cancel := context.WithTimeout(context.Background(), 22*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, quotaAgyBin(), "-p", "/usage", "--output-format", "json")
-	env := os.Environ()
+// quotaCmdEnv builds the subprocess environment for `<agy> -p /usage`.
+// When PureApiHome holds an isolated gateway account token (antigravity-cli/antigravity-oauth-token),
+// it points HOME at a lightweight sibling quota-home whose .gemini symlinks to PureApiHome so /usage
+// reads the active gateway account instead of a stale/unlogged host ~/.gemini profile (which would
+// otherwise block on interactive OAuth until the 22s context timeout sends SIGKILL / "signal: killed").
+func quotaCmdEnv(baseEnv []string) []string {
+	env := make([]string, 0, len(baseEnv)+8)
+	hasSSH := false
+	var quotaHome string
+	if PureApiHome != "" {
+		tokPath := filepath.Join(PureApiHome, "antigravity-cli", "antigravity-oauth-token")
+		if fileExists(tokPath) {
+			qh := filepath.Join(filepath.Dir(PureApiHome), "quota-home")
+			linkPath := filepath.Join(qh, ".gemini")
+			if err := os.MkdirAll(qh, 0o700); err == nil {
+				if cur, err := os.Readlink(linkPath); err != nil || cur != PureApiHome {
+					_ = os.Remove(linkPath)
+					_ = os.Symlink(PureApiHome, linkPath)
+				}
+				quotaHome = qh
+			}
+		}
+	}
+	for _, kv := range baseEnv {
+		if quotaHome != "" && strings.HasPrefix(kv, "HOME=") {
+			continue
+		}
+		if strings.HasPrefix(kv, "SSH_CONNECTION=") {
+			hasSSH = true
+		}
+		env = append(env, kv)
+	}
+	if quotaHome != "" {
+		env = append(env, "HOME="+quotaHome)
+		// On macOS, agy uses file-based token storage when an SSH session is detected;
+		// otherwise it attempts macOS Keychain lookup which can hang in headless daemons.
+		if runtime.GOOS == "darwin" && !hasSSH {
+			env = append(env, "SSH_CONNECTION=1 1 1 1")
+		}
+	}
 	env = append(env, "GOGC=30", "GOMEMLIMIT=120MiB")
 	if proxy := gwcfg.Current().UpstreamProxy; proxy != "" {
 		env = append(env, "HTTP_PROXY="+proxy, "HTTPS_PROXY="+proxy, "NO_PROXY=127.0.0.1,localhost,::1")
 	}
-	cmd.Env = env
+	return env
+}
+
+func fetchOfficialQuotaDo() QuotaSnapshot {
+	ctx, cancel := context.WithTimeout(context.Background(), 22*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, quotaAgyBin(), "-p", "/usage", "--output-format", "json")
+	cmd.Env = quotaCmdEnv(os.Environ())
 	out, err := cmd.Output()
 	if err != nil || len(out) == 0 {
 		errMsg := "Empty /usage output"
-		if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			errMsg = "timeout (22s) running /usage (check auth/proxy)"
+		} else if err != nil {
 			errMsg = err.Error()
 		}
 		quotaMu.Lock()
@@ -431,12 +500,14 @@ func fetchOfficialQuotaDo() QuotaSnapshot {
 		if cachedQuota != nil {
 			return markQuotaStaleLocked(errMsg)
 		}
-		return QuotaSnapshot{
+		errSnap := QuotaSnapshot{
 			Status:    "error",
 			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 			Error:     errMsg,
 			Groups:    []QuotaGroup{},
 		}
+		lastQuotaErr = &errSnap
+		return errSnap
 	}
 
 	var raw struct {
@@ -504,6 +575,7 @@ func fetchOfficialQuotaDo() QuotaSnapshot {
 	quotaMu.Lock()
 	cachedQuota = &snap
 	cachedQuotaAt = time.Now()
+	lastQuotaErr = nil
 	lastQuotaAttemptAt = cachedQuotaAt
 	quotaMu.Unlock()
 	return snap
@@ -933,6 +1005,9 @@ func buildPoolWindowAnnotated(b *QuotaBucket, steps []annotatedStep) PoolWindow 
 func classifyPoolQuota(snap QuotaSnapshot, g *QuotaGroup, now time.Time) PoolQuotaState {
 	st := PoolQuotaState{UpdatedAt: snap.UpdatedAt, Error: snap.Error}
 	switch {
+	case snap.Status == QuotaStateLoading:
+		st.State = QuotaStateLoading
+		st.UpdatedAt = ""
 	case snap.Status == "error":
 		st.State = QuotaStateError
 		st.UpdatedAt = ""

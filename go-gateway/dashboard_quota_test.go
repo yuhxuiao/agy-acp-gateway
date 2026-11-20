@@ -644,3 +644,64 @@ func TestFetchOfficialQuotaRefreshesAfterResetTimePasses(t *testing.T) {
 	}
 	t.Fatal("expected FetchOfficialQuota(false) to background-refresh within 3s once resetTime passed")
 }
+
+
+func TestQuotaCmdEnvUsesPureApiHome(t *testing.T) {
+	tmp := t.TempDir()
+	pure := filepath.Join(tmp, "pure-api-home")
+	cliDir := filepath.Join(pure, "antigravity-cli")
+	if err := os.MkdirAll(cliDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cliDir, "antigravity-oauth-token"), []byte("tok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origPure := PureApiHome
+	PureApiHome = pure
+	defer func() { PureApiHome = origPure }()
+
+	env := quotaCmdEnv([]string{"HOME=/Users/other", "PATH=/usr/bin"})
+	wantHome := filepath.Join(tmp, "quota-home")
+	gotHome := ""
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "HOME=") {
+			gotHome = strings.TrimPrefix(kv, "HOME=")
+		}
+	}
+	if gotHome != wantHome {
+		t.Fatalf("expected isolated HOME=%q, got %q", wantHome, gotHome)
+	}
+	target, err := os.Readlink(filepath.Join(wantHome, ".gemini"))
+	if err != nil || target != pure {
+		t.Fatalf("expected .gemini symlink -> %q, got %q (err=%v)", pure, target, err)
+	}
+}
+
+func TestFetchOfficialQuotaColdNonBlocking(t *testing.T) {
+	quotaMu.Lock()
+	savedCache, savedAt, savedErr, savedAttempt := cachedQuota, cachedQuotaAt, lastQuotaErr, lastQuotaAttemptAt
+	cachedQuota, cachedQuotaAt, lastQuotaErr, lastQuotaAttemptAt = nil, time.Time{}, nil, time.Time{}
+	quotaMu.Unlock()
+	t.Cleanup(func() {
+		quotaMu.Lock()
+		cachedQuota, cachedQuotaAt, lastQuotaErr, lastQuotaAttemptAt = savedCache, savedAt, savedErr, savedAttempt
+		quotaMu.Unlock()
+	})
+
+	dir := t.TempDir()
+	slowBin := filepath.Join(dir, "agy-slow")
+	if err := os.WriteFile(slowBin, []byte("#!/bin/sh\nsleep 2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGY_QUOTA_BIN", slowBin)
+
+	start := time.Now()
+	snap := FetchOfficialQuota(false)
+	elapsed := time.Since(start)
+	if elapsed > 300*time.Millisecond {
+		t.Fatalf("cold FetchOfficialQuota(false) blocked for %v, expected non-blocking", elapsed)
+	}
+	if snap.Status != QuotaStateLoading {
+		t.Fatalf("expected status=%q on cold non-blocking fetch, got %+v", QuotaStateLoading, snap)
+	}
+}

@@ -172,6 +172,14 @@ func detectClientFromPromptAndTools(convKey, sysCombined string, toolNames []str
 		return "pi", "Pi", "Messages", true
 	}
 
+	if strings.Contains(lowSys, "ga-platform") ||
+		(toolSet["code_run"] && toolSet["file_read"] && toolSet["file_patch"] && (toolSet["update_working_checkpoint"] || toolSet["ws_call_tool"])) {
+		return "genericagent", "GenericAgent", "Chat", true
+	}
+	if strings.Contains(lowSys, "<t3_code_instructions>") {
+		return "t3_code", "T3 Code", "Chat", true
+	}
+
 	if strings.Contains(lowSys, "openclaw") {
 		return "openclaw", "OpenClaw", "Messages", true
 	}
@@ -209,6 +217,12 @@ func DetectClientIdentity(r *http.Request, body map[string]any, convKey, rawSys,
 	if isSyntheticProbeKey(convKey) {
 		return ClientIdentity{ID: "probe", Label: "E2E 探针", Protocol: proto, Known: true}
 	}
+	combinedSys := rawSys
+	if cleanSys != "" && cleanSys != rawSys {
+		combinedSys = rawSys + "\n" + cleanSys
+	}
+	promptID, promptLabel, _, promptOK := detectClientFromPromptAndTools(convKey, combinedSys, extractRawHostToolNames(rawTools))
+
 	if r != nil {
 		for _, hdr := range []string{"x-claude-code-session-id", "x-session-id", "session-id", "session_id"} {
 			if v := strings.TrimSpace(r.Header.Get(hdr)); isSyntheticProbeKey(v) {
@@ -228,6 +242,11 @@ func DetectClientIdentity(r *http.Request, body map[string]any, convKey, rawSys,
 		case strings.Contains(ua, "pi-coding-agent") || strings.Contains(ua, "pi-desktop") || strings.Contains(xApp, "pi-coding") || strings.Contains(xTitle, "pi-coding") || strings.TrimSpace(r.Header.Get("x-pi-session-id")) != "":
 			return ClientIdentity{ID: "pi", Label: "Pi", Protocol: proto, Known: true}
 		case strings.Contains(ua, "codex_cli_rs") || strings.Contains(ua, "codex-cli") || strings.Contains(ua, "codex desktop") || strings.Contains(orig, "codex"):
+			// Proxy aggregators (e.g. Magpie client-shapes) may inject Originator: codex_exec on /v1/chat/completions
+			// while forwarding another agent harness. Prefer explicit prompt/tool identity when it disagrees.
+			if promptOK && promptID != "codex" {
+				return ClientIdentity{ID: promptID, Label: promptLabel, Protocol: proto, Known: true}
+			}
 			return ClientIdentity{ID: "codex", Label: "Codex", Protocol: proto, Known: true}
 		case strings.Contains(ua, "openclaw") || strings.Contains(xTitle, "openclaw") || strings.Contains(xApp, "openclaw"):
 			return ClientIdentity{ID: "openclaw", Label: "OpenClaw", Protocol: proto, Known: true}
@@ -252,12 +271,8 @@ func DetectClientIdentity(r *http.Request, body map[string]any, convKey, rawSys,
 		}
 	}
 
-	combinedSys := rawSys
-	if cleanSys != "" && cleanSys != rawSys {
-		combinedSys = rawSys + "\n" + cleanSys
-	}
-	if id, lbl, _, ok := detectClientFromPromptAndTools(convKey, combinedSys, extractRawHostToolNames(rawTools)); ok {
-		return ClientIdentity{ID: id, Label: lbl, Protocol: proto, Known: true}
+	if promptOK {
+		return ClientIdentity{ID: promptID, Label: promptLabel, Protocol: proto, Known: true}
 	}
 
 	if r != nil && strings.TrimSpace(r.Header.Get("x-claude-code-session-id")) != "" {

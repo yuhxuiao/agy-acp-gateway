@@ -1006,7 +1006,7 @@ function buildPools() {
   document.getElementById('pool-3p').innerHTML = tpl('tp', 'Claude 额度池', 'Opus 5.5 · Sonnet 5.5', 'var(--cla)');
 }
 
-const POOL_GAUGE_TXT = { error: '读取失败', not_enabled: '未开通' };
+const POOL_GAUGE_TXT = { error: '读取失败', not_enabled: '未开通', loading: '同步中' };
 function setPoolGauge(key, win, frac, stateName, resetIso, idle, wkExhausted) {
   const v = document.getElementById('v-' + key + '-' + win);
   const u = document.getElementById('u-' + key + '-' + win);
@@ -1045,6 +1045,7 @@ function poolBadgeHTML(st, updatedAt, argonPool, planLabel) {
   let out = '';
   if (planLabel) out += '<span class="pool-badge">' + esc(planLabel) + '</span>';
   if (st === 'stale') out += '<span class="pool-badge warn" title="上次成功读取于 ' + hhmm(updatedAt) + '">缓存读数 ' + hhmm(updatedAt) + '</span>';
+  else if (st === 'loading') out += '<span class="pool-badge">同步中…</span>';
   else if (st === 'error') out += '<span class="pool-badge bad">读取失败</span>';
   else if (st === 'not_enabled') out += '<span class="pool-badge">未开通</span>';
   if (argonPool && argonPool.remainingFraction != null) {
