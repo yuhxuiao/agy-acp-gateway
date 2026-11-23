@@ -1213,7 +1213,11 @@ func (am *AccountManager) BuildAccountHealthView(acc AccountProfile, hasToken bo
 		stPtr = &stCopy
 	}
 	am.healthMu.RUnlock()
-	return buildSingleHealthViewFromRuntime(acc, hasToken, inFlight, stickyCount, stPtr, primaryTripped, primaryReason, now)
+	view := buildSingleHealthViewFromRuntime(acc, hasToken, inFlight, stickyCount, stPtr, primaryTripped, primaryReason, now)
+	if view.State != "disabled" && (am.isAccountLoggingOut(acc.ID) || (acc.Primary && !hasToken && am.isExplicitlyLoggedOut(acc.ID))) {
+		view.State = "unauthenticated"
+	}
+	return view
 }
 
 // SnapshotHealthViews builds AccountHealthView for all supplied accounts using a single healthMu.RLock.
@@ -1226,12 +1230,12 @@ func (am *AccountManager) SnapshotHealthViews(accs []AccountProfile, stickyByAcc
 	inFlightByID := make(map[string]int64, len(accs))
 	primaryTripped, primaryReason := IsTosTripped()
 	for _, a := range accs {
-		hasTokByID[a.ID] = a.Primary || am.HasOAuthToken(a.ID)
+		hasTokByID[a.ID] = am.isAccountAuthEligible(a)
 		inFlightByID[a.ID] = am.AccountInFlight(a.ID)
 	}
 	am.healthMu.RLock()
 	for _, a := range accs {
-		out[a.ID] = buildSingleHealthViewFromRuntime(
+		v := buildSingleHealthViewFromRuntime(
 			a,
 			hasTokByID[a.ID],
 			inFlightByID[a.ID],
@@ -1241,6 +1245,10 @@ func (am *AccountManager) SnapshotHealthViews(accs []AccountProfile, stickyByAcc
 			primaryReason,
 			now,
 		)
+		if v.State != "disabled" && !hasTokByID[a.ID] {
+			v.State = "unauthenticated"
+		}
+		out[a.ID] = v
 	}
 	am.healthMu.RUnlock()
 	return out
@@ -1661,7 +1669,7 @@ func (am *AccountManager) PerformAccountActionEx(req AccountActionRequest) (map[
 		hardMap, coolMap := am.snapshotRoutingHealth(accs, DefaultModelID, now)
 		hasTok := make(map[string]bool, len(accs))
 		for _, a := range accs {
-			hasTok[a.ID] = a.Primary || am.HasOAuthToken(a.ID)
+			hasTok[a.ID] = am.isAccountAuthEligible(a)
 		}
 
 		am.mu.Lock()

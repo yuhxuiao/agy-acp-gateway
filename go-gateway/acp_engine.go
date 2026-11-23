@@ -195,6 +195,9 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	if err := circuitError(); err != nil {
 		return err
 	}
+	if !isChildAccountWorker() && GlobalAccountManager.isPrimaryStartupBlocked() {
+		return errors.New("primary account is signed out or logging out")
+	}
 	e.mu.Lock()
 	for e.booting || e.stopping {
 		e.bootCond.Wait()
@@ -214,6 +217,10 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	}()
 
 	EnsurePureApiHome()
+	absPure := PureApiHome
+	if a, err := filepath.Abs(PureApiHome); err == nil && a != "" {
+		absPure = a
+	}
 	// Child agy processes keep an isolated 180MiB GOMEMLIMIT rather than inheriting the
 	// gateway's 256MiB ceiling so 8 resident workers stay well inside container memory bounds.
 	snap := gwcfg.Current()
@@ -223,7 +230,7 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	proxy := resolvePrimaryUpstreamProxy()
 
 	LogEvent("ACP_ENGINE_START", "Starting single shared agy-acp-900k Pure-API engine (Go Native)", map[string]any{
-		"home":       PureApiHome,
+		"home":       absPure,
 		"gomemlimit": gomem,
 	})
 
@@ -231,7 +238,7 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	cmd := exec.Command(
 		PatchedAgyBin,
 		"acp",
-		"--gemini-dir", PureApiHome,
+		"--gemini-dir", absPure,
 		"--app-data-dir", "antigravity-cli",
 		"--agent", McpBridgeName,
 		"--process-per-session",
@@ -241,7 +248,7 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	cmd.Dir = DefaultCwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	agyHome := resolveIsolatedAgyHome(PureApiHome)
-	env := make([]string, 0, len(os.Environ())+14)
+	env := make([]string, 0, len(os.Environ())+16)
 	hasSSH := false
 	for _, kv := range os.Environ() {
 		if isStrippedLeafAgySubprocessEnv(kv) {
@@ -264,6 +271,8 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	env = append(env,
 		"GOGC="+gogc,
 		"GOMEMLIMIT="+gomem,
+		"GEMINI_HOME="+absPure,
+		"AGY_ACP_FORCE_FILE_STORAGE=1",
 		"DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null",
 		"AGY_CLI_DISABLE_AUTO_UPDATE=1",
 		"HTTP_PROXY="+proxy,
@@ -418,6 +427,7 @@ func isStrippedAgyEngineEnv(kv string) bool {
 		"GOOGLE_CLOUD_PROJECT=", "GOOGLE_CLOUD_LOCATION=", "GOOGLE_CLOUD_QUOTA_PROJECT=",
 		"GOOGLE_GENAI_USE_VERTEXAI=", "GCLOUD_PROJECT=", "CLOUDSDK_CORE_PROJECT=",
 		"AGY_ACP_CCPA_PROJECT=", "GEMINI_HOME=",
+		"AGY_ACP_FORCE_FILE_STORAGE=",
 		"ELECTRON_RUN_AS_NODE=", "CHROME_CRASHPAD_PIPE_NAME=",
 	} {
 		if strings.HasPrefix(kv, prefix) {

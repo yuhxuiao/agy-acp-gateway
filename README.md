@@ -126,12 +126,11 @@ cp .env.example .env
 
 Open the **Warm-Paper Console** at `http://127.0.0.1:18891/` (enter any username and your `AGY_API_KEYS` master key as the password), then click **Account Control Center (`账号控制中心`)** in the top bar:
 
-1. **Method 1 — Zero-SSH WebUI PKCE OAuth (Linux / WSL2 / Docker; Recommended for Headless Servers & Secondary Accounts)**:
-   - *(Native `macOS arm64` hosts do not expose `/dev/ptmx` Linux PTYs; use Method 2 CLI login or Method 3 JSON token import on macOS.)*
-   - Click **Add Account (`新增子账号`)** (or **OAuth (`网页 OAuth 授权`)** on an existing card), choose an egress proxy (`Direct`, named preset, or custom `http://` / `socks5://` proxy), and save.
-   - Click **Step 1: Generate Google OAuth URL**. The gateway spawns `agy login` inside an isolated `/dev/ptmx` pseudo-terminal scoped to that account's sandbox directory and proxy (auto-reaped after `70s`, with `.oauth-bak` rollback protection).
-   - Open the generated `https://accounts.google.com/...` URL in **any** local browser, sign in, and when the browser redirects to `http://localhost:.../?code=4/0A...` (even if localhost shows "connection refused"), copy that full URL (or just the `code` parameter) into **Step 2** and click **Activate**.
-   - The gateway completes token exchange, automatically probes available models/plan tier via official `agy models`, and boots the isolated worker.
+1. **Method 1 — Cross-Platform WebUI ACP OAuth (Linux / macOS / WSL2 / Docker; Recommended for All Accounts)**:
+   - Works natively on **macOS, Linux, WSL2, and Docker** without Linux PTYs by driving `agy acp --gemini-dir <staging> --app-data-dir antigravity-cli --login` with `AGY_ACP_FORCE_FILE_STORAGE=1` and each slot's resolved egress proxy inside an isolated staging directory (`5m` TTL, zero downtime to existing live tokens/workers until verified).
+   - Click **Add Account (`新增子账号`)** (or **Google 登录 / 换号** on an existing card), choose an egress proxy (`Direct`, named preset, or custom `http://` / `socks5://` proxy), and save.
+   - Opening the OAuth panel automatically resumes any active handshake or starts a fresh one and displays the `https://accounts.google.com/...` authorization URL with a live countdown. Sign in from **any** browser; after Google lands on `https://antigravity.google/oauth-callback?...`, copy the displayed authorization code (or full callback URL) and submit it in the form.
+   - The gateway validates `state`/`redirect_uri`, exchanges and verifies the credential via disposable `agy acp` `initialize` + `authenticate("oauth-personal")` RPC, atomically installs the token (`0600`), cleans up legacy `acp_token.json`, displays the authenticated account email, and reloads the active runtime (or supports **Cancel** / **Sign Out** via `logout` RPC).
 2. **Method 2 — Offline Token JSON Import**:
    - In the same OAuth panel, paste an existing `antigravity-oauth-token` JSON payload (`{"access_token":...,"refresh_token":...}`) and click **Import Token JSON**.
 3. **Method 3 — Host/Container Interactive CLI *(Primary Account Only)***:
