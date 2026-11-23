@@ -312,19 +312,48 @@ func (p *accountWorkerProc) finishReady(err error) {
 	})
 }
 
+// AccountTokenMeta captures non-secret account identity metadata parsed from antigravity-oauth-token.
+type AccountTokenMeta struct {
+	Authenticated bool   `json:"authenticated"`
+	Email         string `json:"email,omitempty"`
+	AuthMethod    string `json:"authMethod,omitempty"`
+}
+
+// OAuthFlowSnapshot represents T3-style ACP OAuth login progress for an isolated account slot.
+type OAuthFlowSnapshot struct {
+	AccountID        string `json:"accountId"`
+	Phase            string `json:"phase"` // idle | starting | waiting | verifying | succeeded | failed | cancelled
+	FlowID           string `json:"flowId,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	AuthorizationURL string `json:"authUrl,omitempty"`
+	ExpiresAt        string `json:"expiresAt,omitempty"`
+	Message          string `json:"message,omitempty"`
+	Email            string `json:"email,omitempty"`
+	Tier             string `json:"tier,omitempty"`
+	ModelsCount      int    `json:"modelsCount,omitempty"`
+	Authenticated    bool   `json:"authenticated"`
+}
+
 type pendingOAuthSession struct {
-	accountID string
-	authURL   string
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdinOnce sync.Once
-	output    *bytes.Buffer
-	outMu     sync.Mutex
-	tokenPath string
-	bakPath   string
-	startedAt time.Time
-	done      chan struct{}
-	doneCh    chan error
+	accountID        string
+	flowID           string
+	authURL          string
+	redirectURI      string
+	state            string
+	tempDir          string
+	stagingGeminiDir string
+	stagingTokPath   string
+	cmd              *exec.Cmd
+	stdin            io.WriteCloser
+	stdinOnce        sync.Once
+	output           *bytes.Buffer
+	outMu            sync.Mutex
+	tokenPath        string
+	startedAt        time.Time
+	expiresAt        time.Time
+	submitted        bool
+	done             chan struct{}
+	doneCh           chan error
 }
 
 func (s *pendingOAuthSession) closeStdin() {
@@ -355,6 +384,7 @@ type AccountManager struct {
 	opLocks         map[string]*sync.Mutex
 	oauthMu         sync.Mutex
 	oauthActive     map[string]*pendingOAuthSession
+	oauthState      map[string]OAuthFlowSnapshot
 	stickyMu        sync.Mutex
 	stickyLRU       *stickySessionLRU
 	stickyLastPrune time.Time
@@ -382,6 +412,7 @@ func NewAccountManager() *AccountManager {
 		crashStates:   make(map[string]workerCrashState),
 		opLocks:       make(map[string]*sync.Mutex),
 		oauthActive:   make(map[string]*pendingOAuthSession),
+		oauthState:    make(map[string]OAuthFlowSnapshot),
 		stickyLRU:     newStickySessionLRU(),
 		rrCounters:    make(map[string]uint64),
 		swrrStates:    make(map[string]map[string]*swrrEntry),
@@ -707,6 +738,7 @@ func (am *AccountManager) saveToDiskLocked() error {
 }
 
 func (am *AccountManager) AccountHomeDir(accountID string) string {
+	accountID = strings.ToLower(strings.TrimSpace(accountID))
 	am.ensureInitialized()
 	am.mu.RLock()
 	base := am.baseDataDir
@@ -723,9 +755,13 @@ func (am *AccountManager) AccountHomeDir(accountID string) string {
 	}
 	return filepath.Join(base, "accounts", accountID)
 }
+
+// AccountGeminiDir returns the absolute .gemini / GEMINI_HOME directory isolated for accountID.
 func (am *AccountManager) AccountGeminiDir(accountID string) string {
+	accountID = strings.ToLower(strings.TrimSpace(accountID))
 	am.ensureInitialized()
 	am.mu.RLock()
+	base := am.baseDataDir
 	var isPrim bool
 	for _, a := range am.accounts {
 		if a.ID == accountID && a.Primary {
@@ -734,10 +770,14 @@ func (am *AccountManager) AccountGeminiDir(accountID string) string {
 		}
 	}
 	am.mu.RUnlock()
+	raw := filepath.Join(base, "accounts", accountID, ".gemini")
 	if isPrim {
-		return PureApiHome
+		raw = PureApiHome
 	}
-	return filepath.Join(am.AccountHomeDir(accountID), ".gemini")
+	if abs, err := filepath.Abs(raw); err == nil && abs != "" {
+		return abs
+	}
+	return raw
 }
 
 func (am *AccountManager) EnsureAccountSandboxSeeded(accountID string) error {
@@ -752,8 +792,11 @@ func (am *AccountManager) EnsureAccountSandboxSeeded(accountID string) error {
 	}
 	seedDefaultCliProject(filepath.Join(geminiDir, "config", "projects", "default-cli-project.json"))
 	seedOnboardingFile(filepath.Join(appDir, "cache", "onboarding.json"))
-	if filepath.Clean(filepath.Join(homeDir, ".gemini")) != filepath.Clean(geminiDir) {
-		dotGemini := filepath.Join(homeDir, ".gemini")
+	dotGemini := filepath.Join(homeDir, ".gemini")
+	absDotGemini, err1 := filepath.Abs(dotGemini)
+	absGeminiDir, err2 := filepath.Abs(geminiDir)
+	differs := (err1 == nil && err2 == nil && absDotGemini != absGeminiDir) || (err1 != nil && filepath.Clean(dotGemini) != filepath.Clean(geminiDir))
+	if differs {
 		if _, err := os.Lstat(dotGemini); os.IsNotExist(err) {
 			_ = os.MkdirAll(homeDir, 0o700)
 			_ = os.Symlink(geminiDir, dotGemini)
@@ -770,20 +813,33 @@ func (am *AccountManager) ClearWorkerBackoff(accountID string) {
 }
 
 func (am *AccountManager) AccountTokenPath(accountID string) string {
-	am.ensureInitialized()
-	am.mu.RLock()
-	var isPrim bool
-	for _, a := range am.accounts {
-		if a.ID == accountID && a.Primary {
-			isPrim = true
-			break
-		}
+	return filepath.Join(am.AccountGeminiDir(accountID), "antigravity-cli", "antigravity-oauth-token")
+}
+
+// ReadAccountTokenMeta reads non-secret identity metadata (email, auth_method) from the account's OAuth token file.
+func (am *AccountManager) ReadAccountTokenMeta(accountID string) AccountTokenMeta {
+	p := am.AccountTokenPath(accountID)
+	info, err := os.Stat(p)
+	if err != nil || info.IsDir() || info.Size() <= 16 {
+		return AccountTokenMeta{}
 	}
-	am.mu.RUnlock()
-	if isPrim {
-		return filepath.Join(PureApiHome, "antigravity-cli", "antigravity-oauth-token")
+	meta := AccountTokenMeta{Authenticated: true}
+	if info.Size() > 64*1024 {
+		return meta
 	}
-	return filepath.Join(am.AccountHomeDir(accountID), ".gemini", "antigravity-cli", "antigravity-oauth-token")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return meta
+	}
+	var parsed struct {
+		AuthMethod   string `json:"auth_method"`
+		IDTokenEmail string `json:"id_token_email"`
+	}
+	if json.Unmarshal(b, &parsed) == nil {
+		meta.AuthMethod = strings.TrimSpace(parsed.AuthMethod)
+		meta.Email = strings.TrimSpace(parsed.IDTokenEmail)
+	}
+	return meta
 }
 
 func (am *AccountManager) InvalidateTokenCache(accountID string) {
@@ -1151,13 +1207,19 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 	if runtime.GOOS == "darwin" && !hasSSH {
 		env = append(env, "SSH_CONNECTION=1 1 1 1")
 	}
+	geminiDir := filepath.Join(homeDir, ".gemini")
+	if absGem, absErr := filepath.Abs(geminiDir); absErr == nil && absGem != "" {
+		geminiDir = absGem
+	}
 	env = append(env,
 		"AGY_CHILD_ACCOUNT_WORKER=1",
 		"GOMEMLIMIT="+childMemLimit,
 		"DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null",
 		"AGY_CLI_DISABLE_AUTO_UPDATE=1",
 		"HOME="+homeDir,
-		"AGY_PURE_API_HOME="+filepath.Join(homeDir, ".gemini"),
+		"GEMINI_HOME="+geminiDir,
+		"AGY_ACP_FORCE_FILE_STORAGE=1",
+		"AGY_PURE_API_HOME="+geminiDir,
 		"AGY_DEFAULT_CWD="+filepath.Join(homeDir, "workspace"),
 		"AGY_STATE_DB="+filepath.Join(homeDir, "gateway.db"),
 		"AGY_TOS_TRIPPED_FILE="+filepath.Join(homeDir, "tos-tripped"),
@@ -1405,11 +1467,17 @@ func (am *AccountManager) StopAccountWorker(accountID string) {
 }
 
 func (am *AccountManager) StopAll() {
+	var activeOAuth []*pendingOAuthSession
 	am.oauthMu.Lock()
 	for _, s := range am.oauthActive {
-		am.cancelOAuthSessionLocked(s, true)
+		activeOAuth = append(activeOAuth, s)
+		am.cancelOAuthSessionLocked(s)
 	}
 	am.oauthMu.Unlock()
+	for _, s := range activeOAuth {
+		waitOAuthProcExit(s, 1500*time.Millisecond)
+		cleanupOAuthSessionArtifacts(s)
+	}
 
 	am.mu.RLock()
 	ids := make([]string, 0, len(am.workers))

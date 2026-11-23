@@ -126,12 +126,11 @@ cp .env.example .env
 
 在浏览器打开 **暖纸实时控制台** `http://127.0.0.1:18891/`（HTTP Basic Auth 用户名任意填写，密码输入 `.env` 中的 `AGY_API_KEYS` 主密钥），点击顶栏 **账号控制中心**：
 
-1. **方式一：网页免 SSH PKCE OAuth 授权（适用于 Linux / WSL2 / Docker，推荐无头服务器与全部子账号使用）**
-   - *（注：原生 `macOS arm64` 无 Linux `/dev/ptmx` 伪终端，macOS 原生环境请使用方式二直接导入 Token JSON 或方式三命令行授权。）*
-   - 点击 **新增子账号**（或在已有账号卡片点 **授权**），选择出口代理模式（宿主机直连、命名代理预设、或自定义 `http://` / `socks5://` 代理）并保存。
-   - 点击 **第 1 步：生成 Google OAuth 授权链接**。网关会在该账号专属沙盒目录与代理环境下通过 `/dev/ptmx` 伪终端启动 `agy login`（`70s` 超时自动回收，并带 `.oauth-bak` 失败回滚保护）。
-   - 将生成的 `https://accounts.google.com/...` 链接复制到**任意本地浏览器**完成登录；当浏览器跳转到 `http://localhost:.../?code=4/0A...`（即使页面提示无法访问此网站也完全正常），复制完整地址栏 URL 或 `code` 参数粘贴回 **第 2 步**，点击 **提交授权码激活**。
-   - 网关会自动落盘凭据、调用官方 `agy models` 探测账号订阅档位（AI Pro / Ultra `20x`）与可用模型，并拉起独立子进程。
+1. **方式一：跨平台网页 ACP OAuth 登录（全平台适用 Linux / macOS / WSL2 / Docker，推荐主账号与全部子账号使用）**
+   - 直接通过 `agy acp --gemini-dir <staging> --app-data-dir antigravity-cli --login`（自动注入 `AGY_ACP_FORCE_FILE_STORAGE=1` 与账号专属出口代理）完成握手，**不再依赖 Linux `/dev/ptmx` 伪终端**，macOS 原生环境亦可开箱即用；全程先在隔离临时目录完成授权（`5` 分钟有效期），**验证通过后再原子替换线上凭据**，失败或取消绝不影响现有服务。
+   - 点击 **新增账号槽位**（或在已有账号卡片点 **Google 登录 / 换号**），配置出口代理后打开登录面板，面板会自动恢复或生成 Google 授权链接并显示实时倒计时。
+   - 在任意浏览器完成登录后，页面会跳转至 `https://antigravity.google/oauth-callback?...` 并给出授权码；复制授权码或完整回调 URL 粘贴回车提交。
+   - 网关会校验 `state` 与 `redirect_uri`、启动一次性 `agy acp` 执行 `initialize` + `authenticate("oauth-personal")` 验活、以 `0600` 权限原子落盘并清理遗留 `acp_token.json`，提取并展示 Google 账号邮箱后热重载运行时；面板同时支持 **取消登录** 与 **退出登录**（`logout` RPC）。
 2. **方式二：离线导入 Token JSON**
    - 在同一授权面板中，直接粘贴已有的 `antigravity-oauth-token` JSON 原文并点击 **直接写入 Token JSON**。
 3. **方式三：宿主机/容器命令行交互登录 *(仅主账号 `primary`)***

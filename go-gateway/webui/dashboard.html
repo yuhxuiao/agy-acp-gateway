@@ -194,6 +194,26 @@
     background: var(--paper-dim); border: 1px solid var(--line-2); overflow-wrap: anywhere;
     max-height: 76px; overflow-y: auto; margin: 8px 0;
   }
+  .acc-oauth-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+    margin-bottom: 8px; font-size: 12px; color: var(--ink-2);
+  }
+  .acc-oauth-phase {
+    display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px;
+    border: 1px solid var(--line-2); background: #fff; font-size: 11.5px; font-weight: 500; color: var(--ink);
+  }
+  .acc-oauth-phase.ok { color: var(--ok); border-color: rgba(22, 124, 82, 0.3); background: rgba(22, 124, 82, 0.06); }
+  .acc-oauth-phase.bad { color: var(--bad); border-color: rgba(190, 47, 47, 0.3); background: rgba(190, 47, 47, 0.06); }
+  .acc-email-btn {
+    border: 0; background: transparent; padding: 0; color: var(--ink); font: inherit; cursor: pointer;
+    text-decoration: underline dotted var(--line-2); text-underline-offset: 2px;
+  }
+  .acc-email-btn:hover { color: var(--gem); }
+  .acc-adv {
+    margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 12px; color: var(--ink-2);
+  }
+  .acc-adv summary { cursor: pointer; user-select: none; font-weight: 500; color: var(--ink-2); }
+  .acc-adv[open] summary { margin-bottom: 8px; color: var(--ink); }
   .status { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; justify-content: flex-end; min-width: 0; }
   .pill {
     display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 12px;
@@ -1280,10 +1300,10 @@ function renderMultiInstanceQuotaCards(rootData) {
       const rawMods = Array.isArray(inst.allowedModels) ? inst.allowedModels : (Array.isArray(inst.defaultModels) ? inst.defaultModels : []);
       const dmods = rawMods.length ? rawMods.join(', ') : '未绑定 (禁止调用)';
       return '<div class="inst-qcard">' +
-        '<div class="inst-qhead"><div class="inst-qtitle"><span class="inst-dot warn"></span><span>' + esc(inst.label || inst.id) + '</span><span class="pool-badge warn">待网页授权</span>' + extraBadges + '</div>' +
-        '<div class="inst-qacts"><button type="button" class="act-chip" data-edit-inst="' + esc(inst.id) + '">' + svg('route') + '<span>代理与Key</span></button><button type="button" class="btn solid" style="height:26px;padding:0 11px;font-size:11.5px" data-oauth-inst="' + esc(inst.id) + '">' + svg('sparkles') + '<span>网页 OAuth 授权</span></button></div></div>' +
+        '<div class="inst-qhead"><div class="inst-qtitle"><span class="inst-dot warn"></span><span>' + esc(inst.label || inst.id) + '</span><span class="pool-badge warn">待 Google 登录</span>' + extraBadges + '</div>' +
+        '<div class="inst-qacts"><button type="button" class="act-chip" data-edit-inst="' + esc(inst.id) + '">' + svg('route') + '<span>代理与Key</span></button><button type="button" class="btn solid" style="height:26px;padding:0 11px;font-size:11.5px" data-oauth-inst="' + esc(inst.id) + '">' + svg('sparkles') + '<span>Google 登录</span></button></div></div>' +
         '<div class="inst-unauth">' +
-        '<div>独立沙盒与出口代理已就绪，点击右上角“网页 OAuth 授权”完成 Google 登录或粘贴 Token 即可激活上线。</div>' +
+        '<div>独立沙盒与出口代理已就绪，点击右上角“Google 登录”完成 OAuth 授权或导入凭据即可激活上线。</div>' +
         '<div class="inst-unauth-meta">' +
         '<b>代理预设</b><span>' + esc(inst.proxyPreset || 'direct') + '</span>' +
         '<b>渠道 Key</b><span>' + keyLine + '</span>' +
@@ -1344,7 +1364,7 @@ function renderMultiInstanceQuotaCards(rootData) {
     ) : '';
     return '<div class="inst-qcard">' +
       '<div class="inst-qhead"><div class="inst-qtitle"><span class="inst-dot ' + dotCls + '"></span><span>' + esc(inst.label || inst.id) + '</span>' + planBadge + stBadge + extraBadges + '</div>' +
-      '<div class="inst-qacts"><button class="act-chip" data-oauth-inst="' + esc(inst.id) + '" title="网页 OAuth 重新授权或更换凭据">' + svg('sparkles') + '<span>授权</span></button>' +
+      '<div class="inst-qacts"><button class="act-chip" data-oauth-inst="' + esc(inst.id) + '" title="Google OAuth 登录或换号">' + svg('sparkles') + '<span>换号</span></button>' +
       '<button class="act-chip" data-edit-inst="' + esc(inst.id) + '" title="配置出口代理、调度权重与渠道专属 API Key">' + svg('route') + '<span>渠道</span></button>' +
       '<button class="act-chip" data-jump-inst="' + esc(inst.id) + '">' + svg('arrow-up-right') + '<span>单节点视图</span></button></div></div>' +
       schedStrip +
@@ -2411,9 +2431,14 @@ const accState = {
   presets: [],
   availableModels: [],
   probeMap: {},
+  revealEmail: {},
   tab: 'accounts',
   oauthUrl: '',
   oauthAccId: '',
+  oauthFlowId: '',
+  oauthExpiresAt: '',
+  oauthPhase: 'idle',
+  oauthTimer: 0,
   msg: ''
 };
 let accToastTimer = null;
@@ -2427,6 +2452,47 @@ function showAccToast(text, isBad = false) {
 }
 function apiBaseUrl() {
   return location.protocol.startsWith('http') ? '' : 'http://127.0.0.1:18891/';
+}
+function stopOAuthCountdown() {
+  if (accState.oauthTimer && typeof clearInterval === 'function') {
+    clearInterval(accState.oauthTimer);
+  }
+  accState.oauthTimer = 0;
+}
+function maskAccountEmail(email) {
+  const s = String(email || '').trim();
+  const at = s.indexOf('@');
+  if (at <= 0) return s;
+  const local = s.slice(0, at);
+  const dom = s.slice(at);
+  if (local.length <= 2) return local.slice(0, 1) + '***' + dom;
+  return local.slice(0, 2) + '***' + dom;
+}
+function updateOAuthCountdownUI() {
+  const ttlEl = document.getElementById('oauth-ttl-txt');
+  if (!ttlEl) return;
+  if (accState.oauthPhase !== 'waiting' || !accState.oauthExpiresAt) {
+    ttlEl.textContent = '';
+    return;
+  }
+  const ms = Date.parse(accState.oauthExpiresAt) - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) {
+    ttlEl.textContent = '链接已超时，请重新生成';
+    setOAuthPhaseBadge('failed', '已超时');
+    stopOAuthCountdown();
+    return;
+  }
+  const sec = Math.ceil(ms / 1000);
+  const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+  const ss = String(sec % 60).padStart(2, '0');
+  ttlEl.textContent = '链接有效期 ' + mm + ':' + ss;
+}
+function setOAuthPhaseBadge(phase, label) {
+  accState.oauthPhase = phase || 'idle';
+  const badge = document.getElementById('oauth-phase-badge');
+  if (!badge) return;
+  badge.className = 'acc-oauth-phase' + (phase === 'succeeded' ? ' ok' : phase === 'failed' ? ' bad' : '');
+  badge.textContent = label || phase || '就绪';
 }
 async function loadAccounts() {
   try {
@@ -2470,6 +2536,7 @@ function switchAccModalTab(tab) {
   document.getElementById('acc-list').hidden = isGrp;
   document.getElementById('acc-groups-list').hidden = !isGrp;
   if (isGrp) {
+    stopOAuthCountdown();
     document.getElementById('acc-oauth-box').hidden = true;
     document.getElementById('acc-edit-box').hidden = true;
     renderGroupsList();
@@ -2579,6 +2646,7 @@ async function openAccModal(focusAccId = '', mode = '') {
   document.getElementById('acc-oauth-box').hidden = true;
   document.getElementById('acc-edit-box').hidden = true;
   document.getElementById('acc-group-edit-box').hidden = true;
+  stopOAuthCountdown();
   await loadAccounts();
   if (mode === 'groups') {
     switchAccModalTab('groups');
@@ -2593,6 +2661,7 @@ async function openAccModal(focusAccId = '', mode = '') {
   }
 }
 function closeAccModal() {
+  stopOAuthCountdown();
   document.getElementById('acc-backdrop').hidden = true;
 }
 function renderAccountsList() {
@@ -2609,8 +2678,8 @@ function renderAccountsList() {
     const stBadge = sched === 'disabled'
       ? '<span class="pool-badge bad">已停用</span>'
       : a.authenticated
-        ? '<span class="pool-badge" style="color:var(--ok);border-color:rgba(22,124,82,.3)">已授权 · ' + (a.running ? '运行中' : '待唤醒') + '</span>'
-        : '<span class="pool-badge warn">待网页 OAuth 授权</span>';
+        ? '<span class="pool-badge" style="color:var(--ok);border-color:rgba(22,124,82,.3)">已登录 · ' + (a.running ? '运行中' : '待唤醒') + '</span>'
+        : '<span class="pool-badge warn">待 Google 登录</span>';
     const extraBadges = buildHealthBadgesHTML(sched, !!a.isActiveTarget, h);
     const hasKeys = Array.isArray(a.boundKeys) && a.boundKeys.length > 0;
     const keyRow = hasKeys
@@ -2618,11 +2687,17 @@ function renderAccountsList() {
       : '无独立 Key · 可用 <code>&lt;主Key&gt;@' + esc(a.id) + '</code>';
     const rawMods = Array.isArray(a.allowedModels) ? a.allowedModels : (Array.isArray(a.defaultModels) ? a.defaultModels : []);
     const dmods = rawMods.length ? esc(rawMods.join(', ')) : '<span style="color:var(--warn)">未绑定任何模型 (调用将返回 403)</span>';
+    const shownEmail = a.email ? (accState.revealEmail[a.id] ? a.email : maskAccountEmail(a.email)) : '';
+    const emailRow = a.authenticated
+      ? '<div class="acc-kv-row"><b>Google 账号</b><span>' + (shownEmail
+          ? '<button type="button" class="acc-email-btn" data-toggle-email="' + esc(a.id) + '" title="点击显示/隐藏完整邮箱">' + esc(shownEmail) + '</button>'
+          : '已授权 (未读取邮箱)') + '</span></div>'
+      : '';
     const grpTxt = Array.isArray(a.groups) && a.groups.length
       ? a.groups.map(g => '<code class="tag">' + esc(g) + '</code>').join(' ')
       : '<span class="m-note">未加入专属分组 (仅全局池可调)</span>';
     const probeMsg = accState.probeMap[a.id];
-    const probeCls = probeMsg && (probeMsg.startsWith('探测失败') || probeMsg.startsWith('删除失败') || probeMsg.startsWith('操作失败')) ? 'var(--bad)' : 'var(--ok)';
+    const probeCls = probeMsg && (probeMsg.startsWith('探测失败') || probeMsg.startsWith('删除失败') || probeMsg.startsWith('操作失败') || probeMsg.startsWith('退出失败')) ? 'var(--bad)' : 'var(--ok)';
     const probeTxt = probeMsg ? '<div class="m-note" style="color:' + probeCls + ';margin-top:4px">' + esc(probeMsg) + '</div>' : '';
     const lastErrTxt = h.lastError ? '<div class="m-note" style="color:var(--warn);margin-top:4px">最近异常: ' + esc(h.lastError) + '</div>' : '';
     const noteTxt = a.notes ? '<div class="m-note" style="margin-top:4px">备注: ' + esc(a.notes) + '</div>' : '';
@@ -2631,6 +2706,7 @@ function renderAccountsList() {
       '<div class="acc-item-top"><div class="acc-item-title"><span>' + esc(a.label || a.id) + '</span><code class="tag">' + esc(a.id) + '</code>' + (a.primary ? '<span class="tag def">主实例</span>' : '') + stBadge + extraBadges + '</div>' +
       '<span class="m-note mono">P' + fmt(a.priority || 100) + ' · W' + fmt(a.weight || 1) + ' · 并发 ' + fmt(h.inFlight || 0) + '/' + fmt(h.maxConcurrency || a.maxConcurrency || a.maxLiveWorkers || 4) + ' · 粘性 ' + fmt(h.stickySessions || 0) + '</span></div>' +
       '<div class="acc-kv">' +
+      emailRow +
       '<div class="acc-kv-row"><b>出口代理</b><span>' + esc(presetLabelOf(a.proxyPreset)) + (a.proxyPreset === 'custom' && a.customProxy ? ' (' + esc(a.customProxy) + ')' : '') + '</span></div>' +
       '<div class="acc-kv-row"><b>所属分组</b><span>' + grpTxt + '</span></div>' +
       '<div class="acc-kv-row"><b>渠道 Key</b><span>' + keyRow + ' <button type="button" class="act-chip" data-copy-txt="@' + esc(a.id) + '" title="复制账号后缀 @' + esc(a.id) + '">' + svg('copy') + '<span>复制后缀</span></button></span></div>' +
@@ -2638,7 +2714,8 @@ function renderAccountsList() {
       '<div class="acc-kv-row"><b>路由统计</b><span class="mono">总请求 ' + fmt(h.totalRequests || 0) + ' · 新会话 ' + fmt(h.routedNewCount || 0) + ' · 粘性续接 ' + fmt(h.routedStickyCount || 0) + ' · 429限流 ' + fmt(h.error429Count || 0) + ' · 切出 ' + fmt(h.failoverOutCount || 0) + '</span></div>' +
       '</div>' + noteTxt + lastErrTxt + probeTxt +
       '<div class="acc-item-acts">' +
-      '<button type="button" class="btn solid" style="height:26px;padding:0 11px;font-size:12px" data-acc-oauth="' + esc(a.id) + '">' + svg('sparkles') + '<span>' + (a.authenticated ? '网页换号 / 重新授权' : '网页 OAuth 授权') + '</span></button>' +
+      '<button type="button" class="btn solid" style="height:26px;padding:0 11px;font-size:12px" data-acc-oauth="' + esc(a.id) + '">' + svg('sparkles') + '<span>' + (a.authenticated ? '换号 / 重新登录' : '使用 Google 登录') + '</span></button>' +
+      (a.authenticated ? '<button type="button" class="act-chip" data-acc-logout="' + esc(a.id) + '">' + svg('plug') + '<span>退出登录</span></button>' : '') +
       (!a.isActiveTarget ? '<button type="button" class="act-chip" data-acc-act="set_active" data-acc-id="' + esc(a.id) + '">' + svg('circle-dot') + '<span>设为主路由</span></button>' : '') +
       (sched === 'draining'
         ? '<button type="button" class="act-chip" data-acc-act="enable" data-acc-id="' + esc(a.id) + '">' + svg('play') + '<span>恢复接单</span></button>'
@@ -2805,40 +2882,105 @@ async function deleteGroupById(gid) {
   }
 }
 
-function openAccountOAuthBox(accId) {
+function applyOAuthWaitingState(st) {
+  const url = st && st.authUrl ? st.authUrl : '';
+  accState.oauthUrl = url;
+  accState.oauthFlowId = (st && st.flowId) || '';
+  accState.oauthExpiresAt = (st && st.expiresAt) || '';
+  const urlBox = document.getElementById('oauth-url-box');
+  const linkBtn = document.getElementById('oauth-open-link');
+  const copyBtn = document.getElementById('oauth-copy-btn');
+  const cancelBtn = document.getElementById('oauth-cancel-btn');
+  const msg = document.getElementById('oauth-status-msg');
+  if (url) {
+    if (urlBox) { urlBox.hidden = false; urlBox.textContent = url; }
+    if (linkBtn) { linkBtn.hidden = false; linkBtn.href = url; }
+    if (copyBtn) copyBtn.hidden = false;
+  }
+  if (cancelBtn) cancelBtn.hidden = false;
+  setOAuthPhaseBadge('waiting', '等待浏览器授权');
+  stopOAuthCountdown();
+  updateOAuthCountdownUI();
+  if (accState.oauthExpiresAt && typeof setInterval === 'function') {
+    accState.oauthTimer = setInterval(updateOAuthCountdownUI, 1000);
+  }
+  if (msg) {
+    msg.className = 'up-msg ok';
+    msg.textContent = (st && st.message) || '请点击“打开 Google 登录页”完成登录，再将页面显示的授权码或完整回调 URL 粘贴到下方。';
+  }
+}
+
+async function openAccountOAuthBox(accId) {
   const acc = accState.accounts.find(a => a.id === accId) || { id: accId, label: accId };
+  stopOAuthCountdown();
   accState.oauthAccId = acc.id;
   accState.oauthUrl = '';
+  accState.oauthFlowId = '';
+  accState.oauthExpiresAt = '';
   document.getElementById('acc-edit-box').hidden = true;
+  const grpEdit = document.getElementById('acc-group-edit-box');
+  if (grpEdit) grpEdit.hidden = true;
   const box = document.getElementById('acc-oauth-box');
   box.hidden = false;
+  const curIdent = acc.authenticated && acc.email ? ('当前已登录: ' + esc(maskAccountEmail(acc.email))) : (acc.authenticated ? '当前已授权' : '尚未登录');
   box.innerHTML =
-    '<h4><span>网页 OAuth 登录与凭据导入 · ' + esc(acc.label || acc.id) + ' (<code>' + esc(acc.id) + '</code>)</span>' +
+    '<h4><span>Google OAuth 登录 (ACP 模式) · ' + esc(acc.label || acc.id) + ' (<code>' + esc(acc.id) + '</code>)</span>' +
     '<button type="button" class="up-x" data-close-box="acc-oauth-box" aria-label="关闭">' + svg('x') + '</button></h4>' +
-    '<div class="m-note" style="margin-bottom:10px">方式一 (推荐 · 经该账号配置的独立出口代理完成 PKCE 握手)：点击第 1 步生成 Google 登录链接 -> 浏览器登录授权 -> 复制浏览器跳转后的回调地址 (<code>http://localhost:.../?code=...</code>，打不开属正常现象) 粘贴到第 2 步提交。</div>' +
-    '<div class="inst-qacts" style="margin-bottom:10px">' +
-    '<button type="button" class="btn solid" id="oa-start-btn" data-oauth-start="' + esc(acc.id) + '">' + svg('sparkles') + '<span>第 1 步：生成 Google 授权链接</span></button>' +
-    '<a class="btn" id="oa-open-link" href="#" target="_blank" rel="noopener noreferrer" hidden>' + svg('arrow-up-right') + '<span>新窗口打开 Google 登录页</span></a>' +
+    '<div class="acc-oauth-head">' +
+    '<span>' + curIdent + ' · 出口代理: <b>' + esc(presetLabelOf(acc.proxyPreset)) + '</b></span>' +
+    '<span style="display:inline-flex;align-items:center;gap:8px"><span class="m-note" id="oauth-ttl-txt"></span><span class="acc-oauth-phase" id="oauth-phase-badge">初始化中</span></span>' +
     '</div>' +
-    '<div id="oa-url-wrap" hidden style="margin-bottom:10px"><label class="acc-field"><span>Google OAuth 授权链接 (可复制到任意浏览器打开)</span><input type="text" id="oa-url-input" readonly></label></div>' +
     '<div class="acc-form-grid">' +
-    '<label class="acc-field" style="grid-column:1/-1"><span>第 2 步：粘贴浏览器回调完整 URL 或授权码 <code>code</code></span>' +
-    '<div style="display:flex;gap:8px;flex-wrap:wrap"><input type="text" id="oa-code-input" style="flex:1;min-width:180px" placeholder="粘贴 http://localhost:.../?code=4/0A... 或纯授权码">' +
-    '<button type="button" class="btn solid" data-oauth-submit="' + esc(acc.id) + '">' + svg('check') + '<span>提交授权码激活</span></button></div></label>' +
-    '<label class="acc-field" style="grid-column:1/-1;margin-top:6px"><span>方式二 (离线导入)：直接粘贴已有 <code>antigravity-oauth-token</code> JSON 原文</span>' +
-    '<textarea id="oa-token-input" placeholder="{&quot;access_token&quot;:&quot;ya29...&quot;,&quot;refresh_token&quot;:&quot;1//0g...&quot;,&quot;expiry_date&quot;:...}"></textarea></label>' +
+    '<div class="acc-field" style="grid-column:1/-1">' +
+    '<div class="inst-qacts" style="flex-wrap:wrap">' +
+    '<a class="btn solid" id="oauth-open-link" href="#" target="_blank" rel="noopener noreferrer" hidden>' + svg('arrow-up-right') + '<span>打开 Google 登录页</span></a>' +
+    '<button type="button" class="btn" id="oauth-copy-btn" data-oauth-copy="1" hidden>' + svg('copy') + '<span>复制登录链接</span></button>' +
+    '<button type="button" class="btn" id="oauth-start-btn" data-oauth-start="' + esc(acc.id) + '">' + svg('refresh-cw') + '<span>重新生成链接</span></button>' +
+    '<button type="button" class="btn" id="oauth-cancel-btn" data-oauth-cancel="' + esc(acc.id) + '" hidden>' + svg('x') + '<span>取消登录</span></button>' +
     '</div>' +
-    '<div class="up-act"><button type="button" class="btn" data-close-box="acc-oauth-box">关闭</button>' +
-    '<button type="button" class="btn" data-oauth-import="' + esc(acc.id) + '">直接写入 Token JSON</button></div>' +
-    '<div class="up-msg" id="oa-msg"></div>';
+    '<div class="acc-oauth-url" id="oauth-url-box" hidden></div>' +
+    '<form id="oauth-code-form" data-oauth-form="' + esc(acc.id) + '" style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">' +
+    '<input type="text" id="oauth-code-in" autocomplete="off" placeholder="粘贴 Antigravity 页面显示的授权码，或完整回调 URL (https://antigravity.google/oauth-callback?...)" style="flex:1;min-width:240px">' +
+    '<button type="submit" class="btn solid" id="oauth-sub-btn" data-oauth-submit="' + esc(acc.id) + '">' + svg('check') + '<span>验证并连接</span></button>' +
+    '</form></div>' +
+    '<details class="acc-adv" style="grid-column:1/-1">' +
+    '<summary>高级选项: 直接粘贴已有 antigravity-oauth-token / jetski-standalone-oauth-token 文件</summary>' +
+    '<div class="acc-field">' +
+    '<textarea id="oauth-tok-in" placeholder="直接粘贴本机已登录账号的 antigravity-oauth-token 或 jetski-standalone-oauth-token 文件全文"></textarea>' +
+    '<div style="display:flex;justify-content:flex-end;margin-top:6px">' +
+    '<button type="button" class="btn" id="oauth-tok-btn" data-oauth-import="' + esc(acc.id) + '">' + svg('database') + '<span>导入凭据并验证</span></button>' +
+    '</div></div></details></div>' +
+    '<div class="up-msg" id="oauth-status-msg"></div>';
   hydrateIcons(box);
   box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  // Resume an active waiting flow if one is already alive and has >5s left; otherwise auto-start immediately.
+  try {
+    const r = await fetch(apiBaseUrl() + 'api/accounts/oauth/status?accountId=' + encodeURIComponent(acc.id), {
+      credentials: 'same-origin', cache: 'no-store',
+    });
+    if (r.ok) {
+      const d = await r.json();
+      const st = d && d.ok ? d.status : null;
+      if (st && st.phase === 'waiting' && st.authUrl && (!st.expiresAt || Date.parse(st.expiresAt) > Date.now() + 5000)) {
+        if (accState.oauthAccId === acc.id && !box.hidden) {
+          applyOAuthWaitingState(st);
+        }
+        return;
+      }
+    }
+  } catch (_) {}
+  if (accState.oauthAccId === acc.id && !box.hidden) {
+    startWebOAuth(acc.id);
+  }
 }
 
 async function startWebOAuth(accId) {
-  const msg = document.getElementById('oa-msg');
-  const btn = document.getElementById('oa-start-btn');
-  if (msg) { msg.className = 'up-msg'; msg.textContent = '正在隔离沙盒与代理环境中启动 agy /login 生成 PKCE 链接...'; }
+  const msg = document.getElementById('oauth-status-msg');
+  const btn = document.getElementById('oauth-start-btn');
+  stopOAuthCountdown();
+  setOAuthPhaseBadge('starting', '正在启动握手');
+  if (msg) { msg.className = 'up-msg'; msg.textContent = '正在通过该账号独立环境启动 agy acp --login 握手...'; }
   if (btn) btn.disabled = true;
   try {
     const r = await fetch(apiBaseUrl() + 'api/accounts/oauth/start', {
@@ -2848,52 +2990,169 @@ async function startWebOAuth(accId) {
     });
     const d = await r.json();
     if (!d.ok) throw new Error(d.error || ('HTTP ' + r.status));
-    const urlWrap = document.getElementById('oa-url-wrap');
-    const urlIn = document.getElementById('oa-url-input');
-    const openLink = document.getElementById('oa-open-link');
-    if (urlWrap) urlWrap.hidden = false;
-    if (urlIn) urlIn.value = d.authUrl || '';
-    if (openLink && d.authUrl) { openLink.href = d.authUrl; openLink.hidden = false; }
-    if (msg) { msg.className = 'up-msg ok'; msg.textContent = '授权链接已生成 (70 秒内有效)：请在新窗口完成 Google 登录，随后将浏览器地址栏的 localhost 回调链接粘贴到上方第 2 步提交。'; }
+    if (typeof d.authUrl !== 'string' || !d.authUrl.startsWith('https://accounts.google.com/')) {
+      throw new Error('返回了非预期的授权 URL');
+    }
+    applyOAuthWaitingState(d.status || {
+      authUrl: d.authUrl,
+      flowId: d.flowId || '',
+      expiresAt: d.expiresAt || '',
+      message: d.message || '',
+    });
   } catch (e) {
-    if (msg) { msg.className = 'up-msg bad'; msg.textContent = '生成授权链接失败: ' + e.message; }
+    setOAuthPhaseBadge('failed', '启动失败');
+    if (msg) { msg.className = 'up-msg bad'; msg.textContent = '获取授权链接失败: ' + e.message; }
   } finally {
     if (btn) btn.disabled = false;
   }
 }
 
+async function copyWebOAuthURL() {
+  const msg = document.getElementById('oauth-status-msg');
+  const url = accState.oauthUrl || '';
+  if (!url) return;
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(url);
+      if (msg) { msg.className = 'up-msg ok'; msg.textContent = '已复制 Google 登录链接到剪贴板。'; }
+      return;
+    }
+  } catch (_) {}
+  if (msg) { msg.className = 'up-msg'; msg.textContent = '当前环境无法直接写入剪贴板，请手动复制上方链接。'; }
+}
+
+function clearOAuthWaitingUI() {
+  stopOAuthCountdown();
+  accState.oauthUrl = '';
+  accState.oauthFlowId = '';
+  accState.oauthExpiresAt = '';
+  const urlBox = document.getElementById('oauth-url-box');
+  const linkBtn = document.getElementById('oauth-open-link');
+  const copyBtn = document.getElementById('oauth-copy-btn');
+  const cancelBtn = document.getElementById('oauth-cancel-btn');
+  if (urlBox) urlBox.hidden = true;
+  if (linkBtn) linkBtn.hidden = true;
+  if (copyBtn) copyBtn.hidden = true;
+  if (cancelBtn) cancelBtn.hidden = true;
+  const ttlEl = document.getElementById('oauth-ttl-txt');
+  if (ttlEl) ttlEl.textContent = '';
+}
+
+async function cancelWebOAuth(accId) {
+  const msg = document.getElementById('oauth-status-msg');
+  const cancelBtn = document.getElementById('oauth-cancel-btn');
+  stopOAuthCountdown();
+  if (cancelBtn) cancelBtn.disabled = true;
+  try {
+    const r = await fetch(apiBaseUrl() + 'api/accounts/oauth/cancel', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-Agy-Requested-With': 'dashboard' },
+      body: JSON.stringify({ accountId: accId, flowId: accState.oauthFlowId || '' }),
+    });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    clearOAuthWaitingUI();
+    setOAuthPhaseBadge('cancelled', '已取消');
+    if (msg) { msg.className = 'up-msg'; msg.textContent = '已取消本次 Google 登录，原有凭据（如有）已保留。'; }
+  } catch (e) {
+    if (msg) { msg.className = 'up-msg bad'; msg.textContent = '取消登录失败: ' + e.message; }
+  } finally {
+    if (cancelBtn) cancelBtn.disabled = false;
+  }
+}
+
 async function submitWebOAuthCode(accId) {
-  const code = (document.getElementById('oa-code-input').value || '').trim();
-  const msg = document.getElementById('oa-msg');
+  const codeEl = document.getElementById('oauth-code-in');
+  const msg = document.getElementById('oauth-status-msg');
+  const btn = document.getElementById('oauth-sub-btn');
+  const code = (codeEl && codeEl.value || '').trim();
   if (!code) {
-    if (msg) { msg.className = 'up-msg bad'; msg.textContent = '请先粘贴回调 URL 或授权码'; }
+    if (msg) { msg.className = 'up-msg bad'; msg.textContent = '请先粘贴 Google 授权码或完整回调 URL'; }
     return;
   }
-  if (msg) { msg.className = 'up-msg'; msg.textContent = '正在向 Google 交换 OAuth 凭据并校验账号订阅档位...'; }
+  setOAuthPhaseBadge('verifying', '验证中');
+  if (msg) { msg.className = 'up-msg'; msg.textContent = '正在经该账号专属代理向 Google 换取凭据并校验 Antigravity 访问权限...'; }
+  if (btn) btn.disabled = true;
   try {
     const r = await fetch(apiBaseUrl() + 'api/accounts/oauth/submit', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json', 'X-Agy-Requested-With': 'dashboard' },
-      body: JSON.stringify({ accountId: accId, code }),
+      body: JSON.stringify({ accountId: accId, flowId: accState.oauthFlowId || '', code }),
     });
     const d = await r.json();
     if (!d.ok) throw new Error(d.error || ('HTTP ' + r.status));
-    if (msg) { msg.className = 'up-msg ok'; msg.textContent = '授权成功：' + (d.tier || '已激活') + '，独立网关子进程已自动拉起。'; }
+    clearOAuthWaitingUI();
+    if (codeEl) codeEl.value = '';
+    setOAuthPhaseBadge('succeeded', '已连接');
+    const who = d.email ? (d.email + ' · ') : '';
+    if (msg) { msg.className = 'up-msg ok'; msg.textContent = '登录成功并已验证: ' + who + (d.tier || '已激活'); }
+    showAccToast('Google 登录成功: ' + accId);
     await loadAccounts();
     await load(true, false);
   } catch (e) {
-    if (msg) { msg.className = 'up-msg bad'; msg.textContent = '提交授权码失败: ' + e.message; }
+    let stillWaiting = false;
+    try {
+      const sr = await fetch(apiBaseUrl() + 'api/accounts/oauth/status?accountId=' + encodeURIComponent(accId), {
+        credentials: 'same-origin', cache: 'no-store',
+      });
+      if (sr.ok) {
+        const sd = await sr.json();
+        const st = sd && sd.ok ? sd.status : null;
+        stillWaiting = !!(st && st.phase === 'waiting' && st.authUrl);
+      }
+    } catch (_) {}
+    if (stillWaiting) {
+      setOAuthPhaseBadge('waiting', '等待重试');
+    } else {
+      clearOAuthWaitingUI();
+      setOAuthPhaseBadge('failed', '验证失败');
+    }
+    if (msg) { msg.className = 'up-msg bad'; msg.textContent = '登录验证失败: ' + e.message; }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function logoutAccountById(accId) {
+  const acc = accState.accounts.find(a => a.id === accId);
+  const name = acc ? (acc.label + ' (' + acc.id + ')') : accId;
+  if (!window.confirm('确认退出账号 ' + name + ' 的 Google 登录？该操作将清除其隔离凭据并停止对应后端进程。')) {
+    return;
+  }
+  try {
+    const r = await fetch(apiBaseUrl() + 'api/accounts/oauth/logout', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-Agy-Requested-With': 'dashboard' },
+      body: JSON.stringify({ accountId: accId }),
+    });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    accState.probeMap[accId] = '已退出 Google 登录并清除隔离凭据';
+    if (accState.oauthAccId === accId) {
+      stopOAuthCountdown();
+      document.getElementById('acc-oauth-box').hidden = true;
+    }
+    showAccToast('已退出登录: ' + accId);
+    await loadAccounts();
+    await load(true, false);
+  } catch (e) {
+    accState.probeMap[accId] = '退出失败: ' + e.message;
+    renderAccountsList();
   }
 }
 
 async function importAccountToken(accId) {
-  const token = (document.getElementById('oa-token-input').value || '').trim();
-  const msg = document.getElementById('oa-msg');
+  const tokEl = document.getElementById('oauth-tok-in');
+  const msg = document.getElementById('oauth-status-msg');
+  const btn = document.getElementById('oauth-tok-btn');
+  const token = (tokEl && tokEl.value || '').trim();
   if (!token) {
-    if (msg) { msg.className = 'up-msg bad'; msg.textContent = '请先粘贴 antigravity-oauth-token JSON 内容'; }
+    if (msg) { msg.className = 'up-msg bad'; msg.textContent = '请先粘贴 antigravity-oauth-token / jetski-standalone-oauth-token JSON 内容'; }
     return;
   }
-  if (msg) { msg.className = 'up-msg'; msg.textContent = '正在写入隔离凭据并探测账号模型权限...'; }
+  setOAuthPhaseBadge('verifying', '验证中');
+  if (msg) { msg.className = 'up-msg'; msg.textContent = '正在写入隔离凭据并经该账号专属代理校验 Antigravity 访问权限...'; }
+  if (btn) btn.disabled = true;
   try {
     const r = await fetch(apiBaseUrl() + 'api/accounts/token', {
       method: 'POST', credentials: 'same-origin',
@@ -2902,11 +3161,19 @@ async function importAccountToken(accId) {
     });
     const d = await r.json();
     if (!d.ok) throw new Error(d.error || ('HTTP ' + r.status));
-    if (msg) { msg.className = 'up-msg ok'; msg.textContent = 'Token 导入成功：' + (d.tier || '已激活'); }
+    clearOAuthWaitingUI();
+    setOAuthPhaseBadge('succeeded', '已导入');
+    const who = d.email ? (d.email + ' · ') : '';
+    if (msg) { msg.className = 'up-msg ok'; msg.textContent = '凭据导入并验证成功: ' + who + (d.tier || '已激活'); }
+    if (tokEl) tokEl.value = '';
+    showAccToast('凭据导入成功: ' + accId);
     await loadAccounts();
     await load(true, false);
   } catch (e) {
+    setOAuthPhaseBadge('failed', '导入失败');
     if (msg) { msg.className = 'up-msg bad'; msg.textContent = '导入失败: ' + e.message; }
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -2929,6 +3196,7 @@ function openAccountEditForm(acc) {
     maxLiveWorkers: 3, maxConcurrency: 0, priority: 100, weight: 1, schedState: 'active',
     groups: [], notes: '', boundKeys: [], allowedModels: ['gemini-4-neon'], enabled: true, primary: false
   };
+  stopOAuthCountdown();
   document.getElementById('acc-oauth-box').hidden = true;
   const box = document.getElementById('acc-edit-box');
   box.hidden = false;
@@ -3075,6 +3343,13 @@ async function deleteAccountById(accId) {
 document.getElementById('acc-add-btn').addEventListener('click', () => openAccountEditForm(null));
 document.getElementById('acc-add-grp-btn').addEventListener('click', () => openGroupEditForm(null));
 document.getElementById('acc-close-btn').addEventListener('click', () => closeAccModal());
+document.getElementById('acc-modal').addEventListener('submit', (e) => {
+  const form = e.target.closest('[data-oauth-form]');
+  if (form) {
+    e.preventDefault();
+    submitWebOAuthCode(form.dataset.oauthForm);
+  }
+});
 document.getElementById('acc-modal').addEventListener('change', (e) => {
   const stratSel = e.target.closest('[data-pool-strat]');
   if (stratSel) { updatePoolRoutingQuick({ strategy: stratSel.value }); return; }
@@ -3114,8 +3389,16 @@ document.getElementById('acc-modal').addEventListener('click', (e) => {
   }
   const closeBox = e.target.closest('[data-close-box]');
   if (closeBox) {
+    if (closeBox.dataset.closeBox === 'acc-oauth-box') stopOAuthCountdown();
     const target = document.getElementById(closeBox.dataset.closeBox);
     if (target) target.hidden = true;
+    return;
+  }
+  const emailBtn = e.target.closest('[data-toggle-email]');
+  if (emailBtn) {
+    const eid = emailBtn.dataset.toggleEmail;
+    accState.revealEmail[eid] = !accState.revealEmail[eid];
+    renderAccountsList();
     return;
   }
   const presetBtn = e.target.closest('[data-model-preset]');
@@ -3138,12 +3421,18 @@ document.getElementById('acc-modal').addEventListener('click', (e) => {
   }
   const startBtn = e.target.closest('[data-oauth-start]');
   if (startBtn) { startWebOAuth(startBtn.dataset.oauthStart); return; }
+  const copyOAuthBtn = e.target.closest('[data-oauth-copy]');
+  if (copyOAuthBtn) { copyWebOAuthURL(); return; }
+  const cancelOAuthBtn = e.target.closest('[data-oauth-cancel]');
+  if (cancelOAuthBtn) { cancelWebOAuth(cancelOAuthBtn.dataset.oauthCancel); return; }
   const subBtn = e.target.closest('[data-oauth-submit]');
-  if (subBtn) { submitWebOAuthCode(subBtn.dataset.oauthSubmit); return; }
+  if (subBtn && subBtn.type !== 'submit') { submitWebOAuthCode(subBtn.dataset.oauthSubmit); return; }
   const impBtn = e.target.closest('[data-oauth-import]');
   if (impBtn) { importAccountToken(impBtn.dataset.oauthImport); return; }
   const ob = e.target.closest('[data-acc-oauth]');
   if (ob) { openAccountOAuthBox(ob.dataset.accOauth); return; }
+  const lb = e.target.closest('[data-acc-logout]');
+  if (lb) { logoutAccountById(lb.dataset.accLogout); return; }
   const eb = e.target.closest('[data-acc-edit]');
   if (eb) { openAccountEditForm(accState.accounts.find(a => a.id === eb.dataset.accEdit)); return; }
   const pb = e.target.closest('[data-acc-probe]');
