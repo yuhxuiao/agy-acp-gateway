@@ -585,10 +585,23 @@ func fetchOfficialQuotaSyncWith(binPath string, cmdEnv []string) QuotaSnapshot {
 var (
 	officialQuotaTimeout = 15 * time.Second
 	creditsProbeTimeout  = 8 * time.Second
+	agyCliProbeSem       = make(chan struct{}, 2)
 
 	creditsTierMu    sync.Mutex
 	creditsTierCache = make(map[string]creditsTierCacheEntry)
 )
+
+func acquireAgyCliProbeSlot(ctx context.Context) (func(), bool) {
+	select {
+	case agyCliProbeSem <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() { <-agyCliProbeSem })
+		}, true
+	case <-ctx.Done():
+		return func() {}, false
+	}
+}
 
 type creditsTierCacheEntry struct {
 	tier      string
@@ -738,14 +751,21 @@ func resolveAuthoritativePlanTierFromCredits(binPath string, cmdEnv []string, pu
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binPath, "-p", "/credits", "--output-format", "json")
-	cmd.Env = cmdEnv
-	configureQuotaSubprocess(cmd)
+	relSlot, okSlot := acquireAgyCliProbeSlot(ctx)
+	var err error
 	stdoutW := &authPromptAbortWriter{cancel: cancel}
 	stderrW := &authPromptAbortWriter{cancel: cancel}
-	cmd.Stdout = stdoutW
-	cmd.Stderr = stderrW
-	err := cmd.Run()
+	if !okSlot {
+		err = ctx.Err()
+	} else {
+		cmd := exec.CommandContext(ctx, binPath, "-p", "/credits", "--output-format", "json")
+		cmd.Env = cmdEnv
+		configureQuotaSubprocess(cmd)
+		cmd.Stdout = stdoutW
+		cmd.Stderr = stderrW
+		err = cmd.Run()
+		relSlot()
+	}
 
 	detected := ""
 	outBytes := stdoutW.Bytes()
@@ -784,6 +804,11 @@ func resolveAuthoritativePlanTierFromCredits(binPath string, cmdEnv []string, pu
 	creditsTierMu.Lock()
 	creditsTierCache[key] = creditsTierCacheEntry{tier: detected, checkedAt: time.Now()}
 	creditsTierMu.Unlock()
+	if detected != "" && !isChildAccountWorker() && GlobalAccountManager != nil && GlobalAccountManager.HasConfiguredAccounts() {
+		if prim, ok := GlobalAccountManager.GetPrimaryAccount(); ok && filepath.Clean(pureHome) == filepath.Clean(PureApiHome) {
+			GlobalAccountManager.SetAccountPlanTierHint(prim.ID, detected)
+		}
+	}
 	return detected
 }
 
@@ -820,14 +845,21 @@ func fetchOfficialQuotaDoWith(binPath string, cmdEnv []string) QuotaSnapshot {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binPath, "-p", "/usage", "--output-format", "json")
-	cmd.Env = cmdEnv
-	configureQuotaSubprocess(cmd)
+	relSlot, okSlot := acquireAgyCliProbeSlot(ctx)
+	var err error
 	stdoutW := &authPromptAbortWriter{cancel: cancel}
 	stderrW := &authPromptAbortWriter{cancel: cancel}
-	cmd.Stdout = stdoutW
-	cmd.Stderr = stderrW
-	err := cmd.Run()
+	if !okSlot {
+		err = ctx.Err()
+	} else {
+		cmd := exec.CommandContext(ctx, binPath, "-p", "/usage", "--output-format", "json")
+		cmd.Env = cmdEnv
+		configureQuotaSubprocess(cmd)
+		cmd.Stdout = stdoutW
+		cmd.Stderr = stderrW
+		err = cmd.Run()
+		relSlot()
+	}
 	out := stdoutW.Bytes()
 	if err != nil || len(out) == 0 {
 		errMsg := "Empty /usage output"

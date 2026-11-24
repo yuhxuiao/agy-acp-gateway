@@ -559,11 +559,19 @@ func BuildFederatedDashboardPayload(gw *GatewayServer, forceQuota bool) map[stri
 	results := make([]peerResult, len(peers))
 	if len(peers) > 0 {
 		fallbackKey := defaultPeerAPIKey(snap)
+		var refreshSem chan struct{}
+		if forceQuota && len(peers) > 3 {
+			refreshSem = make(chan struct{}, 3)
+		}
 		var peerWg sync.WaitGroup
 		for i, p := range peers {
 			peerWg.Add(1)
 			go func(idx int, peer gwcfg.DashboardPeerConfig) {
 				defer peerWg.Done()
+				if refreshSem != nil {
+					refreshSem <- struct{}{}
+					defer func() { <-refreshSem }()
+				}
 				dec, reach, st, fat, em := fetchPeerDashboard(peer, forceQuota, fallbackKey)
 				results[idx] = peerResult{
 					cfg:       peer,

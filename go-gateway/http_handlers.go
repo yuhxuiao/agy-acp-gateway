@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -118,6 +120,64 @@ func isAllowedLoopbackHost(hostHdr string) bool {
 
 func isDataPlaneCORSPath(path string) bool {
 	return strings.HasPrefix(path, "/v1/") || strings.HasPrefix(path, "/v1beta/")
+}
+
+func computeDashboardETag(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	norm := make(map[string]any, len(payload))
+	for k, v := range payload {
+		if k == "now" {
+			continue
+		}
+		if k == "instances" {
+			if insts, ok := v.([]map[string]any); ok {
+				cpList := make([]map[string]any, len(insts))
+				for i, inst := range insts {
+					if inst == nil {
+						continue
+					}
+					if isSelf, _ := inst["self"].(bool); isSelf {
+						cp := make(map[string]any, len(inst))
+						for ik, iv := range inst {
+							if ik != "fetchedAt" {
+								cp[ik] = iv
+							}
+						}
+						cpList[i] = cp
+					} else {
+						cpList[i] = inst
+					}
+				}
+				norm[k] = cpList
+				continue
+			}
+		}
+		norm[k] = v
+	}
+	b, err := json.Marshal(norm)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return `W/"` + hex.EncodeToString(sum[:12]) + `"`
+}
+
+func ifNoneMatchMatches(hdrVal, etag string) bool {
+	if hdrVal == "" || etag == "" {
+		return false
+	}
+	for _, raw := range strings.Split(hdrVal, ",") {
+		cand := strings.TrimSpace(raw)
+		if cand == "*" || cand == etag {
+			return true
+		}
+		if strings.TrimPrefix(cand, "W/") == strings.TrimPrefix(etag, "W/") {
+			return true
+		}
+	}
+	return false
 }
 
 func isDirectLoopbackSameOrigin(r *http.Request) bool {
@@ -555,7 +615,17 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			payload = BuildFederatedDashboardPayload(gs, force)
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Vary", "Authorization, Cookie, x-api-key")
+		if etag := computeDashboardETag(payload); etag != "" {
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Cache-Control", "private, no-cache, must-revalidate")
+			if !force && ifNoneMatchMatches(r.Header.Get("If-None-Match"), etag) {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		} else {
+			w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		}
 		_ = json.NewEncoder(w).Encode(payload)
 		return
 	}

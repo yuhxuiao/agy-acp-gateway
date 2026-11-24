@@ -566,24 +566,25 @@ type familyCooldownEntry struct {
 }
 
 type accountHealthRuntime struct {
-	authErrorUntil    time.Time
-	authErrorReason   string
-	tosTripped        bool
-	tosReason         string
-	familyCooldowns   map[string]familyCooldownEntry
-	consecutiveFails  int
-	totalRequests     uint64
-	totalFailures     uint64
-	routedNewCount    uint64
-	routedStickyCount uint64
-	failoverOutCount  uint64
-	error429Count     uint64
-	error529Count     uint64
-	lastRoutedAt      time.Time
-	lastRouteMode     string
-	lastSuccessAt     time.Time
-	lastErrorAt       time.Time
-	lastError         string
+	authErrorUntil     time.Time
+	authErrorReason    string
+	tosTripped         bool
+	tosReason          string
+	familyCooldowns    map[string]familyCooldownEntry
+	consecutiveFails   int
+	totalRequests      uint64
+	totalFailures      uint64
+	routedNewCount     uint64
+	routedStickyCount  uint64
+	failoverOutCount   uint64
+	error429Count      uint64
+	error529Count      uint64
+	lastRoutedAt       time.Time
+	lastRouteMode      string
+	lastSuccessAt      time.Time
+	lastErrorAt        time.Time
+	lastError          string
+	lastQuota429SyncAt time.Time
 }
 
 // AccountHealthView is the JSON-safe health & routing telemetry summary returned by /api/accounts and federated dashboard cards.
@@ -949,7 +950,14 @@ func (am *AccountManager) RecordAccountOutcome(accountID, canonicalModelID strin
 		}
 		st.lastErrorAt = now
 		st.lastError = cleanMsg
+		shouldSyncQuota := st.lastQuota429SyncAt.IsZero() || now.Sub(st.lastQuota429SyncAt) >= 45*time.Second
+		if shouldSyncQuota {
+			st.lastQuota429SyncAt = now
+		}
 		am.healthMu.Unlock()
+		if shouldSyncQuota && !testing.Testing() {
+			am.triggerTargeted429QuotaRefresh(id)
+		}
 		return
 	}
 
@@ -1010,6 +1018,27 @@ func (am *AccountManager) RecordAccountOutcome(accountID, canonicalModelID strin
 	}
 
 	am.healthMu.Unlock()
+}
+
+func (am *AccountManager) triggerTargeted429QuotaRefresh(accountID string) {
+	if am == nil || accountID == "" || isChildAccountWorker() {
+		return
+	}
+	if accountID == "primary" {
+		startBackgroundQuotaRefresh()
+		return
+	}
+	if running, _, dashPort := am.IsWorkerRunning(accountID); running && dashPort > 0 {
+		peer := gwcfg.DashboardPeerConfig{
+			ID:      accountID,
+			Label:   accountID,
+			BaseURL: fmt.Sprintf("http://127.0.0.1:%d", dashPort),
+		}
+		fallbackKey := defaultPeerAPIKey(gwcfg.Current())
+		go func(p gwcfg.DashboardPeerConfig, k string) {
+			_, _, _, _, _ = fetchPeerDashboard(p, true, k)
+		}(peer, fallbackKey)
+	}
 }
 
 // RecordQuotaSyncOutcome classifies recognizable ban, suspension, or auth errors from /usage

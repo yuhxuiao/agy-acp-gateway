@@ -821,6 +821,9 @@
           <button type="button" data-acc-tab="groups" id="acc-tab-groups-btn">渠道分组池</button>
         </div>
         <div class="inst-qacts">
+          <button type="button" class="act-chip" data-copy-client-tpl="anthropic" title="复制 Anthropic/Claude Code 接入环境变量模板"><span data-ic="copy"></span><span>复制 Anthropic 接入</span></button>
+          <button type="button" class="act-chip" data-copy-client-tpl="openai" title="复制 OpenAI 兼容客户端接入环境变量模板"><span data-ic="copy"></span><span>复制 OpenAI 接入</span></button>
+          <button type="button" class="act-chip" data-copy-client-tpl="gemini" title="复制 Gemini v1beta 接入环境变量模板"><span data-ic="copy"></span><span>复制 Gemini 接入</span></button>
           <button type="button" class="act-chip" data-toggle-adv-routing="1"><span data-ic="sliders-horizontal"></span><span>高级故障转移与粘性护栏</span></button>
         </div>
       </div>
@@ -2160,21 +2163,71 @@ function render(d, fromPoll = false) {
 let loadSeq = 0;
 let pollInFlight = false;
 let refreshInFlight = false;
+let lastDashETag = '';
+let idleUnchangedPolls = 0;
+let pollTimerId = null;
+
+function computeNextPollDelayMs() {
+  const activeCnt = Number((((state.data || {}).gateway || {}).activeSessionsCount) || 0);
+  if (activeCnt > 0 || idleUnchangedPolls < 3) return 2500;
+  if (idleUnchangedPolls < 8) return 6000;
+  return 10000;
+}
+
+function scheduleNextPoll(delayMs) {
+  if (pollTimerId) {
+    clearTimeout(pollTimerId);
+    pollTimerId = null;
+  }
+  const wait = typeof delayMs === 'number' ? delayMs : computeNextPollDelayMs();
+  pollTimerId = setTimeout(async () => {
+    pollTimerId = null;
+    if (state.auto && !document.hidden) {
+      await load(false, true);
+    }
+    scheduleNextPoll();
+  }, wait);
+}
+
 async function load(force = false, fromPoll = false) {
   if (fromPoll && (pollInFlight || refreshInFlight)) return;
   if (force && refreshInFlight) return;
   const mySeq = ++loadSeq;
   if (fromPoll) pollInFlight = true;
-  if (force) refreshInFlight = true;
+  if (force) {
+    refreshInFlight = true;
+    idleUnchangedPolls = 0;
+  }
   try {
     const base = location.protocol.startsWith('http') ? '' : 'http://127.0.0.1:18891/';
-    const r = await fetch(base + 'api/dashboard' + (force ? '?refresh=1' : ''), { credentials: 'same-origin', cache: 'no-store' });
+    const headers = {};
+    if (!force && lastDashETag) headers['If-None-Match'] = lastDashETag;
+    const r = await fetch(base + 'api/dashboard' + (force ? '?refresh=1' : ''), {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers,
+    });
+    if (r.status === 304) {
+      if (mySeq === loadSeq) {
+        const activeCnt = Number((((state.data || {}).gateway || {}).activeSessionsCount) || 0);
+        idleUnchangedPolls = activeCnt > 0 ? 0 : Math.min(idleUnchangedPolls + 1, 20);
+        document.getElementById('live-txt').textContent = '实时在线';
+        document.getElementById('live-dot').className = 'dot on';
+      }
+      return;
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
+    const etag = r.headers.get('ETag') || '';
     const d = await r.json();
     if (!d || typeof d !== 'object' || !d.windows) throw new Error('Invalid dashboard payload');
-    if (mySeq === loadSeq) render(d, fromPoll);
+    if (mySeq === loadSeq) {
+      if (etag) lastDashETag = etag;
+      idleUnchangedPolls = 0;
+      render(d, fromPoll);
+    }
   } catch (e) {
     if (mySeq === loadSeq) {
+      idleUnchangedPolls = 0;
       document.getElementById('live-txt').textContent = '连接断开';
       document.getElementById('live-dot').className = 'dot off';
     }
@@ -3200,6 +3253,25 @@ document.getElementById('acc-modal').addEventListener('change', (e) => {
 document.getElementById('acc-modal').addEventListener('click', (e) => {
   const tabBtn = e.target.closest('[data-acc-tab]');
   if (tabBtn) { switchAccModalTab(tabBtn.dataset.accTab); return; }
+  const tplBtn = e.target.closest('[data-copy-client-tpl]');
+  if (tplBtn) {
+    const kind = tplBtn.dataset.copyClientTpl || 'anthropic';
+    const gwPort = Number((((state.data || {}).gateway || {}).port) || 18890);
+    const host = (location.hostname && location.hostname !== '') ? location.hostname : '127.0.0.1';
+    const baseUrl = (location.protocol === 'https:' ? 'https://' : 'http://') + host + ':' + gwPort;
+    let snippet = '';
+    if (kind === 'openai') {
+      snippet = 'export OPENAI_BASE_URL="' + baseUrl + '/v1"\nexport OPENAI_API_KEY="<YOUR_API_KEY>"';
+    } else if (kind === 'gemini') {
+      snippet = 'export GEMINI_API_BASE_URL="' + baseUrl + '"\nexport GEMINI_API_KEY="<YOUR_API_KEY>"';
+    } else {
+      snippet = 'export ANTHROPIC_BASE_URL="' + baseUrl + '"\nexport ANTHROPIC_API_KEY="<YOUR_API_KEY>"';
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(snippet).then(() => showAccToast('已复制 ' + kind.toUpperCase() + ' 接入模板（请替换 <YOUR_API_KEY>）')).catch(() => {});
+    }
+    return;
+  }
   const advBtn = e.target.closest('[data-toggle-adv-routing]');
   if (advBtn) {
     const box = document.getElementById('acc-adv-routing-box');
@@ -3274,7 +3346,14 @@ load(false, false);
 loadUpgrade();
 loadAccounts();
 setInterval(() => { if (!document.hidden) loadUpgrade(); }, 30000);
-setInterval(() => { if (state.auto && !document.hidden) load(false, true); }, 2500);
+scheduleNextPoll(2500);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && state.auto) {
+    idleUnchangedPolls = 0;
+    load(false, true);
+    scheduleNextPoll(2500);
+  }
+});
 </script>
 </body>
 </html>
