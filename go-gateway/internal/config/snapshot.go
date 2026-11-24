@@ -14,6 +14,7 @@ import (
 // Snapshot holds all process configuration parsed from environment variables at startup or Reload.
 // Callers must treat the returned *Snapshot and any collections accessed via it as immutable.
 type Snapshot struct {
+	PromptPlacement        string
 	ProjectHome            string
 	PatchedAgyBin          string
 	PureApiHome            string
@@ -305,6 +306,7 @@ func LoadFromEnv() *Snapshot {
 		capFallbackMaxTTL = capFallbackTTL
 	}
 	return &Snapshot{
+		PromptPlacement:        EnvStr("AGY_PROMPT_PLACEMENT", "append"),
 		ProjectHome:            home,
 		PatchedAgyBin:          EnvStr("AGY_ACP_BIN", filepath.Join(home, "bin", "agy-acp-900k")),
 		PureApiHome:            EnvStr("AGY_PURE_API_HOME", filepath.Join(home, "runtime", "pure-api-home")),
