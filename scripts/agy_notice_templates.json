@@ -1,0 +1,22 @@
+{
+ "templates": [
+  "API error (attempt %d): %vinvalid JSON arguments: %w%s read_file path is emptypng: unsupported feature: /usr/local/google/tmp/figd/export/hda3/tmp/csd_statestdout connected elsewherefailed to set PTY",
+  "API error (attempt N)` message in the editor's chat each time the CLI retried a model request, even when the retry succeeded; retries are now silent, as in the terminal, and the chat shows an error on",
+  "Agent execution terminated due to error.",
+  "Authorization code submission timed out. Please try again.",
+  "Couldn't load older messages · Retry` lets you try again instead of the view retrying silently every time you scroll up.",
+  "ERROR\"`: Execution terminated due to an error.",
+  "Our servers are experiencing high traffic right now, please try again in a minute.",
+  "Step was interrupted due to server shutdown",
+  "The stream was interrupted.",
+  "The stream was interrupted. Please continue the task you were working on.",
+  "There was a network issue connecting to the server, please try again.",
+  "This usually takes about 30 seconds. Please try again later.",
+  "Thread finding callback was interrupted or crashed; can't fix this",
+  "Your image generation quota has been exceeded. Please try again later.",
+  "[))automatic continuation was interrupted after %d completed hop(s); the partial interaction (status requires_continuation) and its continuation_token can be used to resume",
+  "fingerprint])?malformed ws or wss URLwebsocket: write closed (invalid payload data)proxy: unknown scheme: proxy: SOCKS5 proxy at THIRD_PARTY_NOTICES.txtprogram was interrupted",
+  "s]model output must contain either output text or tool calls, these cannot both be empty, please try again[Policy",
+  "the connection to the agent was interrupted before the response started: %wtheme schedule: entry %q: theme ID must be non-empty, lowercase and trimmeda Styles hook set a Transform on a style, which render."
+ ]
+}
