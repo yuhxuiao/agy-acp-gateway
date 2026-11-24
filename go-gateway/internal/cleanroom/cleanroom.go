@@ -421,6 +421,10 @@ func PruneClientSystemPrompt(rawSys string, applyWaf, applyWafCtx func(string) s
 			}
 			rules = append(rules, sentence)
 		}
+		if !prunedAny {
+			kept = append(kept, line)
+			continue
+		}
 		if len(rules) == 0 && prunedAny {
 			continue
 		}
