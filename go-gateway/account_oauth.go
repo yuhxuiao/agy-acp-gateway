@@ -28,6 +28,37 @@ func openLinuxPTY() (master *os.File, slave *os.File, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	if runtime.GOOS == "darwin" {
+		const (
+			tiocptygrant = 0x20007454 // _IO('t', 84)
+			tiocptyunlk  = 0x20007452 // _IO('t', 82)
+			tiocptygname = 0x40807453 // _IOC(IOC_OUT, 't', 83, 128)
+		)
+		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), tiocptygrant, 0); errno != 0 {
+			_ = ptmx.Close()
+			return nil, nil, errno
+		}
+		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), tiocptyunlk, 0); errno != 0 {
+			_ = ptmx.Close()
+			return nil, nil, errno
+		}
+		var nameBuf [128]byte
+		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), tiocptygname, uintptr(unsafe.Pointer(&nameBuf[0]))); errno != 0 {
+			_ = ptmx.Close()
+			return nil, nil, errno
+		}
+		n := bytes.IndexByte(nameBuf[:], 0)
+		if n <= 0 {
+			_ = ptmx.Close()
+			return nil, nil, errors.New("empty darwin pty slave path")
+		}
+		pts, err := os.OpenFile(string(nameBuf[:n]), os.O_RDWR|syscall.O_NOCTTY, 0)
+		if err != nil {
+			_ = ptmx.Close()
+			return nil, nil, err
+		}
+		return ptmx, pts, nil
+	}
 	var unlock int32
 	const tiocsptlck = 0x40045431
 	const tiocgptn = 0x80045430
@@ -46,6 +77,25 @@ func openLinuxPTY() (master *os.File, slave *os.File, err error) {
 		return nil, nil, err
 	}
 	return ptmx, pts, nil
+}
+
+func summarizeOAuthFailureOutput(outStr string) string {
+	var errLines []string
+	for _, ln := range strings.Split(outStr, "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" ||
+			strings.HasPrefix(t, "Authentication required.") ||
+			strings.HasPrefix(t, "https://accounts.google.com/o/oauth2/auth") ||
+			strings.HasPrefix(t, "Waiting for authentication") ||
+			strings.HasPrefix(t, "Or, paste the authorization code") {
+			continue
+		}
+		errLines = append(errLines, t)
+	}
+	if len(errLines) > 0 {
+		return strings.Join(errLines, " | ")
+	}
+	return strings.TrimSpace(outStr)
 }
 
 func redactAccountErrorString(s string, proxyStr string) string {
@@ -765,7 +815,8 @@ waitLoop:
 		sess.outMu.Lock()
 		outStr := strings.TrimSpace(sess.output.String())
 		sess.outMu.Unlock()
-		return "", 0, fmt.Errorf("OAuth 换取凭据未成功: %s", redactAccountErrorString(truncateRunes(outStr, 240), proxy))
+		errSummary := summarizeOAuthFailureOutput(outStr)
+		return "", 0, fmt.Errorf("OAuth 换取凭据未成功: %s", redactAccountErrorString(truncateRunes(errSummary, 240), proxy))
 	}
 
 	_ = os.Chmod(sess.tokenPath, 0o600)
