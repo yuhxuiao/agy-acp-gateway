@@ -421,31 +421,52 @@ def production_env():
     return env
 
 
-def install(stage):
+def gateway_is_running(port=18890):
+    req = urllib.request.Request(f"http://127.0.0.1:{int(port)}/healthz")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=1.5) as resp:
+            return resp.status == 200
+    except OSError:
+        return False
+
+
+def install(stage, *, force_restart=False):
     from agy_upgrade_e2e import run_probe
     # A fully qualified candidate is required; install never builds implicitly.
     manifest = validate_manifest(stage)
     backup = backup_release()
     write_json(STATE/"last-backup.json", {"path": str(backup)})
     env = production_env()
-    run([ROOT/"scripts/gw.sh", "stop"], env=env, timeout=40)
+    live_gw = ROOT/"bin"/FILES["gateway"]
+    gw_unchanged = live_gw.is_file() and sha(live_gw) == sha(stage/FILES["gateway"])
+    hot_swap = (not force_restart) and gw_unchanged and gateway_is_running(18890)
+    if not hot_swap:
+        run([ROOT/"scripts/gw.sh", "stop"], env=env, timeout=40)
     try:
-        for name in FILES.values():
-            atomic_copy(stage/name, ROOT/"bin"/name)
-        atomic_copy(stage/"manifest.json", ROOT/"bin/agy-acp-900k.manifest.json")
-        run([ROOT/"scripts/gw.sh", "start", "go"], env=env, timeout=40)
+        if hot_swap:
+            atomic_copy(stage/FILES["upstream"], ROOT/"bin"/FILES["upstream"])
+            atomic_copy(stage/"manifest.json", ROOT/"bin/agy-acp-900k.manifest.json")
+        else:
+            for name in FILES.values():
+                atomic_copy(stage/name, ROOT/"bin"/name)
+            atomic_copy(stage/"manifest.json", ROOT/"bin/agy-acp-900k.manifest.json")
+            run([ROOT/"scripts/gw.sh", "start", "go"], env=env, timeout=40)
         probe_metadata(18890)
         result = run_probe(18890, live=True)
         write_json(backup/"post-install.json", result)
         if not result["ok"]:
             raise RuntimeError("post-install semantic probe failed")
     except Exception:
-        run([ROOT/"scripts/gw.sh", "stop"], env=env, timeout=40)
-        restore_release(backup)
-        run([ROOT/"scripts/gw.sh", "start", "go"], env=env, timeout=40)
+        if hot_swap and gateway_is_running(18890):
+            restore_release(backup)
+        else:
+            run([ROOT/"scripts/gw.sh", "stop"], env=env, timeout=40)
+            restore_release(backup)
+            run([ROOT/"scripts/gw.sh", "start", "go"], env=env, timeout=40)
         raise RuntimeError("installation acceptance failed; previous bundle restored") from None
-    write_json(STATE/"installed.json", {"candidate": str(stage), "backup": str(backup), "artifacts": manifest["artifacts"]})
-    print("installed verified bundle; rollback:", backup)
+    write_json(STATE/"installed.json", {"candidate": str(stage), "backup": str(backup), "artifacts": manifest["artifacts"], "hot_swap": hot_swap})
+    print(("hot-swapped" if hot_swap else "installed") + " verified bundle; rollback:", backup)
 
 
 def main():
@@ -459,7 +480,7 @@ def main():
     ap.add_argument("--official", type=Path, default=Path.home()/".local/bin/agy")
     ap.add_argument("--contract", action="store_true")
     ap.add_argument("--live-flash", action="store_true")
-    ap.add_argument("--restart", action="store_true", help="compatibility flag; install always restarts safely")
+    ap.add_argument("--restart", action="store_true", help="force full stop/start even when gateway binary is unchanged")
     ap.add_argument("--port", type=int, default=18892)
     args = ap.parse_args()
     if args.status:
@@ -476,7 +497,7 @@ def main():
         elif args.install:
             if not args.candidate:
                 raise ValueError("--install requires --candidate; no implicit builds or model calls")
-            install(args.candidate.resolve())
+            install(args.candidate.resolve(), force_restart=args.restart)
         else:
             build_candidate(args.official.resolve(), contract=args.contract, live=args.live_flash, port=args.port, dry=args.dry_run)
     return 0

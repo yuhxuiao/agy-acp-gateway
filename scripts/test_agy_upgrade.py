@@ -794,5 +794,78 @@ class UpgradeGateTests(unittest.TestCase):
         d2 = SOURCE_DIGEST(fake_repo)
         self.assertNotEqual(d1, d2)
 
+    def test_install_hot_swaps_upstream_without_restart_when_gateway_unchanged(self):
+        (self.root/"bin").mkdir()
+        gw_bytes = (self.stage/upgrade.FILES["gateway"]).read_bytes()
+        (self.root/"bin"/upgrade.FILES["gateway"]).write_bytes(gw_bytes)
+        (self.root/"bin"/upgrade.FILES["upstream"]).write_bytes(b"old-upstream")
+        (self.root/"bin/agy-acp-900k.manifest.json").write_bytes(b"old-manifest")
+
+        with patch.object(upgrade, "ROOT", self.root), patch.object(upgrade, "STATE", self.root/"state"), \
+             patch.object(upgrade, "gateway_is_running", return_value=True), \
+             patch.object(upgrade, "run") as mock_run, \
+             patch.object(upgrade, "probe_metadata"), \
+             patch.object(probe, "run_probe", return_value={"ok": True}):
+            upgrade.install(self.stage)
+            mock_run.assert_not_called()
+
+        self.assertEqual((self.root/"bin"/upgrade.FILES["upstream"]).read_bytes(), (self.stage/upgrade.FILES["upstream"]).read_bytes())
+        installed = json.loads((self.root/"state/installed.json").read_text())
+        self.assertTrue(installed["hot_swap"])
+
+        # force_restart=True must still run gw.sh stop/start even when gateway binary is unchanged
+        with patch.object(upgrade, "ROOT", self.root), patch.object(upgrade, "STATE", self.root/"state"), \
+             patch.object(upgrade, "gateway_is_running", return_value=True), \
+             patch.object(upgrade, "run") as mock_run, \
+             patch.object(upgrade, "probe_metadata"), \
+             patch.object(probe, "run_probe", return_value={"ok": True}):
+            upgrade.install(self.stage, force_restart=True)
+            self.assertEqual(mock_run.call_count, 2)
+
+        # Hot-swap probe failure restores previous upstream without stopping healthy gateway
+        (self.root/"bin"/upgrade.FILES["upstream"]).write_bytes(b"prev-good-upstream")
+        with patch.object(upgrade, "ROOT", self.root), patch.object(upgrade, "STATE", self.root/"state"), \
+             patch.object(upgrade, "gateway_is_running", return_value=True), \
+             patch.object(upgrade, "run") as mock_run, \
+             patch.object(upgrade, "probe_metadata"), \
+             patch.object(probe, "run_probe", return_value={"ok": False}):
+            with self.assertRaisesRegex(RuntimeError, "previous bundle restored"):
+                upgrade.install(self.stage)
+            mock_run.assert_not_called()
+        self.assertEqual((self.root/"bin"/upgrade.FILES["upstream"]).read_bytes(), b"prev-good-upstream")
+
+    def test_gw_sh_resolve_default_proxy_respects_explicit_and_probes_when_unset(self):
+        gw_src = (Path(__file__).resolve().parent / "gw.sh").read_text()
+        self.assertIn("resolve_default_proxy()", gw_src)
+        self.assertIn("for p in 7890 6152 7897 1087; do", gw_src)
+        # Verify explicit empty AGY_UPSTREAM_PROXY="" stays empty and custom proxy stays unchanged
+        snippet = """
+        port_busy() { [[ "$1" == "6152" ]]; }
+        resolve_default_proxy() {
+          if [[ -n "${AGY_UPSTREAM_PROXY+x}" ]]; then
+            printf '%s' "$AGY_UPSTREAM_PROXY"
+            return 0
+          fi
+          local p
+          for p in 7890 6152 7897 1087; do
+            if port_busy "$p"; then
+              printf 'http://127.0.0.1:%s' "$p"
+              return 0
+            fi
+          done
+          printf '%s' ""
+        }
+        unset AGY_UPSTREAM_PROXY
+        printf 'auto=%s\\n' "$(resolve_default_proxy)"
+        AGY_UPSTREAM_PROXY=""
+        printf 'empty=%s\\n' "$(resolve_default_proxy)"
+        AGY_UPSTREAM_PROXY="http://127.0.0.1:9999"
+        printf 'custom=%s\\n' "$(resolve_default_proxy)"
+        """
+        out = subprocess.check_output(["bash", "-euo", "pipefail", "-c", snippet], text=True)
+        self.assertIn("auto=http://127.0.0.1:6152", out)
+        self.assertIn("empty=\n", out)
+        self.assertIn("custom=http://127.0.0.1:9999", out)
+
 if __name__ == "__main__":
     unittest.main()

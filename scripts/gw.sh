@@ -64,6 +64,8 @@ export AGY_GW_PORT="$GW_PORT" AGY_DASH_PORT="$DASH_PORT"
 port_busy() {
   if command -v ss >/dev/null 2>&1; then
     ss -ltnH | awk -v port=":$1" '$4 ~ port"$" {found=1} END {exit !found}'
+  elif [[ "$UNAME_S" == "Darwin" && -x /usr/bin/nc ]]; then
+    /usr/bin/nc -z 127.0.0.1 "$1" >/dev/null 2>&1 || /usr/bin/nc -z ::1 "$1" >/dev/null 2>&1
   elif command -v lsof >/dev/null 2>&1; then
     lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
   elif [[ -x /usr/sbin/lsof ]]; then
@@ -71,6 +73,20 @@ port_busy() {
   else
     python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(0.2); r=s.connect_ex(("127.0.0.1", int(sys.argv[1]))); s.close(); sys.exit(0 if r == 0 else 1)' "$1" >/dev/null 2>&1
   fi
+}
+resolve_default_proxy() {
+  if [[ -n "${AGY_UPSTREAM_PROXY+x}" ]]; then
+    printf '%s' "$AGY_UPSTREAM_PROXY"
+    return 0
+  fi
+  local p
+  for p in 7890 6152 7897 1087; do
+    if port_busy "$p"; then
+      printf 'http://127.0.0.1:%s' "$p"
+      return 0
+    fi
+  done
+  printf '%s' ""
 }
 start_ticks() {
   if [[ -r "/proc/$1/stat" ]]; then
@@ -159,11 +175,13 @@ start() {
   if [[ ! -x "$BIN" ]]; then echo "Gateway binary not executable: $BIN" >&2; return 1; fi
   if port_busy "$GW_PORT" || port_busy "$DASH_PORT"; then echo 'Instance port already occupied' >&2; return 1; fi
   cd "$ROOT"
+  local resolved_proxy
+  resolved_proxy="$(resolve_default_proxy)"
   if command -v setsid >/dev/null 2>&1; then
-    AGY_UPSTREAM_PROXY="${AGY_UPSTREAM_PROXY-http://127.0.0.1:7890}" \
+    AGY_UPSTREAM_PROXY="$resolved_proxy" \
       setsid nohup "$BIN" >>"$LOGS/go-gateway.out" 2>&1 < /dev/null 9>&- &
   else
-    AGY_UPSTREAM_PROXY="${AGY_UPSTREAM_PROXY-http://127.0.0.1:7890}" \
+    AGY_UPSTREAM_PROXY="$resolved_proxy" \
       nohup python3 -c 'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' "$BIN" >>"$LOGS/go-gateway.out" 2>&1 < /dev/null 9>&- &
   fi
   gw_pid="$!"
