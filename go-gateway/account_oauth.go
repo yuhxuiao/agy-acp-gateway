@@ -78,11 +78,16 @@ func isStrippedSubprocessEnv(kv string) bool {
 // plus synthetic views for accounts awaiting web OAuth login or still starting their child worker.
 // It never blocks /api/dashboard waiting for cold worker startup.
 func (am *AccountManager) ManagedPeersForDashboard() (peers []gwcfg.DashboardPeerConfig, unauthInstances []map[string]any) {
+	return am.ManagedPeersForDashboardWithForce(false)
+}
+
+func (am *AccountManager) ManagedPeersForDashboardWithForce(forceQuota bool) (peers []gwcfg.DashboardPeerConfig, unauthInstances []map[string]any) {
 	if isChildAccountWorker() {
 		return nil, nil
 	}
 	am.ensureInitialized()
 	accs := am.ListAccounts()
+	rCfg := am.GetRoutingConfig()
 	for _, acc := range accs {
 		if acc.Primary || !acc.Enabled {
 			continue
@@ -125,6 +130,34 @@ func (am *AccountManager) ManagedPeersForDashboard() (peers []gwcfg.DashboardPee
 				BaseURL: fmt.Sprintf("http://127.0.0.1:%d", dashPort),
 			})
 			continue
+		}
+		isPinnedManual := rCfg.Strategy == RouteStrategyManualActive && rCfg.ActiveAccountID == acc.ID
+		if hibSnap, wasHibernated := am.getHibernatedWorkerSnapshot(acc.ID); wasHibernated && !forceQuota && !isPinnedManual {
+			if cachedDec, cachedAt, okC := lookupCachedPeerDashboardByPort(acc.ID, hibSnap.lastDashPort); okC && cachedDec != nil {
+				gwMap := cloneGatewayMapWithInstance(cachedDec.Gateway, acc.ID, acc.Label)
+				gwMap["activeSessionsCount"] = 0
+				unauthInstances = append(unauthInstances, map[string]any{
+					"id":            acc.ID,
+					"label":         acc.Label,
+					"self":          false,
+					"reachable":     true,
+					"sleeping":      true,
+					"stale":         false,
+					"proxyPreset":   acc.ProxyPreset,
+					"boundKeys":     maskBoundKeysForDashboard(acc.BoundKeys),
+					"boundKeyCount": len(acc.BoundKeys),
+					"allowedModels": acc.AllowedModels,
+					"defaultModels": acc.DefaultModels,
+					"error":         "",
+					"fetchedAt":     cachedAt.UTC().Format(time.RFC3339),
+					"gateway":       gwMap,
+					"quota":         cachedDec.Quota,
+					"windows":       cachedDec.Windows,
+					"canaryRoutes":  []map[string]any{},
+					"cacheWarnings": []map[string]any{},
+				})
+				continue
+			}
 		}
 		if !testing.Testing() && am.shouldTriggerWorkerWarmup(acc.ID, 10*time.Second) {
 			go func(id string) {

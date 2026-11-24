@@ -678,6 +678,14 @@ func (gs *GatewayServer) reapIdleWorkers() {
 		}
 	}
 
+	if !isChildAccountWorker() {
+		childIdleTTL := 2 * IdleWorkerTtl
+		if childIdleTTL < 10*time.Minute {
+			childIdleTTL = 10 * time.Minute
+		}
+		GlobalAccountManager.ReapIdleAccountWorkers(now, childIdleTTL)
+	}
+
 	if !anyBusy && len(promptSem) == 0 && eng.IsAlive() {
 		gs.workerAdmitMu.Lock()
 		shouldStop := len(promptSem) == 0 && eng.IsAlive() && gs.countTotalLiveWorkers() == 0

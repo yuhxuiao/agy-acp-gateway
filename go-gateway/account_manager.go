@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -275,6 +276,11 @@ type workerCrashState struct {
 	backoffUntil time.Time
 }
 
+type hibernatedWorkerSnapshot struct {
+	lastDashPort int
+	hibernatedAt time.Time
+}
+
 type accountWorkerProc struct {
 	id              string
 	gwPort          int
@@ -288,6 +294,7 @@ type accountWorkerProc struct {
 	readyOnce       sync.Once
 	readyErr        error
 	healthyAt       time.Time
+	lastActiveNs    atomic.Int64
 	intentionalStop bool
 	stopped         bool
 }
@@ -351,6 +358,7 @@ type AccountManager struct {
 	groups          []AccountGroup
 	accounts        []AccountProfile
 	workers         map[string]*accountWorkerProc
+	idleHibernated  map[string]hibernatedWorkerSnapshot
 	crashStates     map[string]workerCrashState
 	opMu            sync.Mutex
 	opLocks         map[string]*sync.Mutex
@@ -378,17 +386,18 @@ func isChildAccountWorker() bool {
 
 func NewAccountManager() *AccountManager {
 	return &AccountManager{
-		routing:       (AccountPoolConfig{}).Normalized(),
-		workers:       make(map[string]*accountWorkerProc),
-		crashStates:   make(map[string]workerCrashState),
-		opLocks:       make(map[string]*sync.Mutex),
-		oauthActive:   make(map[string]*pendingOAuthSession),
-		stickyLRU:     newStickySessionLRU(),
-		rrCounters:    make(map[string]uint64),
-		swrrStates:    make(map[string]map[string]*swrrEntry),
-		healthStates:  make(map[string]*accountHealthRuntime),
-		tokCache:      make(map[string]tokenCacheEntry),
-		warmupAttempt: make(map[string]time.Time),
+		routing:        (AccountPoolConfig{}).Normalized(),
+		workers:        make(map[string]*accountWorkerProc),
+		idleHibernated: make(map[string]hibernatedWorkerSnapshot),
+		crashStates:    make(map[string]workerCrashState),
+		opLocks:        make(map[string]*sync.Mutex),
+		oauthActive:    make(map[string]*pendingOAuthSession),
+		stickyLRU:      newStickySessionLRU(),
+		rrCounters:     make(map[string]uint64),
+		swrrStates:     make(map[string]map[string]*swrrEntry),
+		healthStates:   make(map[string]*accountHealthRuntime),
+		tokCache:       make(map[string]tokenCacheEntry),
+		warmupAttempt:  make(map[string]time.Time),
 	}
 }
 
@@ -1082,6 +1091,11 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 		done:     make(chan struct{}),
 		readyCh:  make(chan struct{}),
 	}
+	proc.lastActiveNs.Store(time.Now().UnixNano())
+	if am.idleHibernated == nil {
+		am.idleHibernated = make(map[string]hibernatedWorkerSnapshot)
+	}
+	delete(am.idleHibernated, acc.ID)
 	am.workers[acc.ID] = proc
 	baseDataDir := am.baseDataDir
 	am.mu.Unlock()
@@ -1352,10 +1366,11 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 		return err
 	}
 
-	// Wait briefly for child /healthz on loopback with bounded per-probe timeout, aborting immediately if child exits early
+	// Wait briefly for child /healthz on loopback with exponential-backoff polling (5ms -> 40ms), aborting immediately if child exits early
 	deadline := time.Now().Add(4 * time.Second)
 	healthURL := fmt.Sprintf("http://127.0.0.1:%d/healthz", gwPort)
 	healthy := false
+	pollWait := 5 * time.Millisecond
 	for time.Now().Before(deadline) {
 		select {
 		case <-proc.done:
@@ -1383,7 +1398,17 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 			}
 		}
 		probeCancel()
-		time.Sleep(40 * time.Millisecond)
+		select {
+		case <-proc.done:
+			return cleanupFailed(fmt.Errorf("worker for account %q exited before becoming healthy", acc.ID))
+		case <-time.After(pollWait):
+		}
+		if pollWait < 40*time.Millisecond {
+			pollWait *= 2
+			if pollWait > 40*time.Millisecond {
+				pollWait = 40 * time.Millisecond
+			}
+		}
 	}
 	if !healthy {
 		return cleanupFailed(fmt.Errorf("worker for account %q healthz timeout", acc.ID))
@@ -1397,10 +1422,150 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 		}
 		return fmt.Errorf("worker for account %q was stopped during startup", acc.ID)
 	}
-	proc.healthyAt = time.Now()
+	nowHealthy := time.Now()
+	proc.healthyAt = nowHealthy
+	proc.lastActiveNs.Store(nowHealthy.UnixNano())
 	proc.finishReady(nil)
 	am.mu.Unlock()
 	return nil
+}
+
+func (am *AccountManager) touchWorkerActivity(accountID string) {
+	if am == nil || accountID == "" {
+		return
+	}
+	nowNs := time.Now().UnixNano()
+	am.mu.RLock()
+	w := am.workers[accountID]
+	if w != nil && !w.stopped {
+		w.lastActiveNs.Store(nowNs)
+	}
+	am.mu.RUnlock()
+}
+
+func (am *AccountManager) getHibernatedWorkerSnapshot(accountID string) (hibernatedWorkerSnapshot, bool) {
+	if am == nil || accountID == "" {
+		return hibernatedWorkerSnapshot{}, false
+	}
+	am.mu.RLock()
+	snap, ok := am.idleHibernated[accountID]
+	am.mu.RUnlock()
+	return snap, ok
+}
+
+// ReapIdleAccountWorkers gracefully hibernates idle child gateway processes that have zero in-flight
+// requests, zero active/parked sessions, no pending OAuth handshake, and have exceeded idleTTL.
+// Sticky session mappings in the parent gateway are preserved so subsequent turns transparently wake the worker.
+func (am *AccountManager) ReapIdleAccountWorkers(now time.Time, idleTTL time.Duration) int {
+	if am == nil || isChildAccountWorker() || idleTTL <= 0 || !am.HasConfiguredAccounts() {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	type candidate struct {
+		id       string
+		label    string
+		dashPort int
+		proc     *accountWorkerProc
+	}
+	am.mu.RLock()
+	rCfg := am.routing.Normalized()
+	var cands []candidate
+	for id, w := range am.workers {
+		if w == nil || w.stopped || w.healthyAt.IsZero() {
+			continue
+		}
+		if rCfg.Strategy == RouteStrategyManualActive && rCfg.ActiveAccountID == id {
+			continue
+		}
+		if now.Sub(w.healthyAt) < idleTTL {
+			continue
+		}
+		lastNs := w.lastActiveNs.Load()
+		if lastNs > 0 && now.Sub(time.Unix(0, lastNs)) < idleTTL {
+			continue
+		}
+		if am.AccountInFlight(id) > 0 {
+			continue
+		}
+		label := id
+		for _, a := range am.accounts {
+			if a.ID == id && a.Label != "" {
+				label = a.Label
+				break
+			}
+		}
+		cands = append(cands, candidate{id: id, label: label, dashPort: w.dashPort, proc: w})
+	}
+	am.mu.RUnlock()
+	if len(cands) == 0 {
+		return 0
+	}
+
+	reaped := 0
+	snapCfg := gwcfg.Current()
+	fallbackKey := defaultPeerAPIKey(snapCfg)
+	for _, c := range cands {
+		am.oauthMu.Lock()
+		hasOAuth := am.oauthActive[c.id] != nil
+		am.oauthMu.Unlock()
+		if hasOAuth || am.AccountInFlight(c.id) > 0 {
+			continue
+		}
+		if c.dashPort > 0 {
+			peer := gwcfg.DashboardPeerConfig{
+				ID:      c.id,
+				Label:   c.label,
+				BaseURL: fmt.Sprintf("http://127.0.0.1:%d", c.dashPort),
+			}
+			dec, reachable, _, _, _ := fetchPeerDashboard(peer, false, fallbackKey)
+			if !reachable || dec == nil || len(dec.LiveSessions) > 0 {
+				continue
+			}
+		}
+
+		am.mu.Lock()
+		cur := am.workers[c.id]
+		lastNs := int64(0)
+		if cur != nil {
+			lastNs = cur.lastActiveNs.Load()
+		}
+		if cur != c.proc || cur.stopped || am.AccountInFlight(c.id) > 0 || (lastNs > 0 && now.Sub(time.Unix(0, lastNs)) < idleTTL) {
+			am.mu.Unlock()
+			continue
+		}
+		delete(am.workers, c.id)
+		cur.intentionalStop = true
+		cur.stopped = true
+		if am.idleHibernated == nil {
+			am.idleHibernated = make(map[string]hibernatedWorkerSnapshot)
+		}
+		am.idleHibernated[c.id] = hibernatedWorkerSnapshot{
+			lastDashPort: c.dashPort,
+			hibernatedAt: now,
+		}
+		am.mu.Unlock()
+
+		cur.closeTransport()
+		if cur.cmd != nil && cur.cmd.Process != nil {
+			_ = syscall.Kill(-cur.cmd.Process.Pid, syscall.SIGTERM)
+			if cur.done != nil {
+				select {
+				case <-cur.done:
+				case <-time.After(4 * time.Second):
+					_ = syscall.Kill(-cur.cmd.Process.Pid, syscall.SIGKILL)
+					<-cur.done
+				}
+			}
+		}
+		LogEvent("ACCOUNT_WORKER_HIBERNATE", "Hibernated idle child account worker process", map[string]any{
+			"accountId": c.id,
+			"idleSec":   int(idleTTL.Seconds()),
+		})
+		reaped++
+	}
+	return reaped
 }
 
 func (am *AccountManager) StopAccountWorker(accountID string) {
@@ -2333,24 +2498,274 @@ func extractFirstJSONArrayElement(raw json.RawMessage) json.RawMessage {
 	return first
 }
 
-// inspectConversationTurns examines a messages/contents/input JSON array so Turn-1 requests carrying
-// leading system/developer prompts ([system, user]) are accurately recognized as Turn-1 (isContinuation=false)
-// and fingerprinted using BOTH leading system items AND the first user turn (matching Turn 2+ of the same thread).
+func skipJSONWS(b []byte, pos int) int {
+	for pos < len(b) {
+		switch b[pos] {
+		case ' ', '\t', '\r', '\n':
+			pos++
+		default:
+			return pos
+		}
+	}
+	return pos
+}
+
+// skipValidJSONValue advances past one JSON value starting at pos inside an already json.Valid slice.
+func skipValidJSONValue(b []byte, pos int) (end int, ok bool) {
+	pos = skipJSONWS(b, pos)
+	if pos >= len(b) {
+		return 0, false
+	}
+	switch b[pos] {
+	case '"':
+		for i := pos + 1; i < len(b); i++ {
+			if b[i] == '\\' {
+				i++
+				continue
+			}
+			if b[i] == '"' {
+				return i + 1, true
+			}
+		}
+		return 0, false
+	case '{', '[':
+		depth := 0
+		for i := pos; i < len(b); i++ {
+			switch b[i] {
+			case '"':
+				for i++; i < len(b); i++ {
+					if b[i] == '\\' {
+						i++
+						continue
+					}
+					if b[i] == '"' {
+						break
+					}
+				}
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+				if depth == 0 {
+					return i + 1, true
+				}
+			}
+		}
+		return 0, false
+	default:
+		i := pos
+		for i < len(b) {
+			switch b[i] {
+			case ' ', '\t', '\r', '\n', ',', '}', ']':
+				return i, true
+			default:
+				i++
+			}
+		}
+		return i, true
+	}
+}
+
+func unquoteJSONKeyBytes(rawKey []byte) string {
+	if len(rawKey) < 2 || rawKey[0] != '"' || rawKey[len(rawKey)-1] != '"' {
+		return ""
+	}
+	inner := rawKey[1 : len(rawKey)-1]
+	if bytes.IndexByte(inner, '\\') < 0 {
+		return string(inner)
+	}
+	var s string
+	if json.Unmarshal(rawKey, &s) == nil {
+		return s
+	}
+	return ""
+}
+
+type topRoutingFields struct {
+	model              []byte
+	previousResponseID []byte
+	messages           []byte
+	contents           []byte
+	input              []byte
+	promptCacheKey     []byte
+	metadata           []byte
+	system             []byte
+	instructions       []byte
+	systemInstruction  []byte
+	user               []byte
+}
+
+// scanTopLevelRoutingFields extracts zero-copy byte subslices of top-level routing keys from a validated JSON object.
+// Duplicate keys overwrite earlier occurrences, preserving 100% parity with encoding/json map[string]json.RawMessage.
+func scanTopLevelRoutingFields(obj []byte) topRoutingFields {
+	var out topRoutingFields
+	pos := skipJSONWS(obj, 0)
+	if pos >= len(obj) || obj[pos] != '{' {
+		return out
+	}
+	pos++
+	for {
+		pos = skipJSONWS(obj, pos)
+		if pos >= len(obj) || obj[pos] == '}' {
+			return out
+		}
+		kEnd, okK := skipValidJSONValue(obj, pos)
+		if !okK || obj[pos] != '"' {
+			return out
+		}
+		rawKey := obj[pos:kEnd]
+		pos = skipJSONWS(obj, kEnd)
+		if pos >= len(obj) || obj[pos] != ':' {
+			return out
+		}
+		vStart := skipJSONWS(obj, pos+1)
+		vEnd, okV := skipValidJSONValue(obj, vStart)
+		if !okV {
+			return out
+		}
+		valSlice := obj[vStart:vEnd]
+		innerKey := rawKey[1 : len(rawKey)-1]
+		if bytes.IndexByte(innerKey, '\\') < 0 {
+			switch string(innerKey) {
+			case "model":
+				out.model = valSlice
+			case "previous_response_id":
+				out.previousResponseID = valSlice
+			case "messages":
+				out.messages = valSlice
+			case "contents":
+				out.contents = valSlice
+			case "input":
+				out.input = valSlice
+			case "prompt_cache_key":
+				out.promptCacheKey = valSlice
+			case "metadata":
+				out.metadata = valSlice
+			case "system":
+				out.system = valSlice
+			case "instructions":
+				out.instructions = valSlice
+			case "systemInstruction":
+				out.systemInstruction = valSlice
+			case "user":
+				out.user = valSlice
+			}
+		} else {
+			switch unquoteJSONKeyBytes(rawKey) {
+			case "model":
+				out.model = valSlice
+			case "previous_response_id":
+				out.previousResponseID = valSlice
+			case "messages":
+				out.messages = valSlice
+			case "contents":
+				out.contents = valSlice
+			case "input":
+				out.input = valSlice
+			case "prompt_cache_key":
+				out.promptCacheKey = valSlice
+			case "metadata":
+				out.metadata = valSlice
+			case "system":
+				out.system = valSlice
+			case "instructions":
+				out.instructions = valSlice
+			case "systemInstruction":
+				out.systemInstruction = valSlice
+			case "user":
+				out.user = valSlice
+			}
+		}
+		pos = skipJSONWS(obj, vEnd)
+		if pos < len(obj) && obj[pos] == ',' {
+			pos++
+			continue
+		}
+		return out
+	}
+}
+
+func scanTurnElementFields(obj []byte) (role, typ string, content, parts []byte, ok bool) {
+	pos := skipJSONWS(obj, 0)
+	if pos >= len(obj) || obj[pos] != '{' {
+		return "", "", nil, nil, false
+	}
+	pos++
+	for {
+		pos = skipJSONWS(obj, pos)
+		if pos >= len(obj) {
+			return "", "", nil, nil, false
+		}
+		if obj[pos] == '}' {
+			return role, typ, content, parts, true
+		}
+		kEnd, okK := skipValidJSONValue(obj, pos)
+		if !okK || obj[pos] != '"' {
+			return "", "", nil, nil, false
+		}
+		rawKey := obj[pos:kEnd]
+		pos = skipJSONWS(obj, kEnd)
+		if pos >= len(obj) || obj[pos] != ':' {
+			return "", "", nil, nil, false
+		}
+		vStart := skipJSONWS(obj, pos+1)
+		vEnd, okV := skipValidJSONValue(obj, vStart)
+		if !okV {
+			return "", "", nil, nil, false
+		}
+		valSlice := obj[vStart:vEnd]
+		keyStr := ""
+		inner := rawKey[1 : len(rawKey)-1]
+		if bytes.IndexByte(inner, '\\') < 0 {
+			switch string(inner) {
+			case "role", "Role", "ROLE", "type", "Type", "TYPE", "content", "Content", "parts", "Parts":
+				keyStr = strings.ToLower(string(inner))
+			}
+		} else {
+			keyStr = strings.ToLower(unquoteJSONKeyBytes(rawKey))
+		}
+		switch keyStr {
+		case "role":
+			role = rawJSONString(valSlice)
+		case "type":
+			typ = rawJSONString(valSlice)
+		case "content":
+			content = valSlice
+		case "parts":
+			parts = valSlice
+		}
+		pos = skipJSONWS(obj, vEnd)
+		if pos < len(obj) && obj[pos] == ',' {
+			pos++
+			continue
+		}
+		return role, typ, content, parts, obj[pos] == '}'
+	}
+}
+
+// inspectConversationTurns examines a messages/contents/input JSON array using zero-copy slicing so Turn-1
+// requests carrying multi-megabyte base64 images or long system prompts never duplicate payload slices.
 func inspectConversationTurns(raw json.RawMessage) (sysLead, firstUser json.RawMessage, isContinuation bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) < 2 || trimmed[0] != '[' {
 		return nil, nil, false
 	}
-	dec := json.NewDecoder(bytes.NewReader(trimmed))
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
-		return nil, nil, false
-	}
+	pos := 1
 	var sysBuf []byte
 	userCount := 0
-	for idx := 0; dec.More() && idx < 64; idx++ {
-		var elem json.RawMessage
-		if err := dec.Decode(&elem); err != nil {
+	for idx := 0; idx < 64; idx++ {
+		pos = skipJSONWS(trimmed, pos)
+		if pos >= len(trimmed) || trimmed[pos] == ']' {
 			break
+		}
+		elemEnd, okE := skipValidJSONValue(trimmed, pos)
+		if !okE {
+			break
+		}
+		elem := trimmed[pos:elemEnd]
+		pos = skipJSONWS(trimmed, elemEnd)
+		if pos < len(trimmed) && trimmed[pos] == ',' {
+			pos++
 		}
 		eTrim := bytes.TrimSpace(elem)
 		if len(eTrim) == 0 {
@@ -2358,7 +2773,7 @@ func inspectConversationTurns(raw json.RawMessage) (sysLead, firstUser json.RawM
 		}
 		if eTrim[0] != '{' {
 			if len(firstUser) == 0 {
-				firstUser = elem
+				firstUser = eTrim
 			}
 			userCount++
 			if userCount >= 2 {
@@ -2367,20 +2782,15 @@ func inspectConversationTurns(raw json.RawMessage) (sysLead, firstUser json.RawM
 			}
 			continue
 		}
-		var lite struct {
-			Role    string          `json:"role"`
-			Type    string          `json:"type"`
-			Content json.RawMessage `json:"content"`
-			Parts   json.RawMessage `json:"parts"`
-		}
-		if json.Unmarshal(eTrim, &lite) != nil {
+		rawRole, rawType, contentSlice, partsSlice, okObj := scanTurnElementFields(eTrim)
+		if !okObj {
 			if len(firstUser) == 0 {
-				firstUser = elem
+				firstUser = eTrim
 			}
 			continue
 		}
-		role := strings.ToLower(strings.TrimSpace(lite.Role))
-		typ := strings.ToLower(strings.TrimSpace(lite.Type))
+		role := strings.ToLower(strings.TrimSpace(rawRole))
+		typ := strings.ToLower(strings.TrimSpace(rawType))
 		switch role {
 		case "system", "developer":
 			if len(firstUser) == 0 && len(sysBuf) < 512 {
@@ -2394,15 +2804,15 @@ func inspectConversationTurns(raw json.RawMessage) (sysLead, firstUser json.RawM
 		case "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "computer_call_output", "reasoning", "item_reference":
 			isContinuation = true
 		}
-		if role == "user" || (role == "" && typ == "message") || (role == "" && len(lite.Parts) > 0) {
+		if role == "user" || (role == "" && typ == "message") || (role == "" && len(partsSlice) > 0) {
 			userCount++
 			if len(firstUser) == 0 {
-				firstUser = elem
+				firstUser = eTrim
 			}
 			if userCount >= 2 {
 				isContinuation = true
 			}
-			if bytes.Contains(lite.Content, []byte(`"tool_result"`)) || bytes.Contains(lite.Parts, []byte(`"functionResponse"`)) || bytes.Contains(lite.Parts, []byte(`"functionCall"`)) {
+			if bytes.Contains(contentSlice, []byte(`"tool_result"`)) || bytes.Contains(partsSlice, []byte(`"functionResponse"`)) || bytes.Contains(partsSlice, []byte(`"functionCall"`)) {
 				isContinuation = true
 			}
 		}
@@ -2418,8 +2828,16 @@ func inspectConversationTurns(raw json.RawMessage) (sysLead, firstUser json.RawM
 }
 
 func rawJSONString(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) < 2 || trimmed[0] != '"' || trimmed[len(trimmed)-1] != '"' {
+		return ""
+	}
+	inner := trimmed[1 : len(trimmed)-1]
+	if bytes.IndexByte(inner, '\\') < 0 {
+		return strings.TrimSpace(string(inner))
+	}
 	var s string
-	if len(raw) > 0 && json.Unmarshal(raw, &s) == nil {
+	if json.Unmarshal(trimmed, &s) == nil {
 		return strings.TrimSpace(s)
 	}
 	return ""
@@ -2556,28 +2974,25 @@ func extractRequestRoutingHintsFull(r *http.Request) (
 	}
 
 	trimmedRaw := bytes.TrimSpace(raw)
-	if len(trimmedRaw) == 0 || trimmedRaw[0] != '{' {
+	if len(trimmedRaw) == 0 || trimmedRaw[0] != '{' || !json.Valid(trimmedRaw) {
 		return canonicalModel, sessionKey, false, isNonUpstream, false, raw, true, false, nil
 	}
 
-	var topRaw map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &topRaw); err != nil || topRaw == nil {
-		return canonicalModel, sessionKey, false, isNonUpstream, false, raw, true, false, nil
-	}
-	if mStr := rawJSONString(topRaw["model"]); canonicalModel == "" && mStr != "" {
+	topRaw := scanTopLevelRoutingFields(trimmedRaw)
+	if mStr := rawJSONString(topRaw.model); canonicalModel == "" && mStr != "" {
 		canonicalModel = ResolveRequestedModel(mStr, nil).Model.ID
 	}
-	if prevRespID := rawJSONString(topRaw["previous_response_id"]); prevRespID != "" {
+	if prevRespID := rawJSONString(topRaw.previousResponseID); prevRespID != "" {
 		isContinuation = true
 	}
 	var inArrSys json.RawMessage
 	var firstElem json.RawMessage
 	var arrCont bool
-	if len(bytes.TrimSpace(topRaw["messages"])) > 0 {
-		inArrSys, firstElem, arrCont = inspectConversationTurns(topRaw["messages"])
-	} else if len(bytes.TrimSpace(topRaw["contents"])) > 0 {
-		inArrSys, firstElem, arrCont = inspectConversationTurns(topRaw["contents"])
-	} else if rawInput := bytes.TrimSpace(topRaw["input"]); len(rawInput) > 0 {
+	if len(bytes.TrimSpace(topRaw.messages)) > 0 {
+		inArrSys, firstElem, arrCont = inspectConversationTurns(topRaw.messages)
+	} else if len(bytes.TrimSpace(topRaw.contents)) > 0 {
+		inArrSys, firstElem, arrCont = inspectConversationTurns(topRaw.contents)
+	} else if rawInput := bytes.TrimSpace(topRaw.input); len(rawInput) > 0 {
 		if rawInput[0] == '[' {
 			inArrSys, firstElem, arrCont = inspectConversationTurns(rawInput)
 		} else {
@@ -2589,26 +3004,26 @@ func extractRequestRoutingHintsFull(r *http.Request) (
 	}
 
 	if sessionKey == "" {
-		if k := rawJSONString(topRaw["prompt_cache_key"]); k != "" {
+		if k := rawJSONString(topRaw.promptCacheKey); k != "" {
 			sessionKey = "pck:" + k
 		} else {
 			var metaObj struct {
 				UserID string `json:"user_id"`
 			}
 			metaUID := ""
-			if rawMeta := topRaw["metadata"]; len(rawMeta) > 0 && json.Unmarshal(rawMeta, &metaObj) == nil {
+			if rawMeta := topRaw.metadata; len(rawMeta) > 0 && json.Unmarshal(rawMeta, &metaObj) == nil {
 				metaUID = strings.TrimSpace(metaObj.UserID)
 			}
 			if metaUID != "" && strings.Contains(strings.ToLower(metaUID), "session") {
 				sessionKey = "meta:" + metaUID
 			} else {
 				firstMsg := clipBytes(firstElem, 1024)
-				sysPart := clipBytes(topRaw["system"], 512)
+				sysPart := clipBytes(topRaw.system, 512)
 				if len(sysPart) == 0 {
-					sysPart = clipBytes(topRaw["instructions"], 512)
+					sysPart = clipBytes(topRaw.instructions, 512)
 				}
 				if len(sysPart) == 0 {
-					sysPart = clipBytes(topRaw["systemInstruction"], 512)
+					sysPart = clipBytes(topRaw.systemInstruction, 512)
 				}
 				arrSysClip := clipBytes(inArrSys, 512)
 				if len(firstMsg) > 0 || len(sysPart) > 0 || len(arrSysClip) > 0 {
@@ -2621,7 +3036,7 @@ func extractRequestRoutingHintsFull(r *http.Request) (
 					sessionKey = "fp:" + hex.EncodeToString(h.Sum(nil))[:16]
 				} else if metaUID != "" {
 					sessionKey = "meta:" + metaUID
-				} else if k := rawJSONString(topRaw["user"]); k != "" {
+				} else if k := rawJSONString(topRaw.user); k != "" {
 					sessionKey = "usr:" + k
 				}
 			}

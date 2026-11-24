@@ -694,10 +694,12 @@ func (am *AccountManager) AcquireAccountInFlight(accountID string) func() {
 	}
 	c := am.counterForAccount(accountID)
 	c.Add(1)
+	am.touchWorkerActivity(accountID)
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			c.Add(-1)
+			am.touchWorkerActivity(accountID)
 		})
 	}
 }

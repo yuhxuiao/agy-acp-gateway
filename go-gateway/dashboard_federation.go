@@ -129,6 +129,20 @@ func cloneGatewayMapWithInstance(gw map[string]any, instID, instLabel string) ma
 	return cp
 }
 
+func lookupCachedPeerDashboardByPort(accountID string, dashPort int) (*peerDashboardDecoded, time.Time, bool) {
+	if accountID == "" || dashPort <= 0 {
+		return nil, time.Time{}, false
+	}
+	cacheKey := fmt.Sprintf("%s|http://127.0.0.1:%d", accountID, dashPort)
+	peerDashCacheMu.Lock()
+	cached, ok := peerDashCache[cacheKey]
+	peerDashCacheMu.Unlock()
+	if !ok || cached.decoded == nil {
+		return nil, time.Time{}, false
+	}
+	return cached.decoded, cached.fetchedAt, true
+}
+
 func fetchPeerDashboard(peer gwcfg.DashboardPeerConfig, forceQuota bool, fallbackKey string) (decoded *peerDashboardDecoded, reachable bool, stale bool, fetchedAt string, errMsg string) {
 	cacheKey := peer.ID + "|" + peer.BaseURL
 	flightKey := cacheKey
@@ -518,7 +532,7 @@ func BuildFederatedDashboardPayload(gw *GatewayServer, forceQuota bool) map[stri
 		}
 	}
 
-	managedPeers, unauthInstances := GlobalAccountManager.ManagedPeersForDashboard()
+	managedPeers, unauthInstances := GlobalAccountManager.ManagedPeersForDashboardWithForce(forceQuota)
 	seenPeer := make(map[string]bool)
 	var peers []gwcfg.DashboardPeerConfig
 	for _, p := range managedPeers {
@@ -811,6 +825,15 @@ func BuildFederatedDashboardPayload(gw *GatewayServer, forceQuota bool) map[stri
 	for _, unauth := range unauthInstances {
 		if uid, _ := unauth["id"].(string); uid != "" && !seenPeer[uid] {
 			instances = append(instances, unauth)
+			if sleeping, _ := unauth["sleeping"].(bool); sleeping {
+				if uw, okW := unauth["windows"].(map[string]WindowAggregate); okW {
+					for _, k := range winKeys {
+						if w, ok := uw[k]; ok {
+							winsByKey[k] = append(winsByKey[k], w)
+						}
+					}
+				}
+			}
 		}
 	}
 
