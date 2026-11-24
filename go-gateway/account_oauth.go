@@ -28,6 +28,37 @@ func openLinuxPTY() (master *os.File, slave *os.File, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	if runtime.GOOS == "darwin" {
+		const (
+			tiocptygrant = 0x20007454 // _IO('t', 84)
+			tiocptyunlk  = 0x20007452 // _IO('t', 82)
+			tiocptygname = 0x40807453 // _IOC(IOC_OUT, 't', 83, 128)
+		)
+		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), tiocptygrant, 0); errno != 0 {
+			_ = ptmx.Close()
+			return nil, nil, errno
+		}
+		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), tiocptyunlk, 0); errno != 0 {
+			_ = ptmx.Close()
+			return nil, nil, errno
+		}
+		var nameBuf [128]byte
+		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), tiocptygname, uintptr(unsafe.Pointer(&nameBuf[0]))); errno != 0 {
+			_ = ptmx.Close()
+			return nil, nil, errno
+		}
+		n := bytes.IndexByte(nameBuf[:], 0)
+		if n <= 0 {
+			_ = ptmx.Close()
+			return nil, nil, errors.New("empty darwin pty slave path")
+		}
+		pts, err := os.OpenFile(string(nameBuf[:n]), os.O_RDWR|syscall.O_NOCTTY, 0)
+		if err != nil {
+			_ = ptmx.Close()
+			return nil, nil, err
+		}
+		return ptmx, pts, nil
+	}
 	var unlock int32
 	const tiocsptlck = 0x40045431
 	const tiocgptn = 0x80045430
@@ -46,6 +77,25 @@ func openLinuxPTY() (master *os.File, slave *os.File, err error) {
 		return nil, nil, err
 	}
 	return ptmx, pts, nil
+}
+
+func summarizeOAuthFailureOutput(outStr string) string {
+	var errLines []string
+	for _, ln := range strings.Split(outStr, "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" ||
+			strings.HasPrefix(t, "Authentication required.") ||
+			strings.HasPrefix(t, "https://accounts.google.com/o/oauth2/auth") ||
+			strings.HasPrefix(t, "Waiting for authentication") ||
+			strings.HasPrefix(t, "Or, paste the authorization code") {
+			continue
+		}
+		errLines = append(errLines, t)
+	}
+	if len(errLines) > 0 {
+		return strings.Join(errLines, " | ")
+	}
+	return strings.TrimSpace(outStr)
 }
 
 func redactAccountErrorString(s string, proxyStr string) string {
@@ -456,29 +506,7 @@ func (am *AccountManager) StartOAuthLogin(accountID string) (string, error) {
 	cmd := exec.Command(PatchedAgyBin, "-p", "/login")
 	cmd.Dir = homeDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	env := make([]string, 0, len(os.Environ())+14)
-	for _, kv := range os.Environ() {
-		if isStrippedSubprocessEnv(kv) {
-			continue
-		}
-		env = append(env, kv)
-	}
-	env = append(env,
-		"HOME="+homeDir,
-		"BROWSER=/bin/false",
-		"DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null",
-		"AGY_CLI_DISABLE_AUTO_UPDATE=1",
-		"HTTP_PROXY="+proxy,
-		"HTTPS_PROXY="+proxy,
-		"http_proxy="+proxy,
-		"https_proxy="+proxy,
-		"ALL_PROXY=",
-		"all_proxy=",
-		"NO_PROXY=127.0.0.1,localhost,::1",
-		"no_proxy=127.0.0.1,localhost,::1",
-	)
-	cmd.Env = env
+	cmd.Env = am.buildOAuthSubprocessEnv(homeDir, proxy)
 
 	var stdinPipe io.WriteCloser
 	var ptySlave *os.File
@@ -765,7 +793,8 @@ waitLoop:
 		sess.outMu.Lock()
 		outStr := strings.TrimSpace(sess.output.String())
 		sess.outMu.Unlock()
-		return "", 0, fmt.Errorf("OAuth 换取凭据未成功: %s", redactAccountErrorString(truncateRunes(outStr, 240), proxy))
+		errSummary := summarizeOAuthFailureOutput(outStr)
+		return "", 0, fmt.Errorf("OAuth 换取凭据未成功: %s", redactAccountErrorString(truncateRunes(errSummary, 240), proxy))
 	}
 
 	_ = os.Chmod(sess.tokenPath, 0o600)
@@ -837,10 +866,10 @@ func (am *AccountManager) ImportOAuthToken(accountID, rawToken string) (tierLabe
 	return tier, cnt, nil
 }
 
-func (am *AccountManager) buildAccountSubprocessEnv(homeDir, proxy string) []string {
-	env := make([]string, 0, len(os.Environ())+16)
+func buildAccountSubprocessEnvForGOOS(baseEnv []string, goos, homeDir, proxy string, extra ...string) []string {
+	env := make([]string, 0, len(baseEnv)+16+len(extra))
 	hasSSH := false
-	for _, kv := range os.Environ() {
+	for _, kv := range baseEnv {
 		if isStrippedSubprocessEnv(kv) {
 			continue
 		}
@@ -849,7 +878,7 @@ func (am *AccountManager) buildAccountSubprocessEnv(homeDir, proxy string) []str
 		}
 		env = append(env, kv)
 	}
-	if runtime.GOOS == "darwin" && !hasSSH {
+	if goos == "darwin" && !hasSSH {
 		env = append(env, "SSH_CONNECTION=1 1 1 1")
 	}
 	env = append(env,
@@ -865,7 +894,16 @@ func (am *AccountManager) buildAccountSubprocessEnv(homeDir, proxy string) []str
 		"NO_PROXY=127.0.0.1,localhost,::1",
 		"no_proxy=127.0.0.1,localhost,::1",
 	)
+	env = append(env, extra...)
 	return env
+}
+
+func (am *AccountManager) buildAccountSubprocessEnv(homeDir, proxy string) []string {
+	return buildAccountSubprocessEnvForGOOS(os.Environ(), runtime.GOOS, homeDir, proxy)
+}
+
+func (am *AccountManager) buildOAuthSubprocessEnv(homeDir, proxy string) []string {
+	return buildAccountSubprocessEnvForGOOS(os.Environ(), runtime.GOOS, homeDir, proxy, "BROWSER=/bin/false")
 }
 
 func (am *AccountManager) probeAccountModelsTier(acc AccountProfile) (tierLabel string, modelsCount int) {
