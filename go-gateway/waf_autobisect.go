@@ -15,11 +15,12 @@ import (
 type wafRewriteRule = cleanroom.WafRewriteRule
 
 type wafRuleCache struct {
-	mu      sync.RWMutex
-	path    string
-	mtimeNs int64
-	size    int64
-	rules   []wafRewriteRule
+	mu       sync.RWMutex
+	path     string
+	mtimeNs  int64
+	size     int64
+	rules    []wafRewriteRule
+	compiled *cleanroom.CompiledWafRules
 }
 
 var (
@@ -58,6 +59,7 @@ func resetWafRuleCacheForTest() {
 	globalWafRules.mtimeNs = 0
 	globalWafRules.size = 0
 	globalWafRules.rules = nil
+	globalWafRules.compiled = nil
 	globalWafRules.mu.Unlock()
 
 	wafCooldownMu.Lock()
@@ -65,7 +67,7 @@ func resetWafRuleCacheForTest() {
 	wafCooldownMu.Unlock()
 }
 
-func loadDynamicWafRules() []wafRewriteRule {
+func currentCompiledWafRules() *cleanroom.CompiledWafRules {
 	target := effectiveWafRulesFile()
 	if target == "" {
 		return nil
@@ -73,13 +75,19 @@ func loadDynamicWafRules() []wafRewriteRule {
 	st, err := os.Stat(target)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			globalWafRules.mu.Lock()
-			if globalWafRules.path == target && len(globalWafRules.rules) > 0 {
-				globalWafRules.rules = nil
-				globalWafRules.mtimeNs = 0
-				globalWafRules.size = 0
+			globalWafRules.mu.RLock()
+			stale := globalWafRules.path == target && (len(globalWafRules.rules) > 0 || globalWafRules.compiled != nil)
+			globalWafRules.mu.RUnlock()
+			if stale {
+				globalWafRules.mu.Lock()
+				if globalWafRules.path == target {
+					globalWafRules.rules = nil
+					globalWafRules.compiled = nil
+					globalWafRules.mtimeNs = 0
+					globalWafRules.size = 0
+				}
+				globalWafRules.mu.Unlock()
 			}
-			globalWafRules.mu.Unlock()
 		}
 		return nil
 	}
@@ -88,9 +96,9 @@ func loadDynamicWafRules() []wafRewriteRule {
 
 	globalWafRules.mu.RLock()
 	if globalWafRules.path == target && globalWafRules.mtimeNs == mtimeNs && globalWafRules.size == sz {
-		cp := append([]wafRewriteRule(nil), globalWafRules.rules...)
+		comp := globalWafRules.compiled
 		globalWafRules.mu.RUnlock()
-		return cp
+		return comp
 	}
 	globalWafRules.mu.RUnlock()
 
@@ -102,28 +110,33 @@ func loadDynamicWafRules() []wafRewriteRule {
 	if err != nil {
 		return nil
 	}
+	comp := cleanroom.CompileWafRules(valid)
 	globalWafRules.mu.Lock()
 	globalWafRules.path = target
 	globalWafRules.mtimeNs = mtimeNs
 	globalWafRules.size = sz
 	globalWafRules.rules = valid
-	cp := append([]wafRewriteRule(nil), valid...)
+	globalWafRules.compiled = comp
 	globalWafRules.mu.Unlock()
-	return cp
+	return comp
+}
+
+func loadDynamicWafRules() []wafRewriteRule {
+	return currentCompiledWafRules().Rules()
 }
 
 func ApplyDynamicWafRules(s string) string {
 	if s == "" {
 		return ""
 	}
-	return cleanroom.ApplyRules(s, loadDynamicWafRules())
+	return currentCompiledWafRules().Apply(s)
 }
 
 func ApplyDynamicWafRulesInWorkspaceContext(s string) string {
 	if s == "" || !strings.Contains(s, "<workspace-context>") {
 		return s
 	}
-	return cleanroom.ApplyRulesInWorkspaceContext(s, loadDynamicWafRules())
+	return currentCompiledWafRules().ApplyInWorkspaceContext(s)
 }
 
 var wafPersistEpoch atomic.Uint64

@@ -215,13 +215,122 @@ func PersistRuleFile(target, literal, source string, existing []WafRewriteRule) 
 	return nil
 }
 
-// WafRuleCache caches parsed WAF rewrite rules keyed by file mtime+size.
+// CompiledWafRules holds an immutable rule slice plus a precompiled single-pass *strings.Replacer
+// when literals are pairwise non-overlapping and replacements cannot synthesize chained matches.
+type CompiledWafRules struct {
+	rules        []WafRewriteRule
+	fastReplacer *strings.Replacer
+}
+
+func hasAffixOverlap(a, b string) bool {
+	if strings.Contains(a, b) || strings.Contains(b, a) {
+		return true
+	}
+	maxK := len(a) - 1
+	if len(b)-1 < maxK {
+		maxK = len(b) - 1
+	}
+	for k := 1; k <= maxK; k++ {
+		if a[len(a)-k:] == b[:k] || b[len(b)-k:] == a[:k] {
+			return true
+		}
+	}
+	return false
+}
+
+// CompileWafRules builds an immutable CompiledWafRules snapshot from rules.
+func CompileWafRules(rules []WafRewriteRule) *CompiledWafRules {
+	if len(rules) == 0 {
+		return nil
+	}
+	cp := make([]WafRewriteRule, 0, len(rules))
+	for _, r := range rules {
+		if r.Literal != "" {
+			cp = append(cp, r)
+		}
+	}
+	if len(cp) == 0 {
+		return nil
+	}
+	canFast := true
+	for i := 0; i < len(cp) && canFast; i++ {
+		if cp[i].Replacement != "" {
+			canFast = false
+			break
+		}
+		for j := i + 1; j < len(cp); j++ {
+			if hasAffixOverlap(cp[i].Literal, cp[j].Literal) {
+				canFast = false
+				break
+			}
+		}
+	}
+	out := &CompiledWafRules{rules: cp}
+	if canFast {
+		pairs := make([]string, 0, len(cp)*2)
+		for _, r := range cp {
+			pairs = append(pairs, r.Literal, r.Replacement)
+		}
+		out.fastReplacer = strings.NewReplacer(pairs...)
+	}
+	return out
+}
+
+// Rules returns a defensive copy of the underlying WAF rewrite rules.
+func (cr *CompiledWafRules) Rules() []WafRewriteRule {
+	if cr == nil || len(cr.rules) == 0 {
+		return nil
+	}
+	return append([]WafRewriteRule(nil), cr.rules...)
+}
+
+// Apply rewrites s using the precompiled single-pass replacer when eligible, else sequential ApplyRules.
+func (cr *CompiledWafRules) Apply(s string) string {
+	if cr == nil || s == "" || len(cr.rules) == 0 {
+		return s
+	}
+	if cr.fastReplacer != nil {
+		out := cr.fastReplacer.Replace(s)
+		if out == s {
+			return s
+		}
+		out = StripOrphanBulletLines(out)
+		return multiBlankLinesRe.ReplaceAllString(strings.TrimSpace(out), "\n\n")
+	}
+	return ApplyRules(s, cr.rules)
+}
+
+// ApplyInWorkspaceContext rewrites only <workspace-context> spans using CompiledWafRules.
+func (cr *CompiledWafRules) ApplyInWorkspaceContext(s string) string {
+	if cr == nil || s == "" || len(cr.rules) == 0 || !strings.Contains(s, "<workspace-context>") {
+		return s
+	}
+	if cr.fastReplacer == nil {
+		return ApplyRulesInWorkspaceContext(s, cr.rules)
+	}
+	return workspaceContextSpanRe.ReplaceAllStringFunc(s, func(span string) string {
+		inner := strings.TrimPrefix(span, "<workspace-context>")
+		inner = strings.TrimSuffix(inner, "</workspace-context>")
+		replaced := cr.fastReplacer.Replace(inner)
+		if replaced == inner {
+			return span
+		}
+		inner = StripOrphanBulletLines(replaced)
+		trimmed := strings.TrimSpace(multiBlankLinesRe.ReplaceAllString(inner, "\n\n"))
+		if trimmed == "" {
+			return ""
+		}
+		return "<workspace-context>\n" + trimmed + "\n</workspace-context>"
+	})
+}
+
+// WafRuleCache caches parsed and compiled WAF rewrite rules keyed by file mtime+size.
 type WafRuleCache struct {
-	mu      sync.RWMutex
-	path    string
-	mtimeNs int64
-	size    int64
-	rules   []WafRewriteRule
+	mu       sync.RWMutex
+	path     string
+	mtimeNs  int64
+	size     int64
+	compiled *CompiledWafRules
 }
 
 // Reset clears the in-memory rule cache.
@@ -230,25 +339,30 @@ func (c *WafRuleCache) Reset() {
 	c.path = ""
 	c.mtimeNs = 0
 	c.size = 0
-	c.rules = nil
+	c.compiled = nil
 	c.mu.Unlock()
 }
 
-// Load returns the active rules from target, reloading if mtime or size changed.
-func (c *WafRuleCache) Load(target string) []WafRewriteRule {
+// LoadCompiled returns the immutable compiled rules snapshot for target without copying slices on cache hits.
+func (c *WafRuleCache) LoadCompiled(target string) *CompiledWafRules {
 	if target == "" {
 		return nil
 	}
 	st, err := os.Stat(target)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			c.mu.Lock()
-			if c.path == target && len(c.rules) > 0 {
-				c.rules = nil
-				c.mtimeNs = 0
-				c.size = 0
+			c.mu.RLock()
+			stale := c.path == target && c.compiled != nil
+			c.mu.RUnlock()
+			if stale {
+				c.mu.Lock()
+				if c.path == target {
+					c.compiled = nil
+					c.mtimeNs = 0
+					c.size = 0
+				}
+				c.mu.Unlock()
 			}
-			c.mu.Unlock()
 		}
 		return nil
 	}
@@ -257,9 +371,9 @@ func (c *WafRuleCache) Load(target string) []WafRewriteRule {
 
 	c.mu.RLock()
 	if c.path == target && c.mtimeNs == mtimeNs && c.size == sz {
-		cp := append([]WafRewriteRule(nil), c.rules...)
+		comp := c.compiled
 		c.mu.RUnlock()
-		return cp
+		return comp
 	}
 	c.mu.RUnlock()
 
@@ -271,12 +385,17 @@ func (c *WafRuleCache) Load(target string) []WafRewriteRule {
 	if err != nil {
 		return nil
 	}
+	comp := CompileWafRules(valid)
 	c.mu.Lock()
 	c.path = target
 	c.mtimeNs = mtimeNs
 	c.size = sz
-	c.rules = valid
-	cp := append([]WafRewriteRule(nil), valid...)
+	c.compiled = comp
 	c.mu.Unlock()
-	return cp
+	return comp
+}
+
+// Load returns the active rules from target, reloading if mtime or size changed.
+func (c *WafRuleCache) Load(target string) []WafRewriteRule {
+	return c.LoadCompiled(target).Rules()
 }

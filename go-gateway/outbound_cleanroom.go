@@ -100,11 +100,25 @@ type prunedSysCacheEntry struct {
 }
 
 var prunedSysCache = struct {
-	mu      sync.RWMutex
+	mu      sync.Mutex
 	entries map[prunedSysCacheKey]prunedSysCacheEntry
 	order   []prunedSysCacheKey
 }{
 	entries: make(map[prunedSysCacheKey]prunedSysCacheEntry, maxPrunedSysCacheEntries),
+}
+
+func movePrunedKeyToMRULocked(key prunedSysCacheKey) {
+	n := len(prunedSysCache.order)
+	if n <= 1 || prunedSysCache.order[n-1] == key {
+		return
+	}
+	for i := n - 2; i >= 0; i-- {
+		if prunedSysCache.order[i] == key {
+			copy(prunedSysCache.order[i:], prunedSysCache.order[i+1:])
+			prunedSysCache.order[n-1] = key
+			return
+		}
+	}
 }
 
 func PruneClientSystemPrompt(rawSys string) string {
@@ -117,17 +131,27 @@ func PruneClientSystemPrompt(rawSys string) string {
 		rawLen:   len(rawSys),
 		wafStamp: stamp,
 	}
-	prunedSysCache.mu.RLock()
+	prunedSysCache.mu.Lock()
 	if ent, ok := prunedSysCache.entries[key]; ok && ent.rawSys == rawSys {
-		prunedSysCache.mu.RUnlock()
-		return ent.pruned
+		movePrunedKeyToMRULocked(key)
+		res := ent.pruned
+		prunedSysCache.mu.Unlock()
+		return res
 	}
-	prunedSysCache.mu.RUnlock()
+	prunedSysCache.mu.Unlock()
 
-	pruned := cleanroom.PruneClientSystemPrompt(rawSys, ApplyDynamicWafRules, ApplyDynamicWafRulesInWorkspaceContext)
+	compiled := currentCompiledWafRules()
+	var applyWaf, applyWafCtx func(string) string
+	if compiled != nil {
+		applyWaf = compiled.Apply
+		applyWafCtx = compiled.ApplyInWorkspaceContext
+	}
+	pruned := cleanroom.PruneClientSystemPrompt(rawSys, applyWaf, applyWafCtx)
 	if len(rawSys) <= 512*1024 {
 		prunedSysCache.mu.Lock()
-		if _, exists := prunedSysCache.entries[key]; !exists {
+		if _, exists := prunedSysCache.entries[key]; exists {
+			movePrunedKeyToMRULocked(key)
+		} else {
 			if len(prunedSysCache.order) >= maxPrunedSysCacheEntries {
 				evict := prunedSysCache.order[0]
 				prunedSysCache.order = prunedSysCache.order[1:]
@@ -142,7 +166,12 @@ func PruneClientSystemPrompt(rawSys string) string {
 }
 
 func SanitizeStructuredValue(v any) any {
-	return cleanroom.SanitizeStructuredValue(v, ApplyDynamicWafRulesInWorkspaceContext)
+	compiled := currentCompiledWafRules()
+	var applyWafCtx func(string) string
+	if compiled != nil {
+		applyWafCtx = compiled.ApplyInWorkspaceContext
+	}
+	return cleanroom.SanitizeStructuredValue(v, applyWafCtx)
 }
 
 func SanitizeOutboundText(s string) string {

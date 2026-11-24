@@ -573,3 +573,58 @@ func TestAdjacentParagraphCapabilityFillerAndSelfDocSubItems(t *testing.T) {
 		t.Fatalf("nested self-doc got:\n%q\nwant:\n%q", got, wantNested)
 	}
 }
+
+func TestWindowedSanitizeOutboundTextByteEquivalenceAndCompiledWafRules(t *testing.T) {
+	// Build >64KB multi-line code + sparse vendor stems (including cross-newline \s+ phrases and masked identifiers)
+	var b strings.Builder
+	for i := 0; i < 400; i++ {
+		b.WriteString("func helperRoutineNumber(x int) string { return \"/usr/local/bin/sample_path_item\" }\n")
+	}
+	b.WriteString("// Mid-file note referencing OpenHands and /dsh/bin/runner\n")
+	b.WriteString("You are using the\nDeepSeek\nHarness (\nDSH\n) environment.\n")
+	for i := 0; i < 400; i++ {
+		b.WriteString("const anotherCleanConstantValue = \"alpha_beta_gamma_delta_epsilon_zeta\"\n")
+	}
+	b.WriteString("func\nCline() {}\nAnd Windsurf IDE at the tail.\n")
+	largeDoc := b.String()
+	if len(largeDoc) <= 32768 {
+		t.Fatalf("expected >32KB input, got %d", len(largeDoc))
+	}
+
+	got := SanitizeOutboundText(largeDoc, nil)
+	want := refSanitizeOutboundTextUngated(largeDoc, nil)
+	if got != want {
+		t.Fatalf("windowed SanitizeOutboundText diverged from full-text reference (len got=%d want=%d)", len(got), len(want))
+	}
+
+	// Verify CompiledWafRules fastReplacer (disjoint) and fallback (overlapping/affix) both match ApplyRules byte-for-byte.
+	disjoint := []WafRewriteRule{
+		{ID: "1", Literal: "forbidden alpha phrase one", Replacement: ""},
+		{ID: "2", Literal: "forbidden beta phrase two", Replacement: ""},
+	}
+	compDisjoint := CompileWafRules(disjoint)
+	if compDisjoint == nil || compDisjoint.fastReplacer == nil {
+		t.Fatal("expected disjoint empty-replacement rules to enable fastReplacer")
+	}
+	sample := "Header\n- forbidden alpha phrase one\nMiddle\n* forbidden beta phrase two\nFooter"
+	if compDisjoint.Apply(sample) != ApplyRules(sample, disjoint) {
+		t.Fatalf("CompiledWafRules.Apply mismatch on disjoint rules")
+	}
+	ctxSample := "Outside\n<workspace-context>\n- forbidden alpha phrase one\nKeep me\n</workspace-context>"
+	if compDisjoint.ApplyInWorkspaceContext(ctxSample) != ApplyRulesInWorkspaceContext(ctxSample, disjoint) {
+		t.Fatalf("CompiledWafRules.ApplyInWorkspaceContext mismatch on disjoint rules")
+	}
+
+	overlapping := []WafRewriteRule{
+		{ID: "1", Literal: "shared prefix literal one", Replacement: ""},
+		{ID: "2", Literal: "literal one suffix tail", Replacement: ""},
+	}
+	compOverlap := CompileWafRules(overlapping)
+	if compOverlap == nil || compOverlap.fastReplacer != nil {
+		t.Fatal("expected affix-overlapping rules to fall back to sequential ApplyRules")
+	}
+	overlapSample := "Start shared prefix literal one suffix tail End"
+	if compOverlap.Apply(overlapSample) != ApplyRules(overlapSample, overlapping) {
+		t.Fatalf("CompiledWafRules.Apply mismatch on overlapping rules")
+	}
+}

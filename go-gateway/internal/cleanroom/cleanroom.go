@@ -609,6 +609,148 @@ func leadingLine1HorizontalIndent(s string) string {
 	return s[:i]
 }
 
+func sanitizeStageCSegment(seg string, stemMask uint32) string {
+	if stemMask == 0 || seg == "" {
+		return seg
+	}
+	var masked []string
+	var protBuf strings.Builder
+	protBuf.Grow(len(seg))
+	lastPos := 0
+	for _, loc := range maskTokenMasterRe.FindAllStringIndex(seg, -1) {
+		start, end := loc[0], loc[1]
+		m := seg[start:end]
+		protBuf.WriteString(seg[lastPos:start])
+		if shouldSkipMaskingToken(m) || isSlashJoinedVendorList(seg, start, end) {
+			protBuf.WriteString(m)
+		} else {
+			idx := len(masked)
+			masked = append(masked, m)
+			protBuf.WriteString("\x00TOK_")
+			protBuf.WriteString(strconv.Itoa(idx))
+			protBuf.WriteByte(0)
+		}
+		lastPos = end
+	}
+	protBuf.WriteString(seg[lastPos:])
+	cleaned := protBuf.String()
+
+	for _, item := range stageCPhraseReplacements {
+		if stemMask&item.stemBit == 0 {
+			continue
+		}
+		cleaned = item.re.ReplaceAllString(cleaned, item.repl)
+	}
+
+	if len(masked) > 0 {
+		var b strings.Builder
+		b.Grow(len(cleaned))
+		for i := 0; i < len(cleaned); {
+			if cleaned[i] == 0 && i+5 < len(cleaned) && cleaned[i:i+5] == "\x00TOK_" {
+				end := strings.IndexByte(cleaned[i+5:], 0)
+				if end > 0 {
+					numStr := cleaned[i+5 : i+5+end]
+					if idx, err := strconv.Atoi(numStr); err == nil && idx >= 0 && idx < len(masked) {
+						b.WriteString(masked[idx])
+						i = i + 5 + end + 1
+						continue
+					}
+				}
+			}
+			b.WriteByte(cleaned[i])
+			i++
+		}
+		cleaned = b.String()
+	}
+	return cleaned
+}
+
+// sanitizeStageCWindowed skips regex token-masking on stem-free code/prose regions of large (>4KB)
+// multi-line inputs while keeping a +/-3 line margin around every stem-bearing line so multi-line
+// \s+ phrases and \b boundaries produce 100% byte-identical output to full-text Stage C.
+func sanitizeStageCWindowed(s string) string {
+	if len(s) <= 4096 {
+		if stemMask := scanStageCStems(s); stemMask != 0 {
+			return sanitizeStageCSegment(s, stemMask)
+		}
+		return s
+	}
+	type lineSpan struct {
+		start int
+		end   int
+		mask  uint32
+	}
+	var lines []lineSpan
+	var totalMask uint32
+	lineStart := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			m := scanStageCStems(s[lineStart:i])
+			totalMask |= m
+			lines = append(lines, lineSpan{start: lineStart, end: i, mask: m})
+			lineStart = i + 1
+		}
+	}
+	if lineStart <= len(s) {
+		m := scanStageCStems(s[lineStart:])
+		totalMask |= m
+		lines = append(lines, lineSpan{start: lineStart, end: len(s), mask: m})
+	}
+	if totalMask == 0 {
+		return s
+	}
+	if len(lines) < 10 {
+		return sanitizeStageCSegment(s, totalMask)
+	}
+
+	const margin = 3
+	type win struct {
+		first int
+		last  int
+		mask  uint32
+	}
+	var wins []win
+	for idx, ln := range lines {
+		if ln.mask == 0 {
+			continue
+		}
+		f := idx - margin
+		if f < 0 {
+			f = 0
+		}
+		l := idx + margin
+		if l >= len(lines) {
+			l = len(lines) - 1
+		}
+		if len(wins) > 0 && f <= wins[len(wins)-1].last+1 {
+			wins[len(wins)-1].last = l
+			wins[len(wins)-1].mask |= ln.mask
+		} else {
+			wins = append(wins, win{first: f, last: l, mask: ln.mask})
+		}
+	}
+	if len(wins) == 1 && wins[0].first == 0 && wins[0].last == len(lines)-1 {
+		return sanitizeStageCSegment(s, totalMask)
+	}
+
+	var out strings.Builder
+	out.Grow(len(s))
+	cursor := 0
+	for _, w := range wins {
+		bStart := lines[w.first].start
+		bEnd := lines[w.last].end
+		if cursor < bStart {
+			out.WriteString(s[cursor:bStart])
+		}
+		out.WriteString(sanitizeStageCSegment(s[bStart:bEnd], w.mask))
+		cursor = bEnd
+	}
+	if cursor < len(s) {
+		out.WriteString(s[cursor:])
+	}
+	return out.String()
+}
+
 // SanitizeOutboundText implements Stage C single-pass token-masked sanitization and XML tag normalization.
 func SanitizeOutboundText(s string, applyWafCtx func(string) string) string {
 	if s == "" || strings.TrimSpace(s) == "" {
@@ -622,58 +764,7 @@ func SanitizeOutboundText(s string, applyWafCtx func(string) string) string {
 		s = pastedContentCloseRe.ReplaceAllString(s, "</user-excerpt>")
 	}
 
-	cleaned := s
-	if stemMask := scanStageCStems(s); stemMask != 0 {
-		var masked []string
-		var protBuf strings.Builder
-		protBuf.Grow(len(s))
-		lastPos := 0
-		for _, loc := range maskTokenMasterRe.FindAllStringIndex(s, -1) {
-			start, end := loc[0], loc[1]
-			m := s[start:end]
-			protBuf.WriteString(s[lastPos:start])
-			if shouldSkipMaskingToken(m) || isSlashJoinedVendorList(s, start, end) {
-				protBuf.WriteString(m)
-			} else {
-				idx := len(masked)
-				masked = append(masked, m)
-				protBuf.WriteString("\x00TOK_")
-				protBuf.WriteString(strconv.Itoa(idx))
-				protBuf.WriteByte(0)
-			}
-			lastPos = end
-		}
-		protBuf.WriteString(s[lastPos:])
-		cleaned = protBuf.String()
-
-		for _, item := range stageCPhraseReplacements {
-			if stemMask&item.stemBit == 0 {
-				continue
-			}
-			cleaned = item.re.ReplaceAllString(cleaned, item.repl)
-		}
-
-		if len(masked) > 0 {
-			var b strings.Builder
-			b.Grow(len(cleaned))
-			for i := 0; i < len(cleaned); {
-				if cleaned[i] == 0 && i+5 < len(cleaned) && cleaned[i:i+5] == "\x00TOK_" {
-					end := strings.IndexByte(cleaned[i+5:], 0)
-					if end > 0 {
-						numStr := cleaned[i+5 : i+5+end]
-						if idx, err := strconv.Atoi(numStr); err == nil && idx >= 0 && idx < len(masked) {
-							b.WriteString(masked[idx])
-							i = i + 5 + end + 1
-							continue
-						}
-					}
-				}
-				b.WriteByte(cleaned[i])
-				i++
-			}
-			cleaned = b.String()
-		}
-	}
+	cleaned := sanitizeStageCWindowed(s)
 	if applyWafCtx != nil && strings.IndexByte(cleaned, '<') >= 0 && strings.Contains(cleaned, "<workspace-context>") {
 		cleaned = applyWafCtx(cleaned)
 	}
