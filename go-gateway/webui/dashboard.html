@@ -2217,7 +2217,7 @@ async function load(force = false, fromPoll = false) {
       return;
     }
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const etag = r.headers.get('ETag') || '';
+    const etag = (r.headers && typeof r.headers.get === 'function') ? (r.headers.get('ETag') || '') : '';
     const d = await r.json();
     if (!d || typeof d !== 'object' || !d.windows) throw new Error('Invalid dashboard payload');
     if (mySeq === loadSeq) {
