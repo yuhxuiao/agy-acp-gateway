@@ -20,6 +20,7 @@ var (
 	secretFieldLogRE       = regexp.MustCompile(`(?i)("(?:tenant|tenantkey|authorization|x-api-key|x-goog-api-key|api_key|apikey|access_token|refresh_token)"\s*:\s*)"[^"\r\n]*"`)
 	anyURLQueryValRE       = regexp.MustCompile(`([?&][^=&#\s"'\\<>]+)=[^&#\s"'\\<>]+`)
 	urlUserInfoLogRE       = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s"'\\<>@]+@`)
+	clientKeyLogRE         = regexp.MustCompile(`agy-(?:ck|child)-[A-Za-z0-9_-]{8,}`)
 )
 
 func hasAuthSchemeHint(s string) bool {
@@ -36,6 +37,9 @@ func hasAuthSchemeHint(s string) bool {
 func RedactSecretsInString(s string) string {
 	if s == "" {
 		return s
+	}
+	if strings.Contains(s, "agy-ck-") || strings.Contains(s, "agy-child-") {
+		s = clientKeyLogRE.ReplaceAllString(s, "agy-ck-[REDACTED]")
 	}
 	if hasAuthSchemeHint(s) {
 		s = authSchemeLogRE.ReplaceAllString(s, `${1}[REDACTED]`)

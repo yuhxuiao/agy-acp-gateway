@@ -435,6 +435,7 @@ func isStrippedLeafAgySubprocessEnv(kv string) bool {
 	}
 	for _, prefix := range []string{
 		"AGY_API_KEYS=", "AGY_API_KEYS_FILE=",
+		"AGY_DASHBOARD_PASSWORD=", "AGY_DASHBOARD_PASSWORD_FILE=", "AGY_CLIENT_KEYS_FILE=",
 		"AGY_RESIN_PROXY_TOKEN=", "AGY_RESIN_HOST=",
 		"AGY_PROXY_PRESETS_FILE=", "AGY_UPSTREAM_PROXY=",
 		"AGY_DASHBOARD_PEERS=",

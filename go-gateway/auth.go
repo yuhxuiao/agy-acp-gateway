@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"os"
@@ -53,10 +55,125 @@ func loadAPIKeys() [][]byte {
 			out = append(out, []byte(k))
 		}
 	}
+	dashboardCreds = loadDashboardCredentials()
 	return out
 }
 
+// authEnabled reports whether legacy master API keys (AGY_API_KEYS / AGY_API_KEYS_FILE) are configured.
 func authEnabled() bool { return len(apiKeys) > 0 || authConfigErr != nil }
+
+// dataPlaneAuthEnabled reports whether :18890 requires a credential. Issuing any dashboard client key
+// turns data-plane auth on even without master keys (disabled keys keep it on, so revoking never reopens it).
+func dataPlaneAuthEnabled() bool {
+	return authEnabled() || GlobalClientKeys.HasAny()
+}
+
+// --- Dashboard (admin plane) credentials ---
+//
+// AGY_DASHBOARD_PASSWORD        plaintext password (or "sha256:<64 hex>" digest)
+// AGY_DASHBOARD_PASSWORD_FILE   file holding one password / "sha256:<hex>" digest per line (# comments)
+//
+// When any dashboard credential is configured, :18891 (WebUI, /api/*, /metrics, /health) accepts ONLY
+// that credential: master API keys and client keys are rejected. When none is configured, the legacy
+// behaviour is kept (master API key doubles as the dashboard password) for backward compatibility.
+
+type dashboardCredentials struct {
+	digests   [][]byte // sha256 digests of accepted passwords
+	plaintext string   // first plaintext password (used to authenticate to federated peers)
+	err       error
+}
+
+var dashboardCreds = loadDashboardCredentials()
+
+func parseDashboardSecret(raw string) (digest []byte, plain string, ok bool, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(raw, "#") {
+		return nil, "", false, nil
+	}
+	if len(raw) > 7 && strings.EqualFold(raw[:7], "sha256:") {
+		d, decErr := hex.DecodeString(strings.TrimSpace(raw[7:]))
+		if decErr != nil || len(d) != sha256.Size {
+			return nil, "", false, errors.New("configured dashboard password digest is malformed")
+		}
+		return d, "", true, nil
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return sum[:], raw, true, nil
+}
+
+func loadDashboardCredentials() dashboardCredentials {
+	snap := gwcfg.Current()
+	var c dashboardCredentials
+	add := func(raw string) {
+		d, plain, ok, err := parseDashboardSecret(raw)
+		if err != nil && c.err == nil {
+			c.err = err
+		}
+		if ok {
+			c.digests = append(c.digests, d)
+			if c.plaintext == "" && plain != "" {
+				c.plaintext = plain
+			}
+		}
+	}
+	if v := snap.DashboardPassword; strings.TrimSpace(v) != "" {
+		add(v)
+	}
+	if f := snap.DashboardPasswordFile; f != "" {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			c.err = errors.New("configured dashboard password file is unreadable")
+		} else {
+			before := len(c.digests)
+			for _, line := range strings.Split(string(b), "\n") {
+				add(line)
+			}
+			if len(c.digests) == before && c.err == nil {
+				c.err = errors.New("configured dashboard password file contains no passwords")
+			}
+		}
+	}
+	return c
+}
+
+// dashboardPasswordConfigured reports whether a dedicated admin credential is set (or failed to load).
+func dashboardPasswordConfigured() bool {
+	return len(dashboardCreds.digests) > 0 || dashboardCreds.err != nil
+}
+
+// dashboardAuthEnabled reports whether :18891 requires any credential.
+func dashboardAuthEnabled() bool {
+	return dashboardPasswordConfigured() || authEnabled()
+}
+
+// dashboardAuthMode describes the active admin-plane auth mode for the UI / docs (never secrets).
+func dashboardAuthMode() string {
+	switch {
+	case dashboardPasswordConfigured():
+		return "dashboard-password"
+	case authEnabled():
+		return "legacy-master-key"
+	default:
+		return "disabled"
+	}
+}
+
+func dashboardPasswordMatches(candidate string) bool {
+	if candidate == "" || dashboardCreds.err != nil {
+		return false
+	}
+	sum := sha256.Sum256([]byte(candidate))
+	ok := 0
+	for _, d := range dashboardCreds.digests {
+		ok |= subtle.ConstantTimeCompare(sum[:], d)
+	}
+	return ok == 1
+}
+
+// dashboardPeerCredential is the credential presented to federated peer dashboards.
+func dashboardPeerCredential() string {
+	return dashboardCreds.plaintext
+}
 
 func rawMasterKeyMatches(candidate string) bool {
 	if candidate == "" {
@@ -72,6 +189,9 @@ func rawMasterKeyMatches(candidate string) bool {
 
 func keyMatches(candidate string) bool {
 	if rawMasterKeyMatches(candidate) {
+		return true
+	}
+	if _, ok := GlobalClientKeys.Match(candidate); ok {
 		return true
 	}
 	if _, ok := GlobalAccountManager.MatchesAccountKey(candidate); ok {
@@ -133,7 +253,7 @@ func requestKey(r *http.Request) string {
 
 // checkAPIAuth guards /v1/* and /v1beta/*. Returns false after writing a 401.
 func checkAPIAuth(w http.ResponseWriter, r *http.Request) bool {
-	if authConfigErr == nil && (!authEnabled() || keyMatches(requestKey(r))) {
+	if authConfigErr == nil && GlobalClientKeys.LoadError() == nil && (!dataPlaneAuthEnabled() || keyMatches(requestKey(r))) {
 		return true
 	}
 	if r != nil && r.URL != nil && strings.HasPrefix(r.URL.Path, "/v1beta/") {
@@ -146,13 +266,34 @@ func checkAPIAuth(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-// checkDashboardAuth guards the admin page and management APIs (master key only; restricted channel boundKeys are rejected).
+// checkDashboardAuth guards the admin page and management APIs on :18891.
+//   - Dedicated AGY_DASHBOARD_PASSWORD configured: only that password is accepted.
+//   - Otherwise (legacy): the raw master API key; restricted account/group boundKeys are rejected.
+//   - Dashboard-issued client keys are ALWAYS rejected, even when the dashboard is otherwise open.
 func checkDashboardAuth(w http.ResponseWriter, r *http.Request) bool {
-	if authConfigErr == nil && (!authEnabled() || rawMasterKeyMatches(requestKey(r))) {
+	cand := requestKey(r)
+	allowed := false
+	if _, isClientKey := GlobalClientKeys.Lookup(cand); !isClientKey {
+		switch {
+		case dashboardPasswordConfigured():
+			allowed = dashboardPasswordMatches(cand)
+		case authConfigErr != nil:
+			allowed = false
+		case !authEnabled():
+			allowed = true
+		default:
+			allowed = rawMasterKeyMatches(cand)
+		}
+	}
+	if allowed {
 		return true
 	}
 	w.Header().Set("WWW-Authenticate", `Basic realm="ACP Gateway", charset="UTF-8"`)
 	w.WriteHeader(http.StatusUnauthorized)
-	_, _ = w.Write([]byte("401 需要登录: 用户名任意, 密码填主 API Key"))
+	if dashboardPasswordConfigured() {
+		_, _ = w.Write([]byte("401 需要登录: 用户名任意, 密码填管理后台密码 (AGY_DASHBOARD_PASSWORD)"))
+	} else {
+		_, _ = w.Write([]byte("401 需要登录: 用户名任意, 密码填主 API Key"))
+	}
 	return false
 }

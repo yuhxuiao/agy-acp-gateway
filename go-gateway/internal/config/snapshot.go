@@ -67,6 +67,9 @@ type Snapshot struct {
 	QuotaBin               string
 	APIKeysRaw             string
 	APIKeysFile            string
+	DashboardPassword      string
+	DashboardPasswordFile  string
+	ClientKeysFile         string
 	GoGC                   string
 	GoMemLimit             string
 	RouteClaudeNames       bool
@@ -359,6 +362,9 @@ func LoadFromEnv() *Snapshot {
 		QuotaBin:               strings.TrimSpace(os.Getenv("AGY_QUOTA_BIN")),
 		APIKeysRaw:             os.Getenv("AGY_API_KEYS"),
 		APIKeysFile:            os.Getenv("AGY_API_KEYS_FILE"),
+		DashboardPassword:      os.Getenv("AGY_DASHBOARD_PASSWORD"),
+		DashboardPasswordFile:  strings.TrimSpace(os.Getenv("AGY_DASHBOARD_PASSWORD_FILE")),
+		ClientKeysFile:         strings.TrimSpace(os.Getenv("AGY_CLIENT_KEYS_FILE")),
 		GoGC:                   gogc,
 		GoMemLimit:             gomem,
 		RouteClaudeNames:       os.Getenv("AGY_ROUTE_CLAUDE_NAMES") == "1",

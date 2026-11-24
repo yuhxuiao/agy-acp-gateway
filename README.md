@@ -86,8 +86,8 @@ cd go-gateway && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../bin/agy
 
 # 3. Configure environment & start container
 cp .env.example deploy/.env
-# Edit deploy/.env -> set a strong AGY_API_KEYS value (docker-compose pins AGY_LISTEN_HOST=0.0.0.0 inside the container;
-# leave AGY_UPSTREAM_PROXY commented out unless using a reachable proxy)
+# Edit deploy/.env -> set AGY_DASHBOARD_PASSWORD (dedicated :18891 admin password) and AGY_API_KEYS
+# (or mint SHA-256 hashed agy-ck-* client keys inside :18891; leave AGY_UPSTREAM_PROXY commented out unless using a reachable proxy)
 docker compose -f deploy/docker-compose.yml up -d --build
 
 # 4. Verify liveness
@@ -115,7 +115,7 @@ cd ..
 
 # 3. Configure .env & start local service
 cp .env.example .env
-# Edit .env -> set AGY_API_KEYS=sk-your-master-key and AGY_UPSTREAM_PROXY
+# Edit .env -> set AGY_DASHBOARD_PASSWORD (recommended) / AGY_API_KEYS and AGY_UPSTREAM_PROXY
 ./scripts/gw.sh start
 ./scripts/gw.sh status
 ```
@@ -124,7 +124,7 @@ cp .env.example .env
 
 ### Step 3: Onboarding & OAuth Account Authorization (3 Methods)
 
-Open the **Warm-Paper Console** at `http://127.0.0.1:18891/` (enter any username and your `AGY_API_KEYS` master key as the password), then click **Account Control Center (`账号控制中心`)** in the top bar:
+Open the **Warm-Paper Console** at `http://127.0.0.1:18891/` (enter any username and your `AGY_DASHBOARD_PASSWORD` — or `AGY_API_KEYS` master key if `AGY_DASHBOARD_PASSWORD` is unset — as the password), then click **Account Control Center (`账号控制中心`)** in the top bar (where you can also generate SHA-256 hashed `agy-ck-*` **Client API Keys** strictly isolated to `:18890`):
 
 1. **Method 1 — Zero-SSH WebUI PKCE OAuth (Linux / WSL2 / Docker; Recommended for Headless Servers & Secondary Accounts)**:
    - *(Native `macOS arm64` hosts do not expose `/dev/ptmx` Linux PTYs; use Method 2 CLI login or Method 3 JSON token import on macOS.)*
@@ -282,12 +282,13 @@ You can target a specific account, target a **Channel Group**, or let the global
 
 | Targeting Mode | Client Credential / Header | Admin Access (`:18891`) | Model Allowlist Enforcement |
 | :--- | :--- | :--- | :--- |
+| **Dashboard Client Key (`agy-ck-*`)** | `Authorization: Bearer agy-ck-...` *(minted in `:18891`, SHA-256 stored)* | **Denied (`401`)** | Key `allowedModels` ∩ Scope (`global` / `group` / `account`) allowlists |
 | **Account Bound Key** | `Authorization: Bearer sk-acct-only-key` | **Denied (`401`)** | Account `allowedModels` |
 | **Group Bound Key** | `Authorization: Bearer sk-team-group-key` | **Denied (`401`)** | Group `allowedModels` ∩ Account `allowedModels` |
 | **Master Key + Account Suffix** | `<master_key>@acct:<id>` or `<master_key>@<id>` *(also `#`)* | API plane only | Account `allowedModels` |
 | **Master Key + Group Suffix** | `<master_key>@group:<group_id>` *(also `#group:<group_id>`)* | API plane only | Group `allowedModels` ∩ Account `allowedModels` |
-| **Explicit Request Header** | `X-Agy-Account: <id>` or `X-Agy-Group: <group_id>` *(with master key)* | Master key | Conflicting `X-Agy-Account` outside `X-Agy-Group` rejected (`403`) |
-| **Default Global Pool** | `<master_key>` | Master key | Scheduled account's `allowedModels` |
+| **Explicit Request Header** | `X-Agy-Account: <id>` or `X-Agy-Group: <group_id>` *(with master/global key)* | Master key *(only if `AGY_DASHBOARD_PASSWORD` unset)* | Conflicting `X-Agy-Account` outside `X-Agy-Group` rejected (`403`) |
+| **Default Global Pool** | `<master_key>` | Master key *(only if `AGY_DASHBOARD_PASSWORD` unset)* | Scheduled account's `allowedModels` |
 
 Every API response exposes routing telemetry headers (CORS-exposed):
 `X-Agy-Account`, `X-Agy-Group`, `X-Agy-Route-Mode`, `X-Agy-Failover-Count`, `X-Agy-Served-Model`, and `X-Agy-Cache-Warning`.
@@ -388,7 +389,7 @@ Explicit body fields take precedence over model-name suffixes (`<model>-high`, `
 4. **Zero-Lock `.1.19` SQLite Telemetry & Silent-Retry Sensing**:
    - Parses `agy`'s SQLite B-Tree + `.db-wal` frames in pure Go (`internal/store/sqlite_protobuf.go`) without opening competing SQLite write locks — extracting authoritative cached/thinking/output tokens, `step_type=17` upstream silent-retry counts/delays (`agy 1.5.13+`), Argon `.1.19` shadow-routing anomalies, and read-only Desktop App (`AGY_APP`) usage.
 5. **Strict Dual-Port Isolation, Structured Output Parity & SSRF-Guarded Multimodal v2**:
-   - `:18890` serves **only** AI generation endpoints + `/healthz` (`404` on `/`, `/api/*`, `/metrics`); `:18891` serves **only** master-key-authenticated console/admin/metrics endpoints (`404` on `/v1/*`, `/v1beta/*`, `/mcp/*`).
+   - `:18890` serves **only** AI generation endpoints + `/healthz` (`404` on `/`, `/api/*`, `/metrics`); `:18891` serves **only** admin-authenticated console/admin/metrics endpoints (`404` on `/v1/*`, `/v1beta/*`, `/mcp/*`). Setting `AGY_DASHBOARD_PASSWORD` (plaintext or `sha256:<hex>`) completely decouples `:18891` admin auth from `:18890` client/master API keys.
    - Unifies structured JSON schema output (`output_config.format`, `response_format`, `text.format`, `responseJsonSchema`), exposes accurate `max_input_tokens` metadata, and enforces strict `/v1/responses` continuation validation (`previous_response_not_found`, `thread_not_found`).
    - Remote image URLs use `16`-byte magic MIME sniffing, `64MB/15m` unseen-delta caching, and kernel-level `net.Dialer.Control` private/link-local IP blocking against DNS-rebinding SSRF.
 
@@ -403,21 +404,24 @@ Explicit body fields take precedence over model-name suffixes (`<model>-high`, `
 | Surface | Method & Path | Authentication | Description |
 | :--- | :--- | :--- | :--- |
 | **Gateway `:18890`** | `GET /healthz` | None | Container/load-balancer liveness probe (`{"ok":true}`) |
-| **Gateway `:18890`** | `GET /v1/models`, `GET /v1beta/models` | API Key (master / bound / `?key=`) | Model discovery filtered by caller's account/group allowlist |
+| **Gateway `:18890`** | `GET /v1/models`, `GET /v1beta/models` | API Key (client `agy-ck-*` / master / bound / `?key=`) | Model discovery filtered by caller's client-key, account, or group allowlist |
 | **Gateway `:18890`** | `POST /v1/messages`, `POST /v1/messages/count_tokens` | `x-api-key` or `Bearer` | `Anthropic` Messages API (SSE + JSON + tools + vision + thinking) |
 | **Gateway `:18890`** | `POST /v1/chat/completions` | `Authorization: Bearer` | OpenAI Chat Completions API |
 | **Gateway `:18890`** | `POST /v1/responses` | `Authorization: Bearer` | OpenAI Responses API (`Codex` CLI) |
 | **Gateway `:18890`** | `POST /v1beta/models/{m}:generateContent` / `:streamGenerateContent` / `:countTokens` | `x-goog-api-key`, `Bearer`, or `?key=` | Native Google Gemini REST v1beta API |
-| **Console `:18891`** | `GET /`, `GET /api/dashboard`, `GET /api/quota` | **Master Key Only** (Basic/Bearer/`x-api-key`) | Warm-Paper live console, federated instances, and quota snapshots |
-| **Console `:18891`** | `GET /metrics` | **Master Key Only** | Prometheus `0.0.4` gateway & per-account metrics |
-| **Console `:18891`** | `GET/POST/DELETE /api/accounts`, `/routing`, `/groups`, `/action`, `/probe-ip`, `/oauth/*` | **Master Key + CSRF Guard** (`X-Agy-Requested-With: dashboard`) | Multi-account sandbox, group, routing, rotation & PKCE OAuth APIs |
-| **Console `:18891`** | `GET /api/upgrade`, `POST /api/upgrade/approve` | **Master Key + CSRF Guard** | `G1-G4` upstream `agy` upgrade status & 1-click hot-swap approval |
+| **Console `:18891`** | `GET /`, `GET /api/dashboard`, `GET /api/quota` | **Admin Password** (`AGY_DASHBOARD_PASSWORD`, fallback Master Key; Basic/Bearer/`x-api-key`) | Warm-Paper live console, federated instances, and quota snapshots |
+| **Console `:18891`** | `GET /metrics` | **Admin Password** (fallback Master Key) | Prometheus `0.0.4` gateway & per-account metrics |
+| **Console `:18891`** | `GET/POST/DELETE /api/accounts`, `/routing`, `/groups`, `/action`, `/probe-ip`, `/oauth/*` | **Admin Password + CSRF Guard** (`X-Agy-Requested-With: dashboard`) | Multi-account sandbox, group, routing, rotation & PKCE OAuth APIs |
+| **Console `:18891`** | `GET/POST/DELETE /api/client-keys`, `/update`, `/toggle` | **Admin Password + CSRF Guard** (`X-Agy-Requested-With: dashboard`) | Issue, scope (`global`/`group`/`account`), restrict, toggle & revoke SHA-256 `:18890`-only client keys |
+| **Console `:18891`** | `GET /api/upgrade`, `POST /api/upgrade/approve` | **Admin Password + CSRF Guard** | `G1-G4` upstream `agy` upgrade status & 1-click hot-swap approval |
 
 ### Key Environment Variables (`.env`)
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `AGY_API_KEYS` | *(empty on loopback)* | Comma-separated master keys for `:18890` & `:18891` (supports `@acct:<id>` / `@group:<id>`) |
+| `AGY_DASHBOARD_PASSWORD` / `AGY_DASHBOARD_PASSWORD_FILE` | *(optional; falls back to `AGY_API_KEYS`)* | Dedicated `:18891` admin password (plaintext or `sha256:<64-hex>`); isolates `:18891` from `:18890` keys |
+| `AGY_API_KEYS` / `AGY_API_KEYS_FILE` | *(empty on loopback)* | Comma-separated `:18890` master keys (supports `@acct:<id>` / `@group:<id>`; `:18891` fallback only if `AGY_DASHBOARD_PASSWORD` unset) |
+| `AGY_CLIENT_KEYS_FILE` | `<data>/client_keys.json` | SHA-256 hashed store for `:18891`-issued client API keys (`agy-ck-*`, `:18890` data-plane only) |
 | `AGY_GW_PORT` / `AGY_DASH_PORT` | `18890` / `18891` | Strict data-plane API port vs. admin/console/metrics port |
 | `AGY_ACCOUNTS_FILE` | `<data>/accounts.json` | Multi-account sandboxes, `AccountGroup` pools, and routing configuration |
 | `AGY_PROXY_PRESETS_FILE` | *(optional)* | External JSON array of named egress proxy presets |

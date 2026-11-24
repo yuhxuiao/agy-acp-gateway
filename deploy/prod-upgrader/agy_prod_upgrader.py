@@ -166,6 +166,21 @@ def gateway_key():
     return r.stdout.strip()
 
 
+def dashboard_key(fallback=""):
+    try:
+        r = run(["docker", "exec", CONTAINER, "sh", "-c",
+                 'if [ -n "${AGY_DASHBOARD_PASSWORD:-}" ]; then printf "%s" "$AGY_DASHBOARD_PASSWORD"; '
+                 'elif [ -n "${AGY_DASHBOARD_PASSWORD_FILE:-}" ] && [ -r "$AGY_DASHBOARD_PASSWORD_FILE" ]; then '
+                 'grep -v "^[[:space:]]*#" "$AGY_DASHBOARD_PASSWORD_FILE" | grep -v "^[[:space:]]*$" | head -n 1 | tr -d "\\r\\n"; '
+                 'fi'], timeout=15, check=False)
+        pw = (r.stdout or "").strip()
+        if pw and not pw.lower().startswith("sha256:"):
+            return pw
+    except Exception:
+        pass
+    return fallback
+
+
 def http_json(url, body, key, timeout=180, session=None):
     headers = {"Content-Type": "application/json", "x-api-key": key}
     if session:
@@ -749,7 +764,8 @@ def switch_current(target_dir):
 def engine_info(key):
     """Live engine state from the gateway (engine.json is only written when an engine starts)."""
     try:
-        req = urllib.request.Request(f"http://127.0.0.1:{DASH_PORT}/api/upgrade", headers={"x-api-key": key})
+        dash_cred = dashboard_key(key)
+        req = urllib.request.Request(f"http://127.0.0.1:{DASH_PORT}/api/upgrade", headers={"x-api-key": dash_cred})
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read()).get("engine") or {}
     except Exception:

@@ -142,7 +142,7 @@ func applyCORSAndSecurityGuards(w http.ResponseWriter, r *http.Request) bool {
 		w.Header().Set("Vary", "Origin")
 	}
 	isV1Beta := strings.HasPrefix(r.URL.Path, "/v1beta/")
-	if !authEnabled() {
+	if !requestAuthActive(r.URL.Path) {
 		if !isAllowedLoopbackHost(r.Host) {
 			if isV1Beta {
 				writeGeminiError(w, http.StatusForbidden, "non-loopback Host header rejected on unauthenticated gateway")
@@ -167,7 +167,7 @@ func applyCORSAndSecurityGuards(w http.ResponseWriter, r *http.Request) bool {
 	}
 	if r.Method == http.MethodPost && (strings.HasPrefix(r.URL.Path, "/v1/") || isV1Beta) {
 		ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
-		if (!authEnabled() && !strings.HasPrefix(ct, "application/json")) || (ct != "" && !strings.HasPrefix(ct, "application/json")) {
+		if (!dataPlaneAuthEnabled() && !strings.HasPrefix(ct, "application/json")) || (ct != "" && !strings.HasPrefix(ct, "application/json")) {
 			if isV1Beta {
 				writeGeminiError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
 				return false
@@ -248,6 +248,28 @@ func estimateCountTokensFromBody(body map[string]any) (int, error) {
 		est = 1
 	}
 	return est, nil
+}
+
+// isDashboardAuthPath reports whether path belongs to the admin plane guarded by checkDashboardAuth.
+func isDashboardAuthPath(path string) bool {
+	switch path {
+	case "/", "/dashboard", "/api/dashboard", "/api/quota", "/api/upgrade", "/api/upgrade/approve",
+		"/api/accounts", "/api/client-keys", "/health", "/v1/health", "/metrics":
+		return true
+	}
+	return strings.HasPrefix(path, "/api/accounts/") || strings.HasPrefix(path, "/api/client-keys/")
+}
+
+// requestAuthActive reports whether the plane serving path enforces credentials; unauthenticated
+// planes additionally get loopback Host / same-origin hardening in applyCORSAndSecurityGuards.
+func requestAuthActive(path string) bool {
+	if isDashboardAuthPath(path) {
+		return dashboardAuthEnabled()
+	}
+	if strings.HasPrefix(path, "/v1/") || strings.HasPrefix(path, "/v1beta/") {
+		return dataPlaneAuthEnabled()
+	}
+	return dashboardAuthEnabled() && dataPlaneAuthEnabled()
 }
 
 func (gs *GatewayServer) GatewayOnlyHandler() http.Handler {
@@ -503,12 +525,15 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if path == "/" || path == "/dashboard" || path == "/api/dashboard" || path == "/api/quota" || path == "/api/upgrade" || path == "/api/upgrade/approve" || path == "/api/accounts" || strings.HasPrefix(path, "/api/accounts/") || path == "/health" || path == "/v1/health" || path == "/metrics" {
+	if isDashboardAuthPath(path) {
 		if !checkDashboardAuth(w, r) {
 			return
 		}
 	} else if strings.HasPrefix(path, "/v1/") || strings.HasPrefix(path, "/v1beta/") {
 		if !checkAPIAuth(w, r) {
+			return
+		}
+		if !enforceClientKeyModelAllowlist(w, r) {
 			return
 		}
 		var handled bool
@@ -524,6 +549,11 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if path == "/api/accounts" || strings.HasPrefix(path, "/api/accounts/") {
 		HandleAccountsAPI(w, r)
+		return
+	}
+
+	if path == "/api/client-keys" || strings.HasPrefix(path, "/api/client-keys/") {
+		HandleClientKeysAPI(w, r)
 		return
 	}
 

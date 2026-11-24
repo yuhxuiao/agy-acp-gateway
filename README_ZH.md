@@ -86,8 +86,8 @@ cd go-gateway && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../bin/agy
 
 # 3. 配置环境变量并启动容器
 cp .env.example deploy/.env
-# 编辑 deploy/.env -> 设置强随机密钥 AGY_API_KEYS（docker-compose 已内置固定容器监听 AGY_LISTEN_HOST=0.0.0.0；
-# 无可用代理时保持 AGY_UPSTREAM_PROXY 注释状态即可）
+# 编辑 deploy/.env -> 设置 AGY_DASHBOARD_PASSWORD（独立管理面密码）与 AGY_API_KEYS
+# （也可在 :18891 面板内按需签发 SHA-256 哈希存储的 agy-ck-* 客户端 Key；无可用代理时保持 AGY_UPSTREAM_PROXY 注释状态即可）
 docker compose -f deploy/docker-compose.yml up -d --build
 
 # 4. 验证健康检查
@@ -115,7 +115,7 @@ cd ..
 
 # 3. 初始化配置并启动本机服务
 cp .env.example .env
-# 编辑 .env -> 配置 AGY_API_KEYS=sk-your-master-key 与 AGY_UPSTREAM_PROXY
+# 编辑 .env -> 配置 AGY_DASHBOARD_PASSWORD（推荐独立密码）/ AGY_API_KEYS 与 AGY_UPSTREAM_PROXY
 ./scripts/gw.sh start
 ./scripts/gw.sh status
 ```
@@ -124,7 +124,7 @@ cp .env.example .env
 
 ### 第 3 步：完成 Google 账号 OAuth 授权引导（3 种方式任选）
 
-在浏览器打开 **暖纸实时控制台** `http://127.0.0.1:18891/`（HTTP Basic Auth 用户名任意填写，密码输入 `.env` 中的 `AGY_API_KEYS` 主密钥），点击顶栏 **账号控制中心**：
+在浏览器打开 **暖纸实时控制台** `http://127.0.0.1:18891/`（HTTP Basic Auth 用户名任意填写，密码输入 `.env` 中的 `AGY_DASHBOARD_PASSWORD` 管理密码；未配置时兼容回退输入 `AGY_API_KEYS` 主密钥），点击顶栏 **账号控制中心**（亦可在其中的 **客户端 API Key** 标签页签发仅限 `:18890` 数据面使用的 `agy-ck-*` 密钥）：
 
 1. **方式一：网页免 SSH PKCE OAuth 授权（适用于 Linux / WSL2 / Docker，推荐无头服务器与全部子账号使用）**
    - *（注：原生 `macOS arm64` 无 Linux `/dev/ptmx` 伪终端，macOS 原生环境请使用方式二直接导入 Token JSON 或方式三命令行授权。）*
@@ -268,12 +268,13 @@ curl -sS "http://127.0.0.1:18890/v1beta/models/gemini-4-hydrogen:generateContent
 
 | 路由模式 | 客户端传参写法 | `:18891` 管理面权限 | 模型白名单校验 |
 | :--- | :--- | :--- | :--- |
+| **控制台客户端 Key (`agy-ck-*`)** | `Authorization: Bearer agy-ck-...` *(`:18891` 签发，服务端仅存 SHA-256)* | **拒绝 (`401`)** | Key `allowedModels` ∩ 作用域（`global` / `group` / `account`）白名单 |
 | **账号专属 Key (`boundKeys`)** | `Authorization: Bearer sk-acct-only-key` | **拒绝 (`401`)** | 账号 `allowedModels` |
 | **分组池专属 Key (`boundKeys`)** | `Authorization: Bearer sk-team-group-key` | **拒绝 (`401`)** | 分组 `allowedModels` ∩ 账号 `allowedModels` |
 | **主 Key + 账号后缀** | `<master_key>@acct:<id>` 或 `<master_key>@<id>` *(亦支持 `#`)* | 仅限 API 数据面 | 账号 `allowedModels` |
 | **主 Key + 分组后缀** | `<master_key>@group:<group_id>` *(亦支持 `#group:<group_id>`)* | 仅限 API 数据面 | 分组 `allowedModels` ∩ 账号 `allowedModels` |
-| **显式路由请求头** | `X-Agy-Account: <id>` 或 `X-Agy-Group: <group_id>` *(配合主 Key)* | 主 Key 权限 | 若 `X-Agy-Account` 不属于 `X-Agy-Group` 直接返回 `403` |
-| **全局默认池调度** | `<master_key>` | 主 Key 权限 | 命中账号的 `allowedModels` |
+| **显式路由请求头** | `X-Agy-Account: <id>` 或 `X-Agy-Group: <group_id>` *(配合主/全局 Key)* | 主 Key *(仅未设 `AGY_DASHBOARD_PASSWORD` 时)* | 若 `X-Agy-Account` 不属于 `X-Agy-Group` 直接返回 `403` |
+| **全局默认池调度** | `<master_key>` | 主 Key *(仅未设 `AGY_DASHBOARD_PASSWORD` 时)* | 命中账号的 `allowedModels` |
 
 每次响应均回传可观测路由响应头（已配置 CORS 暴露）：
 `X-Agy-Account`、`X-Agy-Group`、`X-Agy-Route-Mode`、`X-Agy-Failover-Count`、`X-Agy-Served-Model`、`X-Agy-Cache-Warning`。
@@ -374,7 +375,7 @@ curl -sS "http://127.0.0.1:18890/v1beta/models/gemini-4-hydrogen:generateContent
 4. **零锁 `.1.19` SQLite 遥测直读与静默重试感知**：
    - 纯 Go 解析 SQLite B-Tree 与 `.db-wal` 帧（`internal/store/sqlite_protobuf.go`），零写锁竞争提取真实输入/缓存/思考/输出 Token、`step_type=17` 上游静默退避重试计数与耗时（`agy 1.5.13+`）、Argon `.1.19` 影子路由告警及桌面端 `AGY_APP` 只读遥测。
 5. **双端口严格物理隔离、统一结构化输出与防 SSRF 多模态 v2 管线**：
-   - `:18890` 仅暴露 AI 生成协议与 `/healthz`（访问 `/`、`/api/*`、`/metrics` 均返回 `404`）；`:18891` 仅服务主密钥鉴权的控制台、账号管理与监控指标（访问 `/v1/*`、`/v1beta/*` 均返回 `404`）。
+   - `:18890` 仅暴露 AI 生成协议与 `/healthz`（访问 `/`、`/api/*`、`/metrics` 均返回 `404`）；`:18891` 仅服务管理员鉴权的控制台、账号/客户端 Key 管理与监控指标（访问 `/v1/*`、`/v1beta/*` 均返回 `404`）。配置 `AGY_DASHBOARD_PASSWORD`（支持明文或 `sha256:<hex>` 摘要）即可实现管理面密码与数据面 API Key 彻底解耦。
    - 四协议统一支持 JSON Schema 结构化输出（`output_config.format`、`response_format`、`text.format`、`responseJsonSchema`），暴露精确 `max_input_tokens` 模型元数据，并对 `/v1/responses` 严格校验会话续接状态（`previous_response_not_found`、`thread_not_found`）。
    - 远程图片拉取具备 `16` 字节魔数 MIME 嗅探、`64MB/15m` 增量缓存及内核级 `net.Dialer.Control` 私网/链路本地地址阻断，彻底防御 DNS 重绑定 SSRF。
 
@@ -389,21 +390,24 @@ curl -sS "http://127.0.0.1:18890/v1beta/models/gemini-4-hydrogen:generateContent
 | 服务面 | 方法与路径 | 鉴权要求 | 说明 |
 | :--- | :--- | :--- | :--- |
 | **数据面 `:18890`** | `GET /healthz` | 免鉴权 | 容器/负载均衡存活探针（`{"ok":true}`） |
-| **数据面 `:18890`** | `GET /v1/models`, `GET /v1beta/models` | API Key（主 Key / 专属 Key / `?key=`） | 按调用方所属账号或分组白名单过滤后的模型列表 |
+| **数据面 `:18890`** | `GET /v1/models`, `GET /v1beta/models` | API Key（客户端 `agy-ck-*` / 主 Key / 专属 Key / `?key=`） | 按调用方客户端 Key、所属账号或分组白名单过滤后的模型列表 |
 | **数据面 `:18890`** | `POST /v1/messages`, `POST /v1/messages/count_tokens` | `x-api-key` 或 `Bearer` | `Anthropic` Messages API（流式/非流式/工具/视觉/思考） |
 | **数据面 `:18890`** | `POST /v1/chat/completions` | `Authorization: Bearer` | OpenAI Chat Completions 接口 |
 | **数据面 `:18890`** | `POST /v1/responses` | `Authorization: Bearer` | OpenAI Responses 接口（`Codex` CLI 原生协议） |
 | **数据面 `:18890`** | `POST /v1beta/models/{m}:generateContent` / `:streamGenerateContent` / `:countTokens` | `x-goog-api-key`、`Bearer` 或 `?key=` | Google Gemini 原生 REST v1beta 接口 |
-| **管理面 `:18891`** | `GET /`, `GET /api/dashboard`, `GET /api/quota` | **仅限主 Key**（Basic/Bearer/`x-api-key`） | 暖纸实时控制台、多节点联邦数据与额度快照 |
-| **管理面 `:18891`** | `GET /metrics` | **仅限主 Key** | Prometheus `0.0.4` 网关与多账号指标 |
-| **管理面 `:18891`** | `GET/POST/DELETE /api/accounts`, `/routing`, `/groups`, `/action`, `/probe-ip`, `/oauth/*` | **仅限主 Key + CSRF 校验**（`X-Agy-Requested-With: dashboard`） | 多账号沙盒、渠道分组、路由策略、一键轮转与网页 PKCE OAuth |
-| **管理面 `:18891`** | `GET /api/upgrade`, `POST /api/upgrade/approve` | **仅限主 Key + CSRF 校验** | `G1-G4` 官方 `agy` 升级状态查询与一键热切换审批 |
+| **管理面 `:18891`** | `GET /`, `GET /api/dashboard`, `GET /api/quota` | **管理员密码**（`AGY_DASHBOARD_PASSWORD`，未设回退主 Key；Basic/Bearer/`x-api-key`） | 暖纸实时控制台、多节点联邦数据与额度快照 |
+| **管理面 `:18891`** | `GET /metrics` | **管理员密码**（未设回退主 Key） | Prometheus `0.0.4` 网关与多账号指标 |
+| **管理面 `:18891`** | `GET/POST/DELETE /api/accounts`, `/routing`, `/groups`, `/action`, `/probe-ip`, `/oauth/*` | **管理员密码 + CSRF 校验**（`X-Agy-Requested-With: dashboard`） | 多账号沙盒、渠道分组、路由策略、一键轮转与网页 PKCE OAuth |
+| **管理面 `:18891`** | `GET/POST/DELETE /api/client-keys`, `/update`, `/toggle` | **管理员密码 + CSRF 校验**（`X-Agy-Requested-With: dashboard`） | 签发、作用域（`global`/`group`/`account`）、模型白名单、启停与吊销仅限 `:18890` 的 SHA-256 客户端 Key |
+| **管理面 `:18891`** | `GET /api/upgrade`, `POST /api/upgrade/approve` | **管理员密码 + CSRF 校验** | `G1-G4` 官方 `agy` 升级状态查询与一键热切换审批 |
 
 ### 核心环境变量速查表 (`.env`)
 
 | 变量名 | 默认值 | 作用说明 |
 | :--- | :--- | :--- |
-| `AGY_API_KEYS` | *(本地回环可空)* | 逗号分隔主管理密钥，保护 `:18890` 与 `:18891`（支持 `@acct:<id>` / `@group:<id>` 后缀） |
+| `AGY_DASHBOARD_PASSWORD` / `AGY_DASHBOARD_PASSWORD_FILE` | *(可选，未设回退 `AGY_API_KEYS`)* | 独立保护 `:18891` 控制台/管理 API/指标的管理员密码（支持明文或 `sha256:<64位hex>`），与 `:18890` 彻底解耦 |
+| `AGY_API_KEYS` / `AGY_API_KEYS_FILE` | *(本地回环可空)* | 逗号分隔 `:18890` 主密钥（支持 `@acct:<id>` / `@group:<id>` 后缀；仅当未设 `AGY_DASHBOARD_PASSWORD` 时兼容登录 `:18891`） |
+| `AGY_CLIENT_KEYS_FILE` | `<data>/client_keys.json` | 控制台签发客户端 Key（`agy-ck-*`，仅限 `:18890` 数据面）的 SHA-256 哈希持久化路径 |
 | `AGY_GW_PORT` / `AGY_DASH_PORT` | `18890` / `18891` | 数据面 API 端口与管理面控制台/监控端口 |
 | `AGY_ACCOUNTS_FILE` | `<data>/accounts.json` | 多账号沙盒、`AccountGroup` 渠道分组与池路由配置持久化路径 |
 | `AGY_PROXY_PRESETS_FILE` | *(可选)* | 外部命名出口代理预设 JSON 文件路径 |

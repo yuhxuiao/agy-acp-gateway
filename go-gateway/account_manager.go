@@ -344,30 +344,31 @@ type tokenCacheEntry struct {
 // AccountManager supervises isolated per-account directories, OAuth handshakes, child worker
 // processes, strict per-account model allowlists, account groups, and strategy-aware sticky routing.
 type AccountManager struct {
-	mu              sync.RWMutex
-	filePath        string
-	baseDataDir     string
-	routing         AccountPoolConfig
-	groups          []AccountGroup
-	accounts        []AccountProfile
-	workers         map[string]*accountWorkerProc
-	crashStates     map[string]workerCrashState
-	opMu            sync.Mutex
-	opLocks         map[string]*sync.Mutex
-	oauthMu         sync.Mutex
-	oauthActive     map[string]*pendingOAuthSession
-	stickyMu        sync.Mutex
-	stickyLRU       *stickySessionLRU
-	stickyLastPrune time.Time
-	rrCounters      map[string]uint64
-	swrrStates      map[string]map[string]*swrrEntry
-	healthMu        sync.RWMutex
-	healthStates    map[string]*accountHealthRuntime
-	inflightMap     sync.Map
-	tokCacheMu      sync.RWMutex
-	tokCache        map[string]tokenCacheEntry
-	warmupMu        sync.Mutex
-	warmupAttempt   map[string]time.Time
+	mu               sync.RWMutex
+	filePath         string
+	baseDataDir      string
+	routing          AccountPoolConfig
+	groups           []AccountGroup
+	accounts         []AccountProfile
+	workers          map[string]*accountWorkerProc
+	crashStates      map[string]workerCrashState
+	opMu             sync.Mutex
+	opLocks          map[string]*sync.Mutex
+	oauthMu          sync.Mutex
+	oauthActive      map[string]*pendingOAuthSession
+	stickyMu         sync.Mutex
+	stickyLRU        *stickySessionLRU
+	stickyLastPrune  time.Time
+	rrCounters       map[string]uint64
+	swrrStates       map[string]map[string]*swrrEntry
+	healthMu         sync.RWMutex
+	healthStates     map[string]*accountHealthRuntime
+	inflightMap      sync.Map
+	tokCacheMu       sync.RWMutex
+	tokCache         map[string]tokenCacheEntry
+	warmupMu         sync.Mutex
+	warmupAttempt    map[string]time.Time
+	childLoopbackKey string
 }
 
 var GlobalAccountManager = NewAccountManager()
@@ -378,17 +379,18 @@ func isChildAccountWorker() bool {
 
 func NewAccountManager() *AccountManager {
 	return &AccountManager{
-		routing:       (AccountPoolConfig{}).Normalized(),
-		workers:       make(map[string]*accountWorkerProc),
-		crashStates:   make(map[string]workerCrashState),
-		opLocks:       make(map[string]*sync.Mutex),
-		oauthActive:   make(map[string]*pendingOAuthSession),
-		stickyLRU:     newStickySessionLRU(),
-		rrCounters:    make(map[string]uint64),
-		swrrStates:    make(map[string]map[string]*swrrEntry),
-		healthStates:  make(map[string]*accountHealthRuntime),
-		tokCache:      make(map[string]tokenCacheEntry),
-		warmupAttempt: make(map[string]time.Time),
+		routing:          (AccountPoolConfig{}).Normalized(),
+		workers:          make(map[string]*accountWorkerProc),
+		crashStates:      make(map[string]workerCrashState),
+		opLocks:          make(map[string]*sync.Mutex),
+		oauthActive:      make(map[string]*pendingOAuthSession),
+		stickyLRU:        newStickySessionLRU(),
+		rrCounters:       make(map[string]uint64),
+		swrrStates:       make(map[string]map[string]*swrrEntry),
+		healthStates:     make(map[string]*accountHealthRuntime),
+		tokCache:         make(map[string]tokenCacheEntry),
+		warmupAttempt:    make(map[string]time.Time),
+		childLoopbackKey: "agy-child-" + randomHex(24),
 	}
 }
 
@@ -1164,6 +1166,11 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 			strings.HasPrefix(kv, "AGY_MAX_LIVE_WORKERS="),
 			strings.HasPrefix(kv, "AGY_UPSTREAM_PROXY="),
 			strings.HasPrefix(kv, "AGY_DASHBOARD_PEERS="),
+			strings.HasPrefix(kv, "AGY_API_KEYS="),
+			strings.HasPrefix(kv, "AGY_API_KEYS_FILE="),
+			strings.HasPrefix(kv, "AGY_DASHBOARD_PASSWORD="),
+			strings.HasPrefix(kv, "AGY_DASHBOARD_PASSWORD_FILE="),
+			strings.HasPrefix(kv, "AGY_CLIENT_KEYS_FILE="),
 			strings.HasPrefix(kv, "AGY_ACCOUNTS_FILE="),
 			strings.HasPrefix(kv, "AGY_PROXY_PRESETS_FILE="),
 			strings.HasPrefix(kv, "AGY_RESIN_PROXY_TOKEN="),
@@ -1204,6 +1211,11 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 		"NO_PROXY=127.0.0.1,localhost,::1",
 		"no_proxy=127.0.0.1,localhost,::1",
 		"AGY_DASHBOARD_PEERS=",
+		"AGY_API_KEYS="+am.childLoopbackKey,
+		"AGY_API_KEYS_FILE=",
+		"AGY_DASHBOARD_PASSWORD=",
+		"AGY_DASHBOARD_PASSWORD_FILE=",
+		"AGY_CLIENT_KEYS_FILE=",
 	)
 	if hint := normalizePlanTierHint(acc.PlanTierHint); hint != "" {
 		env = append(env, "AGY_ACCOUNT_PLAN_TIER_HINT="+hint)
@@ -1218,11 +1230,17 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 	rp := httputil.NewSingleHostReverseProxy(targetURL)
 	rp.FlushInterval = -1
 	baseDirector := rp.Director
+	childKey := am.childLoopbackKey
 	rp.Director = func(req *http.Request) {
 		baseDirector(req)
 		req.Header.Del("X-Forwarded-Host")
 		req.Header.Del("X-Forwarded-Proto")
 		req.Header.Del("X-Forwarded-For")
+		if childKey != "" {
+			req.Header.Set("x-api-key", childKey)
+			req.Header.Del("Authorization")
+			req.Header.Del("x-goog-api-key")
+		}
 	}
 	tr := &http.Transport{
 		Proxy:               nil,
@@ -1504,6 +1522,12 @@ func (am *AccountManager) MatchesAccountKey(candidate string) (accountID string,
 			}
 		}
 	}
+	if ck, ok := GlobalClientKeys.Match(candidate); ok {
+		if ck.Scope == ClientKeyScopeAccount {
+			return ck.ScopeID, true
+		}
+		return "", false
+	}
 	cBytes := []byte(candidate)
 	am.mu.RLock()
 	defer am.mu.RUnlock()
@@ -1599,6 +1623,7 @@ func isAccountModel5hExhausted(accountID string, dashPort int, canonicalModelID 
 			ID:      accountID,
 			Label:   accountID,
 			BaseURL: fmt.Sprintf("http://127.0.0.1:%d", dashPort),
+			APIKey:  GlobalAccountManager.childLoopbackKey,
 		}
 		fallbackKey := defaultPeerAPIKey(gwcfg.Current())
 		go func(p gwcfg.DashboardPeerConfig, k string) {
@@ -2197,17 +2222,19 @@ func (am *AccountManager) ResolveTargetAccountEx(r *http.Request, canonicalModel
 // FilterModelsForRequest filters /v1/models output strictly by the caller's bound account, group, or pool allowlists.
 func (am *AccountManager) FilterModelsForRequest(r *http.Request, all []map[string]any) (filtered []map[string]any, accountID string) {
 	if isChildAccountWorker() || !am.HasConfiguredAccounts() {
-		return all, ""
+		return filterModelsByClientKey(r, all, "id"), ""
 	}
-	return am.filterModelItems(r, all, "id")
+	filtered, accountID = am.filterModelItems(r, all, "id")
+	return filterModelsByClientKey(r, filtered, "id"), accountID
 }
 
 // FilterGeminiModelsForRequest filters /v1beta/models output strictly by the caller's bound account, group, or pool allowlists.
 func (am *AccountManager) FilterGeminiModelsForRequest(r *http.Request, all []map[string]any) (filtered []map[string]any, accountID string) {
 	if isChildAccountWorker() || !am.HasConfiguredAccounts() {
-		return all, ""
+		return filterModelsByClientKey(r, all, "name"), ""
 	}
-	return am.filterModelItems(r, all, "name")
+	filtered, accountID = am.filterModelItems(r, all, "name")
+	return filterModelsByClientKey(r, filtered, "name"), accountID
 }
 
 func (am *AccountManager) filterModelItems(r *http.Request, all []map[string]any, idField string) (filtered []map[string]any, accountID string) {
@@ -2453,6 +2480,8 @@ func (am *AccountManager) isSimpleSinglePrimary(r *http.Request) (string, bool) 
 			return "", false
 		}
 		if rawKey := requestKey(r); strings.ContainsAny(rawKey, "@#") {
+			return "", false
+		} else if ck, ok := GlobalClientKeys.Match(rawKey); ok && ck.Scope != ClientKeyScopeGlobal {
 			return "", false
 		}
 	}
@@ -3020,8 +3049,25 @@ func (am *AccountManager) TryRouteAPIRequestWithFinish(w http.ResponseWriter, r 
 		outReq.Header.Del("X-Forwarded-Host")
 		outReq.Header.Del("X-Forwarded-Proto")
 		outReq.Header.Del("X-Forwarded-For")
-		if masterKey := defaultPeerAPIKey(gwcfg.Current()); masterKey != "" {
-			outReq.Header.Set("x-api-key", masterKey)
+		if strings.HasPrefix(outReq.URL.Path, "/v1beta/") {
+			if cleanP, pk := extractGeminiPathKey(outReq.URL.Path); pk != "" {
+				outReq.URL.Path = cleanP
+				outReq.URL.RawPath = ""
+			}
+			if outReq.URL.RawQuery != "" {
+				q := outReq.URL.Query()
+				if q.Has("key") {
+					q.Del("key")
+					outReq.URL.RawQuery = q.Encode()
+				}
+			}
+		}
+		if am.childLoopbackKey != "" {
+			outReq.Header.Set("x-api-key", am.childLoopbackKey)
+			outReq.Header.Del("Authorization")
+			outReq.Header.Del("x-goog-api-key")
+		} else if len(apiKeys) > 0 && len(apiKeys[0]) > 0 {
+			outReq.Header.Set("x-api-key", string(apiKeys[0]))
 			outReq.Header.Del("Authorization")
 			outReq.Header.Del("x-goog-api-key")
 		}

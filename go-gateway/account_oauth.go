@@ -64,6 +64,7 @@ func isStrippedSubprocessEnv(kv string) bool {
 	for _, prefix := range []string{
 		"HOME=", "BROWSER=",
 		"AGY_API_KEYS=", "AGY_API_KEYS_FILE=",
+		"AGY_DASHBOARD_PASSWORD=", "AGY_DASHBOARD_PASSWORD_FILE=", "AGY_CLIENT_KEYS_FILE=",
 		"AGY_RESIN_PROXY_TOKEN=", "AGY_RESIN_HOST=",
 		"AGY_PROXY_PRESETS_FILE=",
 	} {
@@ -123,6 +124,7 @@ func (am *AccountManager) ManagedPeersForDashboard() (peers []gwcfg.DashboardPee
 				ID:      acc.ID,
 				Label:   acc.Label,
 				BaseURL: fmt.Sprintf("http://127.0.0.1:%d", dashPort),
+				APIKey:  am.childLoopbackKey,
 			})
 			continue
 		}
@@ -214,8 +216,11 @@ func (am *AccountManager) UpsertAccount(in AccountProfile) (AccountProfile, erro
 		if k == "" || seenBound[k] {
 			continue
 		}
-		if rawMasterKeyMatches(k) {
-			return AccountProfile{}, errors.New("渠道专属 Key 不可与网关主管理 Key 相同（主 Key 默认具备全局池权限，指定账号可用 <主Key>@<账号ID>）")
+		if rawMasterKeyMatches(k) || dashboardPasswordMatches(k) {
+			return AccountProfile{}, errors.New("渠道专属 Key 不可与网关主管理 Key 或控制台管理员密码相同（主 Key 默认具备全局池权限，指定账号可用 <主Key>@<账号ID>）")
+		}
+		if strings.HasPrefix(k, ClientKeyPrefix) {
+			return AccountProfile{}, errors.New("agy-ck- 前缀保留给控制台签发的哈希客户端 Key，请直接在“客户端 API Key”标签页管理")
 		}
 		seenBound[k] = true
 		cleanKeys = append(cleanKeys, k)
@@ -1020,7 +1025,7 @@ func requireDashboardMutationGuard(w http.ResponseWriter, r *http.Request) bool 
 	// Reuse same-origin check behind authenticated /acp/ reverse proxy; require direct loopback Host==Origin when unauthenticated.
 	if origin != "" {
 		okOrigin := false
-		if !authEnabled() {
+		if !dashboardAuthEnabled() {
 			okOrigin = isDirectLoopbackSameOrigin(r)
 		} else {
 			okOrigin = sameOrigin(r)

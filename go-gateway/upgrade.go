@@ -364,7 +364,7 @@ func federatedUpgradeEngineInfo() (map[string]any, bool) {
 func BuildUpgradePayload() map[string]any {
 	engInfo, pendingSwitch := federatedUpgradeEngineInfo()
 	out := map[string]any{
-		"enabled":         authEnabled(),
+		"enabled":         dashboardAuthEnabled(),
 		"engine":          engInfo,
 		"pendingSwitch":   pendingSwitch,
 		"approvalPending": false,
@@ -435,8 +435,8 @@ func HandleUpgradeApprove(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(code)
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": msg})
 	}
-	if !authEnabled() {
-		fail(http.StatusForbidden, "approval disabled: API-key auth (AGY_API_KEYS) is not configured")
+	if !dashboardAuthEnabled() {
+		fail(http.StatusForbidden, "approval disabled: dashboard auth (AGY_DASHBOARD_PASSWORD or AGY_API_KEYS) is not configured")
 		return
 	}
 	if r.Header.Get("X-Agy-Requested-With") != "dashboard" || !sameOrigin(r) {

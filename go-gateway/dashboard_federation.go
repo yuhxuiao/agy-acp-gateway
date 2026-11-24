@@ -86,6 +86,11 @@ func resetPeerDashboardCacheForTest() {
 	peerDashCacheMu.Unlock()
 }
 func defaultPeerAPIKey(snap *gwcfg.Snapshot) string {
+	// Peers guard /api/dashboard with their admin credential; prefer the dedicated dashboard
+	// password when one is configured in plaintext, else fall back to the legacy master key.
+	if pw := dashboardPeerCredential(); pw != "" {
+		return pw
+	}
 	if len(apiKeys) > 0 && len(apiKeys[0]) > 0 {
 		return string(apiKeys[0])
 	}

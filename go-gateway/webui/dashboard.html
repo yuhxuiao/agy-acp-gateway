@@ -810,6 +810,7 @@
         <h3><span data-ic="waypoints"></span><span>多账号池 · 路由策略 · 渠道分组管控台</span></h3>
         <div class="inst-qacts">
           <button type="button" class="btn" id="acc-add-grp-btn" hidden><span data-ic="plus"></span><span>新增渠道分组</span></button>
+          <button type="button" class="btn" id="acc-add-ck-btn" hidden><span data-ic="plus"></span><span>生成客户端 Key</span></button>
           <button type="button" class="btn" id="acc-add-btn"><span data-ic="plus"></span><span>新增账号槽位</span></button>
           <button type="button" class="up-x" id="acc-close-btn" aria-label="关闭"><span data-ic="x"></span></button>
         </div>
@@ -819,6 +820,7 @@
         <div class="seg" id="acc-tab-seg">
           <button type="button" data-acc-tab="accounts" class="on" id="acc-tab-accounts-btn">账号槽位</button>
           <button type="button" data-acc-tab="groups" id="acc-tab-groups-btn">渠道分组池</button>
+          <button type="button" data-acc-tab="clientkeys" id="acc-tab-ck-btn">客户端 API Key</button>
         </div>
         <div class="inst-qacts">
           <button type="button" class="act-chip" data-toggle-adv-routing="1"><span data-ic="sliders-horizontal"></span><span>高级故障转移与粘性护栏</span></button>
@@ -831,6 +833,8 @@
       <div class="acc-box" id="acc-group-edit-box" hidden></div>
       <div class="acc-list" id="acc-list"></div>
       <div class="acc-list" id="acc-groups-list" hidden></div>
+      <div class="acc-box" id="acc-ck-edit-box" hidden></div>
+      <div class="acc-list" id="acc-ck-list" hidden></div>
     </div>
   </div>
   <div class="acc-toast" id="acc-toast" role="status" aria-live="polite"></div>
@@ -2517,6 +2521,8 @@ const accState = {
   availableModels: [],
   probeMap: {},
   tab: 'accounts',
+  clientKeys: [],
+  ckMeta: { dashboardAuth: '', dataPlaneAuthActive: false, storeError: '' },
   oauthUrl: '',
   oauthAccId: '',
   msg: ''
@@ -2560,21 +2566,185 @@ async function loadAccounts() {
       }
     }
   } catch (_) {}
+  await loadClientKeys();
+}
+async function loadClientKeys() {
+  try {
+    const r = await fetch(apiBaseUrl() + 'api/client-keys', { credentials: 'same-origin', cache: 'no-store' });
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d && d.ok) {
+      accState.clientKeys = Array.isArray(d.keys) ? d.keys : [];
+      accState.ckMeta = { dashboardAuth: d.dashboardAuth || '', dataPlaneAuthActive: !!d.dataPlaneAuthActive, storeError: d.storeError || '' };
+      const tabCkBtn = document.getElementById('acc-tab-ck-btn');
+      if (tabCkBtn) tabCkBtn.textContent = '客户端 API Key (' + accState.clientKeys.length + ')';
+      if (!document.getElementById('acc-backdrop').hidden && accState.tab === 'clientkeys') renderClientKeysList();
+    }
+  } catch (_) {}
+}
+function ckScopeText(k) {
+  if (k.scope === 'group') return '分组号池 <code>' + esc(k.scopeId) + '</code>';
+  if (k.scope === 'account') return '指定账号 <code>' + esc(k.scopeId) + '</code>';
+  return '全局号池';
+}
+function renderClientKeysList() {
+  const listEl = document.getElementById('acc-ck-list');
+  if (!listEl) return;
+  const meta = accState.ckMeta || {};
+  const modeTxt = meta.dashboardAuth === 'dashboard-password'
+    ? '管理后台使用独立密码 (AGY_DASHBOARD_PASSWORD)，与数据面 Key 完全隔离'
+    : meta.dashboardAuth === 'legacy-master-key'
+      ? '<span style="color:var(--warn)">管理后台仍沿用主 API Key 作为密码 (兼容模式)；建议配置 AGY_DASHBOARD_PASSWORD 实现管理面与数据面解耦</span>'
+      : '<span style="color:var(--bad)">管理后台未启用鉴权，无法签发客户端 Key；请先配置 AGY_DASHBOARD_PASSWORD</span>';
+  let html = '<div class="m-note" style="grid-column:1/-1">' + svg('shield') + ' 此处签发的 Key 只能访问 <code>:18890</code> 数据面 (/v1、/v1beta)，访问 <code>:18891</code> 管理后台一律 401。明文仅在生成时显示一次，服务端只保存 SHA-256 摘要。<br>' + modeTxt +
+    (meta.storeError ? '<br><span style="color:var(--bad)">客户端 Key 存储异常: ' + esc(meta.storeError) + ' (数据面已失败关闭)</span>' : '') + '</div>';
+  if (!accState.clientKeys.length) {
+    html += '<div class="empty" style="grid-column:1/-1">' + svg('shield') + '<span>尚未签发客户端 Key · 点击右上角“生成客户端 Key”</span></div>';
+  } else {
+    html += accState.clientKeys.map(k => {
+      const modTxt = Array.isArray(k.allowedModels) && k.allowedModels.length ? esc(k.allowedModels.join(', ')) : '不限制 (按作用域内账号/分组白名单)';
+      const stateTxt = k.enabled ? '<span class="pool-badge">已启用</span>' : '<span class="pool-badge" style="color:var(--warn)">已停用</span>';
+      return '<div class="acc-item">' +
+        '<div class="acc-item-top"><div class="acc-item-title">' + svg('shield') + '<span>' + esc(k.name || k.id) + '</span><code class="tag">' + esc(k.preview || '') + '</code>' + stateTxt + '</div>' +
+        '<span class="m-note mono">' + esc(k.id) + '</span></div>' +
+        '<div class="acc-kv">' +
+        '<div class="acc-kv-row"><b>作用域</b><span>' + ckScopeText(k) + '</span></div>' +
+        '<div class="acc-kv-row"><b>模型白名单</b><span>' + modTxt + '</span></div>' +
+        (k.notes ? '<div class="acc-kv-row"><b>备注</b><span>' + esc(k.notes) + '</span></div>' : '') +
+        '<div class="acc-kv-row"><b>创建 / 最近使用</b><span>' + esc(k.createdAt || '-') + ' / ' + esc(k.lastUsedAt || '尚未使用 (本次进程内)') + '</span></div>' +
+        '</div>' +
+        '<div class="acc-item-acts">' +
+        '<button type="button" class="act-chip" data-ck-edit="' + esc(k.id) + '">' + svg('route') + '<span>编辑</span></button>' +
+        '<button type="button" class="act-chip" data-ck-toggle="' + esc(k.id) + '" data-ck-enable="' + (k.enabled ? '0' : '1') + '">' + svg(k.enabled ? 'pause' : 'play') + '<span>' + (k.enabled ? '停用' : '启用') + '</span></button>' +
+        '<button type="button" class="act-chip" style="color:var(--bad)" data-ck-del="' + esc(k.id) + '">' + svg('trash-2') + '<span>吊销删除</span></button>' +
+        '</div></div>';
+    }).join('');
+  }
+  listEl.innerHTML = html;
+  hydrateIcons(listEl);
+}
+function openClientKeyForm(key) {
+  const isNew = !key;
+  const k = key || { name: '', notes: '', scope: 'global', scopeId: '', allowedModels: [], enabled: true };
+  const box = document.getElementById('acc-ck-edit-box');
+  box.hidden = false;
+  const avail = getAvailableModelCatalog();
+  const curMods = new Set((k.allowedModels || []).map(s => String(s).toLowerCase()));
+  const modChecks = avail.map(m =>
+    '<label class="acc-mchk"><input type="checkbox" value="' + esc(m.id) + '"' + (curMods.has('*') || curMods.has(String(m.id).toLowerCase()) ? ' checked' : '') + '><span>' + esc(m.id) + '</span></label>'
+  ).join('');
+  const scopeOpts = [['global', '全局号池'], ['group', '指定分组号池'], ['account', '指定账号']].map(([v, l]) =>
+    '<option value="' + v + '"' + (k.scope === v ? ' selected' : '') + '>' + l + '</option>').join('');
+  const grpOpts = accState.groups.map(g => '<option value="' + esc(g.id) + '"' + (k.scope === 'group' && k.scopeId === g.id ? ' selected' : '') + '>' + esc((g.label || g.id) + ' (' + g.id + ')') + '</option>').join('');
+  const accOpts = accState.accounts.map(a => '<option value="' + esc(a.id) + '"' + (k.scope === 'account' && k.scopeId === a.id ? ' selected' : '') + '>' + esc((a.label || a.id) + ' (' + a.id + ')') + '</option>').join('');
+  box.innerHTML =
+    '<h4><span>' + (isNew ? '生成客户端 API Key' : '编辑客户端 Key · ' + esc(k.name || k.id)) + '</span>' +
+    '<button type="button" class="up-x" data-close-box="acc-ck-edit-box" aria-label="关闭">' + svg('x') + '</button></h4>' +
+    '<input type="hidden" id="ckf-id" value="' + esc(k.id || '') + '">' +
+    '<div class="acc-form-grid">' +
+    '<label class="acc-field"><span>名称</span><input type="text" id="ckf-name" maxlength="64" value="' + esc(k.name || '') + '" placeholder="例如 laptop-cherry-studio"></label>' +
+    '<label class="acc-field"><span>状态</span><select id="ckf-enabled"><option value="1"' + (k.enabled ? ' selected' : '') + '>启用</option><option value="0"' + (!k.enabled ? ' selected' : '') + '>停用</option></select></label>' +
+    '<label class="acc-field"><span>作用域</span><select id="ckf-scope">' + scopeOpts + '</select></label>' +
+    '<label class="acc-field" id="ckf-grp-wrap"' + (k.scope === 'group' ? '' : ' hidden') + '><span>目标分组</span><select id="ckf-grp">' + (grpOpts || '<option value="">(暂无分组)</option>') + '</select></label>' +
+    '<label class="acc-field" id="ckf-acc-wrap"' + (k.scope === 'account' ? '' : ' hidden') + '><span>目标账号</span><select id="ckf-acc">' + accOpts + '</select></label>' +
+    '<label class="acc-field" style="grid-column:1/-1"><span>备注</span><input type="text" id="ckf-notes" maxlength="512" value="' + esc(k.notes || '') + '"></label>' +
+    '<div class="acc-field" style="grid-column:1/-1"><span>模型白名单 (全不勾选 = 不额外限制)</span><div class="acc-model-grid" id="ckf-model-grid">' + modChecks + '</div></div>' +
+    '</div>' +
+    '<div class="up-act"><button type="button" class="btn" data-close-box="acc-ck-edit-box">取消</button>' +
+    '<button type="button" class="btn solid" data-save-ck="1">' + svg('check') + '<span>' + (isNew ? '生成 Key' : '保存') + '</span></button></div>' +
+    '<div class="up-msg" id="ckf-msg"></div>';
+  hydrateIcons(box);
+  document.getElementById('ckf-scope').addEventListener('change', (e) => {
+    document.getElementById('ckf-grp-wrap').hidden = e.target.value !== 'group';
+    document.getElementById('ckf-acc-wrap').hidden = e.target.value !== 'account';
+  });
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+async function ckMutate(path, method, body) {
+  const opts = { method, credentials: 'same-origin', headers: { 'X-Agy-Requested-With': 'dashboard' } };
+  if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  const r = await fetch(apiBaseUrl() + path, opts);
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || !d.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  return d;
+}
+async function saveClientKeyForm() {
+  const id = document.getElementById('ckf-id').value || '';
+  const scope = document.getElementById('ckf-scope').value || 'global';
+  const scopeId = scope === 'group' ? (document.getElementById('ckf-grp').value || '') : scope === 'account' ? (document.getElementById('ckf-acc').value || '') : '';
+  const body = {
+    id,
+    name: (document.getElementById('ckf-name').value || '').trim(),
+    notes: (document.getElementById('ckf-notes').value || '').trim(),
+    scope, scopeId,
+    enabled: document.getElementById('ckf-enabled').value === '1',
+    allowedModels: [...document.querySelectorAll('#ckf-model-grid input[type="checkbox"]:checked')].map(cb => cb.value),
+  };
+  const msg = document.getElementById('ckf-msg');
+  try {
+    const d = await ckMutate(id ? 'api/client-keys/update' : 'api/client-keys', 'POST', body);
+    if (!id && d.secret) {
+      const box = document.getElementById('acc-ck-edit-box');
+      box.innerHTML = '<h4><span>客户端 Key 已生成 · 仅显示这一次</span>' +
+        '<button type="button" class="up-x" data-close-box="acc-ck-edit-box" aria-label="关闭">' + svg('x') + '</button></h4>' +
+        '<div class="m-note">请立即复制保存。关闭后服务端只保留摘要，无法再次查看明文；遗失请吊销后重新生成。</div>' +
+        '<div class="acc-field" style="margin-top:8px"><input type="text" readonly id="ckf-secret" value="' + esc(d.secret) + '" style="font-family:var(--mono,monospace)"></div>' +
+        '<div class="up-act"><button type="button" class="btn solid" data-copy-txt="' + esc(d.secret) + '">' + svg('copy') + '<span>复制 Key</span></button>' +
+        '<button type="button" class="btn" data-close-box="acc-ck-edit-box">我已保存</button></div>';
+      hydrateIcons(box);
+    } else {
+      document.getElementById('acc-ck-edit-box').hidden = true;
+      showAccToast('已保存客户端 Key');
+    }
+    await loadClientKeys();
+  } catch (e) {
+    if (msg) { msg.className = 'up-msg bad'; msg.textContent = '保存失败: ' + e.message; }
+  }
+}
+async function toggleClientKey(id, enabled) {
+  try {
+    await ckMutate('api/client-keys/toggle', 'POST', { id, enabled });
+    showAccToast((enabled ? '已启用' : '已停用') + '客户端 Key: ' + id);
+    await loadClientKeys();
+  } catch (e) { showAccToast('操作失败: ' + e.message, true); }
+}
+async function deleteClientKey(id) {
+  if (!window.confirm('确认吊销并删除客户端 Key ' + id + '？使用该 Key 的客户端将立即失效，且不可恢复。')) return;
+  try {
+    await ckMutate('api/client-keys?id=' + encodeURIComponent(id), 'DELETE');
+    showAccToast('已吊销客户端 Key: ' + id);
+    await loadClientKeys();
+  } catch (e) { showAccToast('吊销失败: ' + e.message, true); }
 }
 function presetLabelOf(id) {
   const f = (accState.presets || []).find(p => p.id === id);
   return f ? f.label : (id || 'direct');
 }
 function switchAccModalTab(tab) {
-  accState.tab = tab === 'groups' ? 'groups' : 'accounts';
+  accState.tab = tab === 'groups' || tab === 'clientkeys' ? tab : 'accounts';
   const isGrp = accState.tab === 'groups';
-  document.getElementById('acc-tab-accounts-btn').classList.toggle('on', !isGrp);
+  const isCk = accState.tab === 'clientkeys';
+  const isAcc = accState.tab === 'accounts';
+  document.getElementById('acc-tab-accounts-btn').classList.toggle('on', isAcc);
   document.getElementById('acc-tab-groups-btn').classList.toggle('on', isGrp);
-  document.getElementById('acc-add-btn').hidden = isGrp;
+  document.getElementById('acc-tab-ck-btn').classList.toggle('on', isCk);
+  document.getElementById('acc-add-btn').hidden = !isAcc;
   document.getElementById('acc-add-grp-btn').hidden = !isGrp;
-  document.getElementById('acc-list').hidden = isGrp;
+  document.getElementById('acc-add-ck-btn').hidden = !isCk;
+  document.getElementById('acc-list').hidden = !isAcc;
   document.getElementById('acc-groups-list').hidden = !isGrp;
-  if (isGrp) {
+  document.getElementById('acc-ck-list').hidden = !isCk;
+  if (!isCk) {
+    const ckBox = document.getElementById('acc-ck-edit-box');
+    ckBox.hidden = true;
+    ckBox.innerHTML = '';
+  }
+  if (isCk) {
+    document.getElementById('acc-oauth-box').hidden = true;
+    document.getElementById('acc-edit-box').hidden = true;
+    document.getElementById('acc-group-edit-box').hidden = true;
+    renderClientKeysList();
+  } else if (isGrp) {
     document.getElementById('acc-oauth-box').hidden = true;
     document.getElementById('acc-edit-box').hidden = true;
     renderGroupsList();
@@ -2686,9 +2856,15 @@ async function openAccModal(focusAccId = '', mode = '') {
   document.getElementById('acc-oauth-box').hidden = true;
   document.getElementById('acc-edit-box').hidden = true;
   document.getElementById('acc-group-edit-box').hidden = true;
+  const ckBox = document.getElementById('acc-ck-edit-box');
+  if (ckBox) { ckBox.hidden = true; ckBox.innerHTML = ''; }
   await loadAccounts();
   if (mode === 'groups') {
     switchAccModalTab('groups');
+    return;
+  }
+  if (mode === 'clientkeys') {
+    switchAccModalTab('clientkeys');
     return;
   }
   switchAccModalTab('accounts');
@@ -2700,6 +2876,8 @@ async function openAccModal(focusAccId = '', mode = '') {
   }
 }
 function closeAccModal() {
+  const ckBox = document.getElementById('acc-ck-edit-box');
+  if (ckBox) { ckBox.hidden = true; ckBox.innerHTML = ''; }
   document.getElementById('acc-backdrop').hidden = true;
 }
 function renderAccountsList() {
@@ -3187,6 +3365,7 @@ async function deleteAccountById(accId) {
 
 document.getElementById('acc-add-btn').addEventListener('click', () => openAccountEditForm(null));
 document.getElementById('acc-add-grp-btn').addEventListener('click', () => openGroupEditForm(null));
+document.getElementById('acc-add-ck-btn').addEventListener('click', () => openClientKeyForm(null));
 document.getElementById('acc-close-btn').addEventListener('click', () => closeAccModal());
 document.getElementById('acc-modal').addEventListener('change', (e) => {
   const stratSel = e.target.closest('[data-pool-strat]');
@@ -3220,21 +3399,43 @@ document.getElementById('acc-modal').addEventListener('click', (e) => {
   const copyBtn = e.target.closest('[data-copy-txt]');
   if (copyBtn) {
     const txt = copyBtn.dataset.copyTxt || '';
+    const toastMsg = txt.startsWith('agy-ck-') ? '已复制客户端 Key 到剪贴板' : ('已复制: ' + txt);
+    const fallbackCopy = () => {
+      const inp = document.getElementById('ckf-secret');
+      if (inp && inp.value === txt) {
+        inp.focus();
+        inp.select();
+        try { if (document.execCommand('copy')) showAccToast(toastMsg); } catch (_) {}
+      }
+    };
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(txt).then(() => showAccToast('已复制: ' + txt)).catch(() => {});
+      navigator.clipboard.writeText(txt).then(() => showAccToast(toastMsg)).catch(fallbackCopy);
+    } else {
+      fallbackCopy();
     }
     return;
   }
   const closeBox = e.target.closest('[data-close-box]');
   if (closeBox) {
     const target = document.getElementById(closeBox.dataset.closeBox);
-    if (target) target.hidden = true;
+    if (target) {
+      target.hidden = true;
+      if (closeBox.dataset.closeBox === 'acc-ck-edit-box') target.innerHTML = '';
+    }
     return;
   }
   const presetBtn = e.target.closest('[data-model-preset]');
   if (presetBtn) { setAccountModelPreset(presetBtn.dataset.modelPreset); return; }
   const saveBtn = e.target.closest('[data-save-account]');
   if (saveBtn) { saveAccountForm(); return; }
+  const saveCk = e.target.closest('[data-save-ck]');
+  if (saveCk) { saveClientKeyForm(); return; }
+  const ckEdit = e.target.closest('[data-ck-edit]');
+  if (ckEdit) { openClientKeyForm(accState.clientKeys.find(k => k.id === ckEdit.dataset.ckEdit)); return; }
+  const ckTog = e.target.closest('[data-ck-toggle]');
+  if (ckTog) { toggleClientKey(ckTog.dataset.ckToggle, ckTog.dataset.ckEnable === '1'); return; }
+  const ckDel = e.target.closest('[data-ck-del]');
+  if (ckDel) { deleteClientKey(ckDel.dataset.ckDel); return; }
   const saveGrpBtn = e.target.closest('[data-save-group]');
   if (saveGrpBtn) { saveGroupForm(); return; }
   const grpEdit = e.target.closest('[data-grp-edit]');

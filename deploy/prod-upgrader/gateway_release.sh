@@ -87,6 +87,7 @@ test "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$
 test "$(docker exec agy-acp-gateway sha256sum /app/bin/agy-acp-gateway | cut -d ' ' -f1)" = "$GW_SHA"
 docker exec -e HOST_GW_PORT="$GW_PORT" -e HOST_DASH_PORT="$DASH_PORT" agy-acp-gateway sh -ec '
   key=${AGY_API_KEYS%%,*}
+  dash_key=${AGY_DASHBOARD_PASSWORD:-$key}
   gw_port=${AGY_GW_PORT:-${GW_PORT:-$HOST_GW_PORT}}
   dash_port=${AGY_DASH_PORT:-${DASH_PORT:-$HOST_DASH_PORT}}
   curl -fsS --max-time 10 "http://127.0.0.1:${gw_port}/v1/models" -H "x-api-key: $key" | grep -q "\"gemini-4-carbon\""
@@ -94,8 +95,8 @@ docker exec -e HOST_GW_PORT="$GW_PORT" -e HOST_DASH_PORT="$DASH_PORT" agy-acp-ga
   curl -fsS --max-time 10 "http://127.0.0.1:${gw_port}/v1/models" -H "x-api-key: $key" | grep -q "\"gemini-4-hydrogen\""
   curl -fsS --max-time 10 "http://127.0.0.1:${gw_port}/v1beta/models" -H "x-goog-api-key: $key" | grep -q "\"models/gemini-4-carbon\""
   curl -fsS --max-time 10 "http://127.0.0.1:${gw_port}/v1beta/models" -H "x-goog-api-key: $key" | grep -q "\"models/gemini-4-neon\""
-  curl -fsS --max-time 30 "http://127.0.0.1:${dash_port}/api/dashboard" -H "x-api-key: $key" | grep -q "\"geminiPool\""
-  curl -fsS --max-time 10 "http://127.0.0.1:${dash_port}/api/upgrade" -H "x-api-key: $key" | grep -q "\"enabled\":true"
+  curl -fsS --max-time 30 "http://127.0.0.1:${dash_port}/api/dashboard" -H "x-api-key: $dash_key" | grep -q "\"geminiPool\""
+  curl -fsS --max-time 10 "http://127.0.0.1:${dash_port}/api/upgrade" -H "x-api-key: $dash_key" | grep -q "\"enabled\":true"
 '
 python3 -I - "$release_dir" "$GW_PORT" <<'PY'
 import json, pathlib, re, subprocess, sys, time, urllib.request

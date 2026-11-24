@@ -1465,6 +1465,7 @@ func (am *AccountManager) evaluateAccountQuota(acc AccountProfile, dashPort int,
 			ID:      acc.ID,
 			Label:   acc.ID,
 			BaseURL: fmt.Sprintf("http://127.0.0.1:%d", dashPort),
+			APIKey:  am.childLoopbackKey,
 		}
 		fallbackKey := defaultPeerAPIKey(gwcfg.Current())
 		go func(p gwcfg.DashboardPeerConfig, k string) {
@@ -1504,6 +1505,16 @@ func (am *AccountManager) MatchesGroupKey(candidate string) (AccountGroup, bool)
 				return grp, true
 			}
 		}
+	}
+	if ck, ok := GlobalClientKeys.Match(candidate); ok {
+		if ck.Scope == ClientKeyScopeGroup {
+			if grp, exists := am.GetGroup(ck.ScopeID); exists {
+				return grp, true
+			}
+			// Group was deleted after the key was issued: fail closed instead of widening to the global pool.
+			return AccountGroup{ID: ck.ScopeID, Label: ck.ScopeID, BoundKeys: []string{}}, true
+		}
+		return AccountGroup{}, false
 	}
 	cBytes := []byte(candidate)
 	am.mu.RLock()
@@ -1632,8 +1643,11 @@ func (am *AccountManager) UpsertGroup(in AccountGroup) (AccountGroup, error) {
 		if k == "" || seenKeys[k] {
 			continue
 		}
-		if rawMasterKeyMatches(k) {
-			return AccountGroup{}, errors.New("分组专属 Key 不可与网关主管理 Key 相同")
+		if rawMasterKeyMatches(k) || dashboardPasswordMatches(k) {
+			return AccountGroup{}, errors.New("分组专属 Key 不可与网关主管理 Key 或控制台管理员密码相同")
+		}
+		if strings.HasPrefix(k, ClientKeyPrefix) {
+			return AccountGroup{}, errors.New("agy-ck- 前缀保留给控制台签发的哈希客户端 Key，请直接在“客户端 API Key”标签页管理")
 		}
 		seenKeys[k] = true
 		cleanKeys = append(cleanKeys, k)
