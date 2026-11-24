@@ -1881,6 +1881,14 @@ func (s *AcpProjectSession) ensureBooted(toolsCatalog []ToolDef, thoughtLevel st
 		s.demoteToHibernatedLocked(hibSid)
 		demotedStaleGen = true
 	}
+	// A failed first-prompt dispatch has uncertain instruction delivery. Never
+	// reuse it silently or re-inject into it; normal recovery rebuilds fresh history.
+	if firstPromptPlacement() && s.SessionID != "" {
+		if native, ok := eng.(*SharedAcpEngine); ok && !native.placement.known(s.SessionID, curGen) {
+			s.demoteToHibernatedLocked(s.SessionID)
+			demotedStaleGen = true
+		}
+	}
 	sid := s.SessionID
 	hibSid := s.HibernatedSessionID
 	hibParked := s.HibernatedParkedCallIDs

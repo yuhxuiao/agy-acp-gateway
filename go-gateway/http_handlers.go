@@ -712,6 +712,7 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		recordPlacementRequest(rawBody)
 		rawBody = nil
 
 		if path == "/v1/messages" && hasNonEmptyThreadField(body) {

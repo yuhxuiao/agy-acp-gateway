@@ -1797,7 +1797,7 @@ func (s *AcpProjectSession) executePromptOrParkWithRetry(ctx context.Context, pr
 			res.RetryCount += attempt
 			return res, nil
 		}
-		if attempt >= len(rpcRetryBackoffs) || anyDelta.Load() || ctx.Err() != nil ||
+		if firstPromptPlacement() || attempt >= len(rpcRetryBackoffs) || anyDelta.Load() || ctx.Err() != nil ||
 			!s.engine().IsAlive() || !isRetryableAcpRpcError(err) {
 			return TurnResult{}, err
 		}
@@ -3842,7 +3842,7 @@ func (s *AcpProjectSession) RunTurn(ctx context.Context, messages []map[string]a
 		mode = "sticky_delta"
 	}
 
-	canBisectColdStart := WafAutoBisectEnabled && mode == "cold_start" && !s.isWafBisectProbe &&
+	canBisectColdStart := !firstPromptPlacement() && WafAutoBisectEnabled && mode == "cold_start" && !s.isWafBisectProbe &&
 		!isWafBisectInCooldown() && len(extractBisectCandidates(curSys, rawPromptBlocks)) >= 2
 	s.mu.Lock()
 	s.allowWafFastCancel = canBisectColdStart
@@ -3881,7 +3881,7 @@ func (s *AcpProjectSession) RunTurn(ctx context.Context, messages []map[string]a
 		len(res.ToolCalls) == 0 && time.Since(turnStart) < 8*time.Second &&
 		isBisectableSoftError(DetectAntigravitySoftError(res.Text))
 
-	if (isFastCancelled || isInstantNotice429) && ctx.Err() == nil {
+	if !firstPromptPlacement() && (isFastCancelled || isInstantNotice429) && ctx.Err() == nil {
 		s.HibernateWorker("waf_autobisect_reset", true)
 		if healed, _ := runWafAutoBisectAndPersist(ctx, s.ConvKey, curSys, rawPromptBlocks); healed {
 			s.mu.Lock()
@@ -3972,7 +3972,7 @@ func (s *AcpProjectSession) RunTurn(ctx context.Context, messages []map[string]a
 		return TurnResult{}, err
 	}
 
-	if res.Usage != nil && res.Usage.Degradation != nil && res.Usage.Degradation.Degraded {
+	if !firstPromptPlacement() && res.Usage != nil && res.Usage.Degradation != nil && res.Usage.Degradation.Degraded {
 		deg := res.Usage.Degradation
 		s.recordArgonDegradation(sid, deg, res.EmittedDeltas)
 		if res.EmittedDeltas == 0 {
@@ -4048,7 +4048,7 @@ func (s *AcpProjectSession) RunTurn(ctx context.Context, messages []map[string]a
 			s.mu.Unlock()
 		}
 	}
-	if se := DetectAntigravitySoftError(res.Text); isUpstreamPoolCapacitySoftError(se) &&
+	if se := DetectAntigravitySoftError(res.Text); !firstPromptPlacement() && isUpstreamPoolCapacitySoftError(se) &&
 		res.FailedNotice == "" && res.EmittedDeltas == 0 && len(res.ToolCalls) == 0 &&
 		sel != nil && sel.Model != nil && sel.Model.Family == "gemini" && !sel.ExplicitTier &&
 		nextFallbackTier(curModel, curTier) != "" &&

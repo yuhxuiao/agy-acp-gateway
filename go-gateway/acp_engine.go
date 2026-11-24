@@ -108,6 +108,7 @@ type rpcResult struct {
 }
 
 type SharedAcpEngine struct {
+	placement        promptPlacement
 	capsMu           sync.RWMutex
 	caps             acpCapabilities
 	mu               sync.Mutex
@@ -264,7 +265,6 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	env = append(env,
 		"GOGC="+gogc,
 		"GOMEMLIMIT="+gomem,
-		"DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null",
 		"AGY_CLI_DISABLE_AUTO_UPDATE=1",
 		"HTTP_PROXY="+proxy,
 		"HTTPS_PROXY="+proxy,
@@ -275,6 +275,11 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 		"NO_PROXY=127.0.0.1,localhost,::1",
 		"no_proxy=127.0.0.1,localhost,::1",
 	)
+	// Native Linux credentials use the existing user Secret Service. Placement
+	// mode reuses that authorized login; masking its bus makes ACP unauthenticated.
+	if !firstPromptPlacement() {
+		env = append(env, "DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null")
+	}
 	cmd.Env = env
 
 	stdinPipe, err := cmd.StdinPipe()
@@ -297,6 +302,7 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	}
 
 	myGen := e.gen.Add(1)
+	e.placement.activate(myGen)
 	e.mu.Lock()
 	e.cmd = cmd
 	done := make(chan struct{})
@@ -368,8 +374,10 @@ func (e *SharedAcpEngine) StopEngine() {
 	}
 	e.stopping = true
 	cmd, done, stdinCloser := e.cmd, e.exitDone, e.stdinCloser
+	retiringGen := e.CurrentGen()
 	e.cmd, e.stdin, e.stdinCloser, e.replyCh = nil, nil, nil, nil
 	e.mu.Unlock()
+	e.placement.retire(retiringGen)
 	defer func() { e.mu.Lock(); e.stopping = false; e.bootCond.Broadcast(); e.mu.Unlock() }()
 	if stdinCloser != nil {
 		_ = stdinCloser.Close()
@@ -541,6 +549,13 @@ func (e *SharedAcpEngine) sendRawJSON(payload map[string]any) error {
 }
 
 func (e *SharedAcpEngine) RPC(method string, params any, timeout time.Duration) (json.RawMessage, error) {
+	if firstPromptPlacement() {
+		return e.placement.call(method, params, e.CurrentGen(), e.rpcNative, timeout)
+	}
+	return e.rpcNative(method, params, timeout)
+}
+
+func (e *SharedAcpEngine) rpcNative(method string, params any, timeout time.Duration) (json.RawMessage, error) {
 	if method != "session/close" && method != "session/cancel" {
 		if err := circuitError(); err != nil {
 			return nil, err
@@ -615,13 +630,25 @@ func (e *SharedAcpEngine) UnregisterSession(sid string) {
 }
 
 func (e *SharedAcpEngine) CloseSession(sid string) error {
+	closingGen := e.CurrentGen()
 	if sid == "" || !e.IsAlive() {
-		e.sessionListeners.Delete(sid)
+		e.placement.forget(sid, closingGen)
+		if e.CurrentGen() == closingGen {
+			e.sessionListeners.Delete(sid)
+		}
 		return nil
 	}
-	_, err := e.RPC("session/close", map[string]any{"sessionId": sid}, 10*time.Second)
+	var err error
+	if firstPromptPlacement() {
+		_, err = e.placement.call("session/close", map[string]any{"sessionId": sid}, closingGen, e.rpcNative, 10*time.Second)
+	} else {
+		_, err = e.RPC("session/close", map[string]any{"sessionId": sid}, 10*time.Second)
+	}
 	if isBenignCloseSessionErr(err) {
-		e.sessionListeners.Delete(sid)
+		e.placement.forget(sid, closingGen)
+		if e.CurrentGen() == closingGen {
+			e.sessionListeners.Delete(sid)
+		}
 		return nil
 	}
 	return err
@@ -701,6 +728,7 @@ func waitCmdWithKill(cmd *exec.Cmd, killOnWait bool) {
 }
 
 func (e *SharedAcpEngine) readStdoutLoop(stdoutPipe any, cmd *exec.Cmd, myGen uint64) {
+	defer e.placement.retire(myGen)
 	r, ok := stdoutPipe.(io.Reader)
 	if !ok {
 		return

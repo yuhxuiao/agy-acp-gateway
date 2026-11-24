@@ -321,6 +321,9 @@ func (gs *GatewayServer) reserveWorkerSlot(s *AcpProjectSession) error {
 func (gs *GatewayServer) reserveProbeWorkerSlot(s *AcpProjectSession) (func(), error) {
 	gs.workerAdmitMu.Lock()
 	defer gs.workerAdmitMu.Unlock()
+	if firstPromptPlacement() {
+		return nil, fmt.Errorf("probe inference disabled in first-prompt placement mode")
+	}
 	maxProbes := MaxProbeWorkers
 	if maxProbes < 1 {
 		maxProbes = 1
