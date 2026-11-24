@@ -876,6 +876,7 @@ func TestRound2ENG11SQLiteImageWalSaltAndUncommittedFrames(t *testing.T) {
 	if errImg != nil {
 		t.Fatalf("openSQLiteImage failed: %v", errImg)
 	}
+	defer img.Close()
 	if img.HasWALPage(5) {
 		t.Fatal("expected committed WAL truncation (dbSizeAfter=2) to evict stale walPages[5]")
 	}

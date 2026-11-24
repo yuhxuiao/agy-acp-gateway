@@ -1642,11 +1642,18 @@ func (st *StateStore) syncUsageStepsFromSourceDirInternal(convDir, defaultSource
 		meta      cursorMeta
 	}
 	dbStems := make(map[string]bool)
+	walEntries := make(map[string]os.DirEntry)
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".db") {
+		if e.IsDir() {
+			continue
+		}
+		eName := e.Name()
+		if strings.HasSuffix(eName, ".db") {
 			if info, errI := e.Info(); errI == nil && info.Size() >= 100 {
-				dbStems[strings.ToLower(strings.TrimSuffix(e.Name(), ".db"))] = true
+				dbStems[strings.ToLower(strings.TrimSuffix(eName, ".db"))] = true
 			}
+		} else if strings.HasSuffix(eName, ".db-wal") {
+			walEntries[eName] = e
 		}
 	}
 
@@ -1689,9 +1696,11 @@ func (st *StateStore) syncUsageStepsFromSourceDirInternal(convDir, defaultSource
 		}
 		var walSize, walMtime int64
 		if isDB {
-			if wInfo, errW := os.Stat(filePath + "-wal"); errW == nil {
-				walSize = wInfo.Size()
-				walMtime = wInfo.ModTime().UnixNano()
+			if wEntry, hasWal := walEntries[name+"-wal"]; hasWal {
+				if wInfo, errW := wEntry.Info(); errW == nil {
+					walSize = wInfo.Size()
+					walMtime = wInfo.ModTime().UnixNano()
+				}
 			}
 		}
 		prev, hasPrev := st.cursors[cursorKey]
@@ -1832,6 +1841,7 @@ func (st *StateStore) backfillEmptyServedModels(sid, dbPath string, pureImageOnl
 	if len(byStep) == 0 && len(byTok) == 0 {
 		if img, errI := openSQLiteImage(dbPath); errI == nil {
 			mStep, mTok := readGenMetaIndexFromImage(img)
+			_ = img.Close()
 			if len(mStep) > 0 || len(mTok) > 0 {
 				byStep = map[int]string{}
 				byTok = map[[3]int]string{}

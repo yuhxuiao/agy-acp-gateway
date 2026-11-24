@@ -905,88 +905,158 @@ func readSQLiteInt(buf []byte, st int64) int64 {
 	}
 }
 
+const maxSQLiteImageCachedPages = 256
+
 type SQLiteImage struct {
-	data     []byte
-	pageSize int
-	reserved int
-	usable   int
-	walPages map[uint32][]byte
+	dbFile     *os.File
+	dbSize     int64
+	walFile    *os.File
+	pageSize   int
+	reserved   int
+	usable     int
+	walOffsets map[uint32]int64
+	pageCache  map[uint32][]byte
+}
+
+func (img *SQLiteImage) Close() error {
+	if img == nil {
+		return nil
+	}
+	var firstErr error
+	if img.walFile != nil {
+		if err := img.walFile.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		img.walFile = nil
+	}
+	if img.dbFile != nil {
+		if err := img.dbFile.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		img.dbFile = nil
+	}
+	return firstErr
+}
+
+func (img *SQLiteImage) CachedPageCount() int {
+	if img == nil {
+		return 0
+	}
+	return len(img.pageCache)
 }
 
 func (img *SQLiteImage) HasWALPage(pgNo uint32) bool {
-	if img == nil || img.walPages == nil {
+	if img == nil || img.walOffsets == nil {
 		return false
 	}
-	_, ok := img.walPages[pgNo]
+	_, ok := img.walOffsets[pgNo]
 	return ok
 }
 
 func OpenSQLiteImage(dbPath string) (*SQLiteImage, error) {
-	data, err := os.ReadFile(dbPath)
+	dbFile, err := os.Open(dbPath)
 	if err != nil {
 		return nil, err
 	}
-	if len(data) < 100 {
+	st, err := dbFile.Stat()
+	if err != nil {
+		_ = dbFile.Close()
+		return nil, err
+	}
+	if st.Size() < 100 {
+		_ = dbFile.Close()
 		return nil, os.ErrInvalid
 	}
-	if string(data[:16]) != "SQLite format 3\x00" {
+	var hdr [100]byte
+	if _, err := dbFile.ReadAt(hdr[:], 0); err != nil {
+		_ = dbFile.Close()
 		return nil, os.ErrInvalid
 	}
-	ps := int(binary.BigEndian.Uint16(data[16:18]))
+	if string(hdr[:16]) != "SQLite format 3\x00" {
+		_ = dbFile.Close()
+		return nil, os.ErrInvalid
+	}
+	ps := int(binary.BigEndian.Uint16(hdr[16:18]))
 	if ps == 1 {
 		ps = 65536
 	}
 	if ps < 512 {
+		_ = dbFile.Close()
 		return nil, os.ErrInvalid
 	}
-	res := int(data[20])
+	res := int(hdr[20])
 	usable := ps - res
-
-	img := &SQLiteImage{
-		data:     data,
-		pageSize: ps,
-		reserved: res,
-		usable:   usable,
+	if usable < 480 {
+		_ = dbFile.Close()
+		return nil, os.ErrInvalid
 	}
 
-	// Apply committed WAL frames from the current WAL generation (matching header magic, DB page
-	// size & 8-byte salt, committed only at frames with dbSize > 0) for local files.
+	img := &SQLiteImage{
+		dbFile:    dbFile,
+		dbSize:    st.Size(),
+		pageSize:  ps,
+		reserved:  res,
+		usable:    usable,
+		pageCache: make(map[uint32][]byte, 16),
+	}
+
+	// Scan only 32B WAL header + 24B frame headers via pread (without reading whole WAL pages into RAM),
+	// recording file offsets of committed frames from the current WAL generation.
 	if !strings.HasPrefix(dbPath, "/mnt/c/") {
-		walData, errWal := os.ReadFile(dbPath + "-wal")
-		if errWal == nil && len(walData) >= 32+24+ps {
-			magic := binary.BigEndian.Uint32(walData[0:4])
-			walPs := int(binary.BigEndian.Uint32(walData[8:12]))
-			if walPs == 1 {
-				walPs = 65536
-			}
-			if (magic == 0x377f0682 || magic == 0x377f0683) && walPs == ps {
-				hdrSalt := walData[16:24]
-				img.walPages = make(map[uint32][]byte)
-				txPages := make(map[uint32][]byte)
-				frameSize := 24 + ps
-				for off := 32; off+frameSize <= len(walData); off += frameSize {
-					if !bytes.Equal(walData[off+8:off+16], hdrSalt) {
-						break
+		walFile, errWal := os.Open(dbPath + "-wal")
+		if errWal == nil {
+			keepWal := false
+			if wSt, errStat := walFile.Stat(); errStat == nil && wSt.Size() >= int64(32+24+ps) {
+				var walHdr [32]byte
+				if _, errH := walFile.ReadAt(walHdr[:], 0); errH == nil {
+					magic := binary.BigEndian.Uint32(walHdr[0:4])
+					walPs := int(binary.BigEndian.Uint32(walHdr[8:12]))
+					if walPs == 1 {
+						walPs = 65536
 					}
-					pgNo := binary.BigEndian.Uint32(walData[off : off+4])
-					dbSizeAfter := binary.BigEndian.Uint32(walData[off+4 : off+8])
-					if pgNo > 0 {
-						txPages[pgNo] = walData[off+24 : off+frameSize]
-					}
-					if dbSizeAfter > 0 {
-						for k, v := range txPages {
-							if k <= dbSizeAfter {
-								img.walPages[k] = v
+					if (magic == 0x377f0682 || magic == 0x377f0683) && walPs == ps {
+						hdrSalt := walHdr[16:24]
+						walOffsets := make(map[uint32]int64)
+						txOffsets := make(map[uint32]int64)
+						frameSize := int64(24 + ps)
+						walSize := wSt.Size()
+						var frameHdr [24]byte
+						for off := int64(32); off+frameSize <= walSize; off += frameSize {
+							if _, errF := walFile.ReadAt(frameHdr[:], off); errF != nil {
+								break
+							}
+							if !bytes.Equal(frameHdr[8:16], hdrSalt) {
+								break
+							}
+							pgNo := binary.BigEndian.Uint32(frameHdr[0:4])
+							dbSizeAfter := binary.BigEndian.Uint32(frameHdr[4:8])
+							if pgNo > 0 {
+								txOffsets[pgNo] = off + 24
+							}
+							if dbSizeAfter > 0 {
+								for k, v := range txOffsets {
+									if k <= dbSizeAfter {
+										walOffsets[k] = v
+									}
+								}
+								for k := range walOffsets {
+									if k > dbSizeAfter {
+										delete(walOffsets, k)
+									}
+								}
+								clear(txOffsets)
 							}
 						}
-						for k := range img.walPages {
-							if k > dbSizeAfter {
-								delete(img.walPages, k)
-							}
+						if len(walOffsets) > 0 {
+							img.walFile = walFile
+							img.walOffsets = walOffsets
+							keepWal = true
 						}
-						clear(txPages)
 					}
 				}
+			}
+			if !keepWal {
+				_ = walFile.Close()
 			}
 		}
 	}
@@ -994,19 +1064,39 @@ func OpenSQLiteImage(dbPath string) (*SQLiteImage, error) {
 }
 
 func (img *SQLiteImage) getPage(pgNo uint32) []byte {
-	if pgNo == 0 {
+	if img == nil || pgNo == 0 {
 		return nil
 	}
-	if img.walPages != nil {
-		if p, ok := img.walPages[pgNo]; ok {
-			return p
+	if cached, ok := img.pageCache[pgNo]; ok {
+		return cached
+	}
+	if img.walOffsets != nil && img.walFile != nil {
+		if walOff, ok := img.walOffsets[pgNo]; ok {
+			buf := make([]byte, img.pageSize)
+			if n, err := img.walFile.ReadAt(buf, walOff); err == nil && n == img.pageSize {
+				if len(img.pageCache) < maxSQLiteImageCachedPages {
+					img.pageCache[pgNo] = buf
+				}
+				return buf
+			}
+			return nil
 		}
 	}
-	start := int(pgNo-1) * img.pageSize
-	if start < 0 || start+img.pageSize > len(img.data) {
+	if img.dbFile == nil {
 		return nil
 	}
-	return img.data[start : start+img.pageSize]
+	start := int64(pgNo-1) * int64(img.pageSize)
+	if start < 0 || start+int64(img.pageSize) > img.dbSize {
+		return nil
+	}
+	buf := make([]byte, img.pageSize)
+	if n, err := img.dbFile.ReadAt(buf, start); err != nil || n != img.pageSize {
+		return nil
+	}
+	if len(img.pageCache) < maxSQLiteImageCachedPages {
+		img.pageCache[pgNo] = buf
+	}
+	return buf
 }
 
 func (img *SQLiteImage) readCellPayload(cell []byte, payloadSize int) []byte {
@@ -1058,10 +1148,9 @@ func (img *SQLiteImage) readCellPayload(cell []byte, payloadSize int) []byte {
 	return out
 }
 
-func (img *SQLiteImage) findTableRootPage(tableName string) uint32 {
-	var found uint32
+func (img *SQLiteImage) findTableInfo(tableName string) (rootPage uint32, hasIntPrimaryKey bool) {
 	img.walkTableBTree(1, 0, func(_ int64, cell []byte, pSize int) {
-		if found != 0 {
+		if rootPage != 0 {
 			return
 		}
 		rec := img.readCellPayload(cell, pSize)
@@ -1082,11 +1171,12 @@ func (img *SQLiteImage) findTableRootPage(tableName string) uint32 {
 			pos = next
 		}
 		dpos := int(hdrLen)
-		// col 0: type ("table"), col 1: name, col 2: tbl_name, col 3: rootpage
+		// col 0: type ("table"), col 1: name, col 2: tbl_name, col 3: rootpage, col 4: sql
 		l0 := sqliteSerialTypeLen(sts[0])
 		l1 := sqliteSerialTypeLen(sts[1])
 		l2 := sqliteSerialTypeLen(sts[2])
 		l3 := sqliteSerialTypeLen(sts[3])
+		l4 := sqliteSerialTypeLen(sts[4])
 		if dpos+l0+l1+l2+l3 > len(rec) {
 			return
 		}
@@ -1095,11 +1185,20 @@ func (img *SQLiteImage) findTableRootPage(tableName string) uint32 {
 		if string(typeBytes) == "table" && string(nameBytes) == tableName {
 			rp := readSQLiteInt(rec[dpos+l0+l1+l2:dpos+l0+l1+l2+l3], sts[3])
 			if rp > 0 {
-				found = uint32(rp)
+				rootPage = uint32(rp)
+				if l4 > 0 && dpos+l0+l1+l2+l3+l4 <= len(rec) {
+					ddlUpper := strings.ToUpper(string(rec[dpos+l0+l1+l2+l3 : dpos+l0+l1+l2+l3+l4]))
+					hasIntPrimaryKey = strings.Contains(ddlUpper, "INTEGER PRIMARY KEY") && !strings.Contains(ddlUpper, "WITHOUT ROWID")
+				}
 			}
 		}
 	})
-	return found
+	return rootPage, hasIntPrimaryKey
+}
+
+func (img *SQLiteImage) findTableRootPage(tableName string) uint32 {
+	rp, _ := img.findTableInfo(tableName)
+	return rp
 }
 
 func (img *SQLiteImage) findStepsRootPage() uint32 {
@@ -1107,6 +1206,10 @@ func (img *SQLiteImage) findStepsRootPage() uint32 {
 }
 
 func (img *SQLiteImage) walkTableBTree(pgNo uint32, depth int, onCell func(rowID int64, cellBody []byte, payloadSize int)) {
+	img.walkTableBTreeAfter(pgNo, depth, 0, false, onCell)
+}
+
+func (img *SQLiteImage) walkTableBTreeAfter(pgNo uint32, depth int, minRowIDAfter int64, useMinFilter bool, onCell func(rowID int64, cellBody []byte, payloadSize int)) {
 	if pgNo == 0 || depth > 16 {
 		return
 	}
@@ -1139,9 +1242,14 @@ func (img *SQLiteImage) walkTableBTree(pgNo uint32, depth int, onCell func(rowID
 				continue
 			}
 			leftChild := binary.BigEndian.Uint32(pg[cellOff : cellOff+4])
-			img.walkTableBTree(leftChild, depth+1, onCell)
+			if useMinFilter {
+				if maxKey, _, okK := readSQLiteVarint(pg, cellOff+4); okK && maxKey <= minRowIDAfter {
+					continue
+				}
+			}
+			img.walkTableBTreeAfter(leftChild, depth+1, minRowIDAfter, useMinFilter, onCell)
 		}
-		img.walkTableBTree(rightChild, depth+1, onCell)
+		img.walkTableBTreeAfter(rightChild, depth+1, minRowIDAfter, useMinFilter, onCell)
 	case 0x0d: // Leaf table b-tree page
 		ptrBase := hdrOff + 8
 		for i := 0; i < numCells; i++ {
@@ -1158,6 +1266,9 @@ func (img *SQLiteImage) walkTableBTree(pgNo uint32, depth int, onCell func(rowID
 			}
 			rowID, next2, ok2 := readSQLiteVarint(pg, next1)
 			if !ok2 || next2 > len(pg) {
+				continue
+			}
+			if useMinFilter && rowID <= minRowIDAfter {
 				continue
 			}
 			onCell(rowID, pg[next2:], int(pSize))
@@ -1373,6 +1484,7 @@ func ReadMaxForkStepIdxFromSQLite(dbPath string) int {
 	if err != nil {
 		return -1
 	}
+	defer img.Close()
 	return readMaxForkStepIdxFromImage(img)
 }
 
@@ -1388,6 +1500,7 @@ func ReadModelStepsFromSQLiteAfterInternal(dbPath, sourceSide string, gwSids map
 	if err != nil {
 		return nil, -1, false
 	}
+	defer img.Close()
 	maxForkIdx := -1
 	effectiveAfter := afterIdx
 	if sourceSide == "APP" {
@@ -1396,7 +1509,7 @@ func ReadModelStepsFromSQLiteAfterInternal(dbPath, sourceSide string, gwSids map
 			effectiveAfter = maxForkIdx
 		}
 	}
-	rootPg := img.findStepsRootPage()
+	rootPg, hasIntPK := img.findTableInfo("steps")
 	if rootPg == 0 {
 		return nil, maxForkIdx, true
 	}
@@ -1404,8 +1517,9 @@ func ReadModelStepsFromSQLiteAfterInternal(dbPath, sourceSide string, gwSids map
 	var rawSteps []ParsedModelStep
 	hasAnyDshBridge := isKnownGw
 	fallbackTs := st.ModTime().Unix()
+	useMinRowFilter := hasIntPK && effectiveAfter >= 0 && (hasAnyDshBridge || sourceSide == "APP")
 
-	img.walkTableBTree(rootPg, 0, func(rowID int64, cellBody []byte, pSize int) {
+	img.walkTableBTreeAfter(rootPg, 0, int64(effectiveAfter), useMinRowFilter, func(rowID int64, cellBody []byte, pSize int) {
 		// Fast inspect of record header from local cell slice BEFORE reading overflow pages!
 		hdrLen, pos, ok := readSQLiteVarint(cellBody, 0)
 		if !ok || hdrLen <= 0 || int(hdrLen) > len(cellBody) {
