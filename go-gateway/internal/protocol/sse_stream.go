@@ -19,16 +19,18 @@ type SSEStreamOptions struct {
 // SSEStreamSession coordinates header commitment, response write-deadline renewal,
 // heartbeats, flushing, and serialized writes for one HTTP streaming response.
 type SSEStreamSession struct {
-	mu               sync.Mutex
-	w                http.ResponseWriter
-	flusher          http.Flusher
-	rc               *http.ResponseController
-	contentType      string
-	heartbeatIntv    time.Duration
-	writeTimeout     time.Duration
-	delayHeaders     bool
-	headersCommitted bool
-	writeFailed      bool
+	mu                sync.Mutex
+	w                 http.ResponseWriter
+	flusher           http.Flusher
+	rc                *http.ResponseController
+	contentType       string
+	heartbeatIntv     time.Duration
+	writeTimeout      time.Duration
+	delayHeaders      bool
+	headersCommitted  bool
+	writeFailed       bool
+	lastDeadlineRenew time.Time
+	frameBuf          bytes.Buffer
 
 	hbMu   sync.Mutex
 	hbDone chan struct{}
@@ -76,15 +78,29 @@ func (s *SSEStreamSession) applyStreamHeadersLocked() {
 }
 
 func (s *SSEStreamSession) renewDeadlineLocked() {
-	if s.rc != nil {
-		_ = s.rc.SetWriteDeadline(time.Now().Add(s.writeTimeout))
+	if s.rc == nil {
+		return
 	}
+	now := time.Now()
+	minIntv := 2 * time.Second
+	if quarter := s.writeTimeout / 4; quarter < minIntv {
+		minIntv = quarter
+	}
+	if minIntv > 0 && !s.lastDeadlineRenew.IsZero() && now.Sub(s.lastDeadlineRenew) < minIntv {
+		return
+	}
+	_ = s.rc.SetWriteDeadline(now.Add(s.writeTimeout))
+	s.lastDeadlineRenew = now
 }
 
 // ClearDeadline clears any per-write deadline on exit so the HTTP server can reclaim connections cleanly.
 func (s *SSEStreamSession) ClearDeadline() {
-	if s.rc != nil {
-		_ = s.rc.SetWriteDeadline(time.Time{})
+	s.mu.Lock()
+	s.lastDeadlineRenew = time.Time{}
+	rc := s.rc
+	s.mu.Unlock()
+	if rc != nil {
+		_ = rc.SetWriteDeadline(time.Time{})
 	}
 }
 
@@ -202,6 +218,44 @@ func formatSSEDataBytes(jsonBytes []byte) []byte {
 	return buf.Bytes()
 }
 
+func (s *SSEStreamSession) resetFrameBufLocked() {
+	if s.frameBuf.Cap() > 64*1024 {
+		s.frameBuf = bytes.Buffer{}
+		return
+	}
+	s.frameBuf.Reset()
+}
+
+func (s *SSEStreamSession) writeSSEEventLocked(evName string, payload any) bool {
+	if s.writeFailed {
+		return false
+	}
+	s.resetFrameBufLocked()
+	s.frameBuf.Grow(len(evName) + 128)
+	s.frameBuf.WriteString("event: ")
+	s.frameBuf.WriteString(evName)
+	s.frameBuf.WriteString("\ndata: ")
+	if err := json.NewEncoder(&s.frameBuf).Encode(payload); err != nil {
+		return false
+	}
+	s.frameBuf.WriteByte('\n')
+	return s.writeBytesLocked(s.frameBuf.Bytes())
+}
+
+func (s *SSEStreamSession) writeSSEDataLocked(payload any) bool {
+	if s.writeFailed {
+		return false
+	}
+	s.resetFrameBufLocked()
+	s.frameBuf.Grow(128)
+	s.frameBuf.WriteString("data: ")
+	if err := json.NewEncoder(&s.frameBuf).Encode(payload); err != nil {
+		return false
+	}
+	s.frameBuf.WriteByte('\n')
+	return s.writeBytesLocked(s.frameBuf.Bytes())
+}
+
 // WriteRaw commits headers if needed, renews the write deadline, writes raw bytes, and flushes.
 func (s *SSEStreamSession) WriteRaw(raw string) bool {
 	s.mu.Lock()
@@ -212,31 +266,15 @@ func (s *SSEStreamSession) WriteRaw(raw string) bool {
 // WriteSSEEvent marshals payload as JSON and writes an `event: <ev>\ndata: <json>\n\n` frame.
 func (s *SSEStreamSession) WriteSSEEvent(evName string, payload any) bool {
 	s.mu.Lock()
-	if s.writeFailed {
-		s.mu.Unlock()
-		return false
-	}
-	s.mu.Unlock()
-	b, _ := json.Marshal(payload)
-	frame := formatSSEEventBytes(evName, b)
-	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.writeBytesLocked(frame)
+	return s.writeSSEEventLocked(evName, payload)
 }
 
 // WriteSSEData marshals payload as JSON and writes a `data: <json>\n\n` frame.
 func (s *SSEStreamSession) WriteSSEData(payload any) bool {
 	s.mu.Lock()
-	if s.writeFailed {
-		s.mu.Unlock()
-		return false
-	}
-	s.mu.Unlock()
-	b, _ := json.Marshal(payload)
-	frame := formatSSEDataBytes(b)
-	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.writeBytesLocked(frame)
+	return s.writeSSEDataLocked(payload)
 }
 
 // WriteSSEComment writes a W3C SSE comment line `: <comment>\n\n`.
@@ -246,12 +284,12 @@ func (s *SSEStreamSession) WriteSSEComment(comment string) bool {
 	if s.writeFailed {
 		return false
 	}
-	var buf bytes.Buffer
-	buf.Grow(len(comment) + 4)
-	buf.WriteString(": ")
-	buf.WriteString(comment)
-	buf.WriteString("\n\n")
-	return s.writeBytesLocked(buf.Bytes())
+	s.resetFrameBufLocked()
+	s.frameBuf.Grow(len(comment) + 4)
+	s.frameBuf.WriteString(": ")
+	s.frameBuf.WriteString(comment)
+	s.frameBuf.WriteString("\n\n")
+	return s.writeBytesLocked(s.frameBuf.Bytes())
 }
 
 // DoLocked executes fn exclusively under the stream mutex.
@@ -306,20 +344,12 @@ func (sw *StreamWriter) WriteRaw(raw string) bool {
 
 // WriteSSEEvent writes `event: <evName>\ndata: <json>\n\n` with deadline renewal & Flush.
 func (sw *StreamWriter) WriteSSEEvent(evName string, payload any) bool {
-	if sw.s.writeFailed {
-		return false
-	}
-	b, _ := json.Marshal(payload)
-	return sw.s.writeBytesLocked(formatSSEEventBytes(evName, b))
+	return sw.s.writeSSEEventLocked(evName, payload)
 }
 
 // WriteSSEData writes `data: <json>\n\n` with deadline renewal & Flush.
 func (sw *StreamWriter) WriteSSEData(payload any) bool {
-	if sw.s.writeFailed {
-		return false
-	}
-	b, _ := json.Marshal(payload)
-	return sw.s.writeBytesLocked(formatSSEDataBytes(b))
+	return sw.s.writeSSEDataLocked(payload)
 }
 
 // StartHeartbeat begins emitting periodic heartbeat frames via frameFn (or custom fn under stream lock).

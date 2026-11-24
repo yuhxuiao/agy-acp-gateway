@@ -707,6 +707,8 @@ func (e *SharedAcpEngine) readStdoutLoop(stdoutPipe any, cmd *exec.Cmd, myGen ui
 	}
 	br := bufio.NewReaderSize(r, 256*1024)
 	var loopErr error
+	permSem := make(chan struct{}, 32)
+	var permWg sync.WaitGroup
 
 	for {
 		line, readErr := readJSONRPCLine(br, maxAcpInboundLineBytes)
@@ -737,7 +739,18 @@ func (e *SharedAcpEngine) readStdoutLoop(stdoutPipe any, cmd *exec.Cmd, myGen ui
 						_ = json.Unmarshal(msg.Params, &p)
 						if v, ok := e.sessionListeners.Load(p.SessionID); ok {
 							if l, okL := v.(acp.SessionListener); okL && l != nil {
-								l.HandlePermissionRequest(msg.ID, p.Options, p.ToolCall)
+								rpcID := msg.ID
+								opts := p.Options
+								tc := p.ToolCall
+								permSem <- struct{}{}
+								permWg.Add(1)
+								go func(listener acp.SessionListener) {
+									defer func() {
+										<-permSem
+										permWg.Done()
+									}()
+									listener.HandlePermissionRequest(rpcID, opts, tc)
+								}(l)
 							} else {
 								replyPermissionOutcomeWithEngine(e, msg.ID, p.Options, false)
 							}
@@ -756,13 +769,57 @@ func (e *SharedAcpEngine) readStdoutLoop(stdoutPipe any, cmd *exec.Cmd, myGen ui
 					}
 				} else if msg.Method == "session/update" {
 					var p struct {
-						SessionID string         `json:"sessionId"`
-						Update    map[string]any `json:"update"`
+						SessionID string          `json:"sessionId"`
+						Update    json.RawMessage `json:"update"`
 					}
-					if err := json.Unmarshal(msg.Params, &p); err == nil && p.SessionID != "" {
+					if err := json.Unmarshal(msg.Params, &p); err == nil && p.SessionID != "" && len(p.Update) > 0 {
 						if v, ok := e.sessionListeners.Load(p.SessionID); ok {
 							if l, okL := v.(acp.SessionListener); okL && l != nil {
-								l.HandleSessionUpdate(p.Update)
+								dispatchedFast := false
+								if fl, okF := l.(acp.FastSessionUpdateListener); okF {
+									var fastU struct {
+										SessionUpdate string `json:"sessionUpdate"`
+										Content       struct {
+											Text string `json:"text"`
+										} `json:"content"`
+										Used  *int `json:"used"`
+										Size  *int `json:"size"`
+										Usage *struct {
+											Used *int `json:"used"`
+											Size *int `json:"size"`
+										} `json:"usage"`
+									}
+									if json.Unmarshal(p.Update, &fastU) == nil {
+										switch fastU.SessionUpdate {
+										case "agent_message_chunk", "agent_thought_chunk":
+											fl.HandleFastTextChunk(fastU.SessionUpdate, fastU.Content.Text)
+											dispatchedFast = true
+										case "usage_update":
+											var usedVal, sizeVal int
+											var hasU, hasS bool
+											if fastU.Used != nil {
+												usedVal, hasU = *fastU.Used, true
+											} else if fastU.Usage != nil && fastU.Usage.Used != nil {
+												usedVal, hasU = *fastU.Usage.Used, true
+											}
+											if fastU.Size != nil {
+												sizeVal, hasS = *fastU.Size, true
+											} else if fastU.Usage != nil && fastU.Usage.Size != nil {
+												sizeVal, hasS = *fastU.Usage.Size, true
+											}
+											if hasU || hasS {
+												fl.HandleFastUsageUpdate(usedVal, sizeVal, hasU, hasS)
+												dispatchedFast = true
+											}
+										}
+									}
+								}
+								if !dispatchedFast {
+									var uMap map[string]any
+									if json.Unmarshal(p.Update, &uMap) == nil && uMap != nil {
+										l.HandleSessionUpdate(uMap)
+									}
+								}
 							}
 						}
 					}
@@ -792,6 +849,8 @@ func (e *SharedAcpEngine) readStdoutLoop(stdoutPipe any, cmd *exec.Cmd, myGen ui
 			break
 		}
 	}
+
+	permWg.Wait()
 
 	// Gate concurrent EnsureStarted() / StopEngine() while reaping the dead engine and draining
 	// its pending RPCs & sessionListeners so a gen+1 engine cannot boot and have its state wiped.

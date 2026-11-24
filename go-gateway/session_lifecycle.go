@@ -269,6 +269,14 @@ func (s *AcpProjectSession) HandleSessionUpdate(u map[string]any) {
 	s.handleSessionUpdate(u)
 }
 
+func (s *AcpProjectSession) HandleFastTextChunk(updType, text string) {
+	s.handleFastTextChunk(updType, text)
+}
+
+func (s *AcpProjectSession) HandleFastUsageUpdate(used, size int, hasUsed, hasSize bool) {
+	s.applyUsageUpdateValues(used, size, hasUsed, hasSize)
+}
+
 func (s *AcpProjectSession) HandlePermissionRequest(rpcID any, options []acp.PermissionOption, tc map[string]any) {
 	s.handlePermissionRequest(rpcID, options, tc)
 }
@@ -496,6 +504,11 @@ func setAndVerifySessionConfigOption(sessionID, configID, expectedValue string, 
 }
 
 func setAndVerifySessionConfigOptionWith(eng acp.Engine, sessionID, configID, expectedValue string, timeout time.Duration) error {
+	_, err := setAndVerifySessionConfigOptionRawWith(eng, sessionID, configID, expectedValue, timeout)
+	return err
+}
+
+func setAndVerifySessionConfigOptionRawWith(eng acp.Engine, sessionID, configID, expectedValue string, timeout time.Duration) (json.RawMessage, error) {
 	if timeout <= 0 {
 		timeout = configOptionTimeout
 	}
@@ -513,13 +526,16 @@ func setAndVerifySessionConfigOptionWith(eng acp.Engine, sessionID, configID, ex
 			lastErr = err
 			var rpcErr *acpRPCError
 			if errors.As(err, &rpcErr) || strings.Contains(err.Error(), "-32602") {
-				return err
+				return nil, err
 			}
 			continue
 		}
-		return verifyConfigOptionAck(rawRes, configID, expectedValue)
+		if err := verifyConfigOptionAck(rawRes, configID, expectedValue); err != nil {
+			return nil, err
+		}
+		return rawRes, nil
 	}
-	return lastErr
+	return nil, lastErr
 }
 
 func verifyConfigOptionAck(rawRes json.RawMessage, configID, expectedValue string) error {
@@ -551,10 +567,34 @@ func verifyConfigOptionAck(rawRes json.RawMessage, configID, expectedValue strin
 // re-applied and positively acknowledged. A session that cannot be confirmed is closed instead of
 // silently running (and billing) a different model or tier.
 func (s *AcpProjectSession) pinSessionConfig(sid string, m *ModelInfo, tier string) (string, error) {
+	applied, _, err := s.pinSessionConfigFromAck(sid, m, tier, nil)
+	return applied, err
+}
+
+// pinSessionConfigFromAck pins model and thinking tier on a newly opened or resumed ACP session.
+// Any option already positively confirmed in initialAck (or in the model-switch ack) via
+// verifyConfigOptionAck is reused without an extra IPC round-trip; missing or mismatched options
+// still issue session/set_config_option and fail closed on non-confirmation.
+func (s *AcpProjectSession) pinSessionConfigFromAck(sid string, m *ModelInfo, tier string, initialAck json.RawMessage) (string, json.RawMessage, error) {
 	eng := s.engine()
-	applied, err := setSessionModelAndTierWith(eng, sid, m, tier, true, true)
+	if tier == "" {
+		tier = "medium"
+	}
+	latestAck := initialAck
+	var err error
+	if verifyConfigOptionAck(latestAck, "model", m.ID) != nil {
+		latestAck, err = setAndVerifySessionConfigOptionRawWith(eng, sid, "model", m.ID, configOptionTimeout)
+	}
+	applied := tier
 	if err == nil {
-		return applied, nil
+		if m.FixedTier != "" {
+			applied = m.FixedTier
+		} else if verifyConfigOptionAck(latestAck, "thought_level", tier) != nil {
+			latestAck, err = setAndVerifySessionConfigOptionRawWith(eng, sid, "thought_level", tier, configOptionTimeout)
+		}
+	}
+	if err == nil {
+		return applied, latestAck, nil
 	}
 	LogEvent("MODEL_PIN_FAILED", "closing ACP session whose model/tier could not be applied: "+m.ID+"/"+tier, map[string]any{
 		"convKey": s.ConvKey, "sessionId": sid, "model": m.ID, "thoughtLevel": tier, "error": err.Error(),
@@ -567,7 +607,7 @@ func (s *AcpProjectSession) pinSessionConfig(sid string, m *ModelInfo, tier stri
 		s.syncPhaseLocked()
 	}
 	s.mu.Unlock()
-	return "", &ModelSwitchError{From: "upstream default", To: m.ID + "/" + tier, Err: err}
+	return "", nil, &ModelSwitchError{From: "upstream default", To: m.ID + "/" + tier, Err: err}
 }
 
 // setSessionModelAndTier sets model and/or tier with strict acknowledgement and returns the tier
@@ -1749,36 +1789,21 @@ func (s *AcpProjectSession) CancelActiveTurn(reason string) {
 	}
 }
 
-func (s *AcpProjectSession) handleSessionUpdate(u map[string]any) {
-	if u == nil {
-		return
-	}
-	updType, _ := u["sessionUpdate"].(string)
-	if updType == "tool_call" || updType == "tool_call_update" {
-		s.recordReportedToolUpdate(u)
-		return
-	}
-	if updType == "usage_update" {
-		used, okU := toInt(u["used"])
-		size, okS := toInt(u["size"])
-		if subU, okM := u["usage"].(map[string]any); okM {
-			if !okU {
-				used, okU = toInt(subU["used"])
-			}
-			if !okS {
-				size, okS = toInt(subU["size"])
-			}
+func (s *AcpProjectSession) applyUsageUpdateValues(used, size int, okU, okS bool) {
+	if (okU && used >= 0) || (okS && size > 0) {
+		s.mu.Lock()
+		if okU && used >= 0 {
+			s.LastReportedContextUsed = used
 		}
-		if (okU && used >= 0) || (okS && size > 0) {
-			s.mu.Lock()
-			if okU && used >= 0 {
-				s.LastReportedContextUsed = used
-			}
-			if okS && size > 0 {
-				s.LastReportedContextSize = size
-			}
-			s.mu.Unlock()
+		if okS && size > 0 {
+			s.LastReportedContextSize = size
 		}
+		s.mu.Unlock()
+	}
+}
+
+func (s *AcpProjectSession) handleFastTextChunk(updType, text string) {
+	if text == "" {
 		return
 	}
 	s.mu.Lock()
@@ -1787,12 +1812,6 @@ func (s *AcpProjectSession) handleSessionUpdate(u map[string]any) {
 	if turn == nil {
 		return
 	}
-	content, _ := u["content"].(map[string]any)
-	text, _ := content["text"].(string)
-	if text == "" {
-		return
-	}
-
 	if updType == "agent_message_chunk" {
 		turn.mu.Lock()
 		prevInfo := turn.noticeInfo
@@ -1843,6 +1862,34 @@ func (s *AcpProjectSession) handleSessionUpdate(u map[string]any) {
 		turn.mu.Unlock()
 		turn.pushDelta(DeltaChunk{Type: "thinking", Thinking: text})
 	}
+}
+
+func (s *AcpProjectSession) handleSessionUpdate(u map[string]any) {
+	if u == nil {
+		return
+	}
+	updType, _ := u["sessionUpdate"].(string)
+	if updType == "tool_call" || updType == "tool_call_update" {
+		s.recordReportedToolUpdate(u)
+		return
+	}
+	if updType == "usage_update" {
+		used, okU := toInt(u["used"])
+		size, okS := toInt(u["size"])
+		if subU, okM := u["usage"].(map[string]any); okM {
+			if !okU {
+				used, okU = toInt(subU["used"])
+			}
+			if !okS {
+				size, okS = toInt(subU["size"])
+			}
+		}
+		s.applyUsageUpdateValues(used, size, okU, okS)
+		return
+	}
+	content, _ := u["content"].(map[string]any)
+	text, _ := content["text"].(string)
+	s.handleFastTextChunk(updType, text)
 }
 
 func (s *AcpProjectSession) waitIfClosing(maxWait time.Duration) {
@@ -2073,14 +2120,15 @@ func (s *AcpProjectSession) reloadHibernatedSession(hibSid string, toolsCatalog 
 	}
 	caps := eng.Capabilities()
 	wakeMethod := ""
+	var rawWakeRes json.RawMessage
 	var err error = errors.New("upstream does not advertise session recovery")
 	if caps.Resume {
 		wakeMethod = "session/resume"
-		_, err = eng.RPC(wakeMethod, params, 60*time.Second)
+		rawWakeRes, err = eng.RPC(wakeMethod, params, 60*time.Second)
 	}
 	if err != nil && caps.Load {
 		wakeMethod = "session/load"
-		_, err = eng.RPC(wakeMethod, params, 90*time.Second)
+		rawWakeRes, err = eng.RPC(wakeMethod, params, 90*time.Second)
 	}
 	if err != nil {
 		return err
@@ -2126,7 +2174,7 @@ func (s *AcpProjectSession) reloadHibernatedSession(hibSid string, toolsCatalog 
 
 	eng.RegisterListener(hibSid, s)
 	mInfo := ModelOrDefault(modelID)
-	appliedTier, err := s.pinSessionConfig(hibSid, mInfo, thoughtLevel)
+	appliedTier, latestAck, err := s.pinSessionConfigFromAck(hibSid, mInfo, thoughtLevel, rawWakeRes)
 	if err != nil {
 		s.mu.Lock()
 		if s.SessionID == "" && s.HibernatedSessionID == "" {
@@ -2137,7 +2185,7 @@ func (s *AcpProjectSession) reloadHibernatedSession(hibSid string, toolsCatalog 
 		s.mu.Unlock()
 		return err
 	}
-	if UseG1Credits {
+	if UseG1Credits && verifyConfigOptionAck(latestAck, "use_g1_credits", "true") != nil {
 		_ = setAndVerifySessionConfigOptionWith(eng, hibSid, "use_g1_credits", "true", configOptionTimeout)
 	}
 	s.mu.Lock()
@@ -2311,11 +2359,11 @@ func (s *AcpProjectSession) openFreshSession(toolsCatalog []ToolDef, thoughtLeve
 	modelID := s.ModelID
 	s.mu.Unlock()
 	mInfo := ModelOrDefault(modelID)
-	appliedTier, err := s.pinSessionConfig(parsedNew.SessionID, mInfo, thoughtLevel)
+	appliedTier, latestAck, err := s.pinSessionConfigFromAck(parsedNew.SessionID, mInfo, thoughtLevel, rawRes)
 	if err != nil {
 		return err
 	}
-	if UseG1Credits {
+	if UseG1Credits && verifyConfigOptionAck(latestAck, "use_g1_credits", "true") != nil {
 		_ = setAndVerifySessionConfigOptionWith(eng, parsedNew.SessionID, "use_g1_credits", "true", configOptionTimeout)
 	}
 	s.mu.Lock()

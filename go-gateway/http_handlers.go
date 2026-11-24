@@ -36,7 +36,13 @@ func clearSseWriteDeadline(w io.Writer) {
 func sendSseEvent(w io.Writer, flusher http.Flusher, evName string, data any) {
 	setSseWriteDeadline(w)
 	b, _ := json.Marshal(data)
-	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evName, string(b))
+	frame := make([]byte, 0, len(evName)+len(b)+16)
+	frame = append(frame, "event: "...)
+	frame = append(frame, evName...)
+	frame = append(frame, "\ndata: "...)
+	frame = append(frame, b...)
+	frame = append(frame, "\n\n"...)
+	_, _ = w.Write(frame)
 	if flusher != nil {
 		flusher.Flush()
 	}
@@ -44,7 +50,11 @@ func sendSseEvent(w io.Writer, flusher http.Flusher, evName string, data any) {
 
 func sendSseComment(w io.Writer, flusher http.Flusher, comment string) {
 	setSseWriteDeadline(w)
-	_, _ = fmt.Fprintf(w, ": %s\n\n", comment)
+	frame := make([]byte, 0, len(comment)+4)
+	frame = append(frame, ": "...)
+	frame = append(frame, comment...)
+	frame = append(frame, "\n\n"...)
+	_, _ = w.Write(frame)
 	if flusher != nil {
 		flusher.Flush()
 	}

@@ -19,6 +19,13 @@ type SessionListener interface {
 	OnEngineExited(sid string, exitedGen uint64)
 }
 
+// FastSessionUpdateListener is an optional fast path implemented by SessionListener to receive
+// high-frequency text/thinking chunks and integer usage updates without allocating map[string]any.
+type FastSessionUpdateListener interface {
+	HandleFastTextChunk(updType, text string)
+	HandleFastUsageUpdate(used, size int, hasUsed, hasSize bool)
+}
+
 // Engine abstracts the shared or mockable ACP child process JSON-RPC transport.
 type Engine interface {
 	EnsureStarted() error
