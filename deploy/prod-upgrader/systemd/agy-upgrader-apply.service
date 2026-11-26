@@ -1,0 +1,9 @@
+[Unit]
+Description=agy-acp-gateway: apply an update approved on the dashboard
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/agy-acp-gateway
+ExecStart=/usr/bin/python3 -I /root/agy-acp-gateway/upgrader/agy_prod_upgrader.py apply
+TimeoutStartSec=30min

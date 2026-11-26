@@ -1,0 +1,11 @@
+[Unit]
+Description=agy-acp-gateway: check for and test agy / gateway updates
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/agy-acp-gateway
+ExecStart=/usr/bin/python3 -I /root/agy-acp-gateway/upgrader/agy_prod_upgrader.py check
+TimeoutStartSec=45min
+Nice=10
