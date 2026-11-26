@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for dashboard update approvals and engine hot-switch completion
+
+[Path]
+PathExistsGlob=/root/agy-acp-gateway/data/upgrade/approvals/*.json
+PathModified=/root/agy-acp-gateway/data/upgrade/engine.json
+Unit=agy-upgrader-apply.service
+
+[Install]
+WantedBy=paths.target
