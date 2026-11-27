@@ -1,0 +1,32 @@
+services:
+  agy-acp-gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: agy-acp-gateway:local
+    container_name: agy-acp-gateway
+    restart: unless-stopped
+    stop_grace_period: 25s
+    env_file: .env
+    environment:
+      # 2 vCPU / 8 GB host: each live agy worker ~300 MB.
+      # Multi-account: every enabled non-primary account adds its own agy child
+      # (own max-live-workers budget); size mem_limit for the sum of all accounts.
+      AGY_LISTEN_HOST: "0.0.0.0"
+      AGY_MAX_LIVE_WORKERS: "${AGY_MAX_LIVE_WORKERS:-8}"
+      AGY_GLOBAL_MAX_LIVE_WORKERS: "${AGY_GLOBAL_MAX_LIVE_WORKERS:-8}"
+      AGY_IDLE_WORKER_TTL_SEC: "${AGY_IDLE_WORKER_TTL_SEC:-180}"
+      AGY_CONV_KEEP_DAYS: "${AGY_CONV_KEEP_DAYS:-4}"
+      AGY_ACP_LOG_KEEP_DAYS: "${AGY_ACP_LOG_KEEP_DAYS:-7}"
+    volumes:
+      - ./data:/data
+    ports:
+      # loopback only: 18890 for local debugging, 18891 for the OpenResty /acp/ reverse proxy
+      - "127.0.0.1:18890:18890"
+      - "127.0.0.1:18891:18891"
+    mem_limit: 3200m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,1623 @@
+package main
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"image/color"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
+	"io"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"path"
+	"strconv"
+	"strings"
+	"sync"
+	"unicode/utf8"
+)
+
+// canonicalImageStamp is an unexported in-memory sentinel type stamped onto validated inline
+// image maps. Because encoding/json cannot unmarshal into an unexported struct type, untrusted
+// HTTP JSON payloads can never forge this marker to bypass MIME sniffing or byte budgets.
+type canonicalImageStamp struct{}
+
+const canonicalImageSentinelKey = "_canonical"
+
+func isCanonicalizedImageBlock(b map[string]any) bool {
+	if b == nil {
+		return false
+	}
+	_, ok := b[canonicalImageSentinelKey].(canonicalImageStamp)
+	return ok
+}
+
+type validatedInlineImageMeta struct {
+	mime          string
+	decodedBytes  int
+	digest        string
+	normalizedB64 string // non-empty only when image bytes were normalized (e.g. grayscale APP14 strip)
+}
+
+var (
+	validatedInlineCacheMu sync.RWMutex
+	validatedInlineCache   = make(map[[32]byte]validatedInlineImageMeta)
+)
+
+const maxValidatedInlineCacheEntries = 512
+
+func hashStringSHA256(s string) [32]byte {
+	h := sha256.New()
+	_, _ = io.WriteString(h, s)
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+func lookupValidatedHistoricalImage(rawB64, fieldPath string) (map[string]any, bool, error) {
+	clean := cleanBase64Whitespace(rawB64)
+	if clean == "" {
+		return nil, false, nil
+	}
+	if MaxImageBytes > 0 {
+		maxCleanLen := ((MaxImageBytes + 2) / 3) * 4
+		if len(clean) > maxCleanLen+8 {
+			return nil, true, newMMError(http.StatusRequestEntityTooLarge, fieldPath, fmt.Sprintf("image exceeds maximum decoded size of %d bytes", MaxImageBytes))
+		}
+	}
+	key := hashStringSHA256(clean)
+	validatedInlineCacheMu.RLock()
+	meta, ok := validatedInlineCache[key]
+	validatedInlineCacheMu.RUnlock()
+	if !ok {
+		return nil, false, nil
+	}
+	if MaxImageBytes > 0 && meta.decodedBytes > MaxImageBytes {
+		return nil, true, newMMError(http.StatusRequestEntityTooLarge, fieldPath, fmt.Sprintf("image size (%d bytes) exceeds %d byte limit", meta.decodedBytes, MaxImageBytes))
+	}
+	outB64 := clean
+	if meta.normalizedB64 != "" {
+		outB64 = meta.normalizedB64
+	}
+	return map[string]any{
+		"type":                    "image",
+		"mimeType":                meta.mime,
+		"data":                    outB64,
+		"decodedBytes":            meta.decodedBytes,
+		"digest":                  meta.digest,
+		canonicalImageSentinelKey: canonicalImageStamp{},
+	}, true, nil
+}
+
+func recordValidatedInlineImage(cleanB64 string, meta validatedInlineImageMeta) {
+	if cleanB64 == "" || meta.mime == "" || meta.decodedBytes <= 0 || meta.digest == "" {
+		return
+	}
+	key := hashStringSHA256(cleanB64)
+	validatedInlineCacheMu.Lock()
+	if len(validatedInlineCache) >= maxValidatedInlineCacheEntries {
+		for k := range validatedInlineCache {
+			delete(validatedInlineCache, k)
+			if len(validatedInlineCache) < maxValidatedInlineCacheEntries*3/4 {
+				break
+			}
+		}
+	}
+	validatedInlineCache[key] = meta
+	validatedInlineCacheMu.Unlock()
+}
+
+// MultimodalValidationError represents a client-facing 400/413 multimodal input error
+// with the exact field path that failed Stage 1-3 validation.
+type MultimodalValidationError struct {
+	StatusCode int
+	FieldPath  string
+	Message    string
+}
+
+func (e *MultimodalValidationError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.FieldPath != "" {
+		return fmt.Sprintf("%s: %s", e.FieldPath, e.Message)
+	}
+	return e.Message
+}
+
+func newMMError(status int, fieldPath, msg string) error {
+	if status <= 0 {
+		status = http.StatusBadRequest
+	}
+	return &MultimodalValidationError{
+		StatusCode: status,
+		FieldPath:  fieldPath,
+		Message:    msg,
+	}
+}
+
+var allowedImageMimeMap = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+	"image/gif":  true,
+	"image/webp": true,
+	"image/heic": true,
+	"image/heif": true,
+}
+
+// sniffAllowedImageMime strictly inspects the first 16 decoded bytes and ignores any
+// client-declared MIME type or HTTP Content-Type header.
+func sniffAllowedImageMime(raw []byte) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	head := raw
+	if len(head) > 16 {
+		head = raw[:16]
+	}
+	switch {
+	case len(head) >= 8 && bytes.Equal(head[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}):
+		return "image/png", true
+	case len(head) >= 3 && head[0] == 0xff && head[1] == 0xd8 && head[2] == 0xff:
+		return "image/jpeg", true
+	case len(head) >= 6 && (string(head[:6]) == "GIF87a" || string(head[:6]) == "GIF89a"):
+		return "image/gif", true
+	case len(head) >= 12 && string(head[:4]) == "RIFF" && string(head[8:12]) == "WEBP":
+		return "image/webp", true
+	case len(head) >= 12 && string(head[4:8]) == "ftyp":
+		switch string(head[8:12]) {
+		case "heic", "heix", "hevc":
+			return "image/heic", true
+		case "mif1", "msf1":
+			return "image/heif", true
+		}
+		return "", false
+	default:
+		return "", false
+	}
+}
+
+func cleanBase64Whitespace(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.ContainsAny(s, " \t\r\n") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\t', '\r', '\n':
+			continue
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
+func decodeBoundedBase64(rawB64 string, maxBytes, overLimitStatus int, fieldPath, kind string) ([]byte, string, error) {
+	clean := cleanBase64Whitespace(rawB64)
+	if clean == "" {
+		return nil, "", newMMError(http.StatusBadRequest, fieldPath, kind+" base64 payload is empty")
+	}
+	if maxBytes > 0 {
+		// Maximum clean base64 length for maxBytes with standard padding plus tolerance.
+		maxCleanLen := ((maxBytes + 2) / 3) * 4
+		if len(clean) > maxCleanLen+8 {
+			return nil, "", newMMError(overLimitStatus, fieldPath, fmt.Sprintf("%s exceeds maximum decoded size of %d bytes", kind, maxBytes))
+		}
+	}
+	decoded, err := base64.StdEncoding.DecodeString(clean)
+	if err != nil && !strings.ContainsRune(clean, '=') {
+		decoded, err = base64.RawStdEncoding.DecodeString(clean)
+	}
+	if err != nil {
+		return nil, "", newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("invalid base64 %s payload", kind))
+	}
+	if len(decoded) == 0 {
+		return nil, "", newMMError(http.StatusBadRequest, fieldPath, kind+" payload decoded to 0 bytes")
+	}
+	if maxBytes > 0 && len(decoded) > maxBytes {
+		return nil, "", newMMError(overLimitStatus, fieldPath, fmt.Sprintf("%s decoded size (%d bytes) exceeds %d byte limit", kind, len(decoded), maxBytes))
+	}
+	cleanOut := base64.StdEncoding.EncodeToString(decoded)
+	if cleanOut == clean {
+		// Reuse caller's already-canonical base64 string without retaining the newly allocated copy.
+		cleanOut = clean
+	}
+	return decoded, cleanOut, nil
+}
+
+func inlineImageDigest(mime string, raw []byte) string {
+	h := sha256.New()
+	_, _ = io.WriteString(h, mime)
+	_, _ = h.Write([]byte{':'})
+	_, _ = io.WriteString(h, strconv.Itoa(len(raw)))
+	_, _ = h.Write([]byte{':'})
+	_, _ = h.Write(raw)
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+type jpegByteSpan struct {
+	start int
+	end   int
+}
+
+// inspectJPEGSegments performs a pure byte-level scan of JPEG markers (including progressive
+// multi-scan entropy sections) to verify structural integrity (EOI FF D9 present, no truncated
+// segment lengths), read SOF component count, and locate any Adobe APP14 segments (FF EE "Adobe\x00").
+func inspectJPEGSegments(raw []byte) (numComponents int, app14Spans []jpegByteSpan, hasEOI bool, err error) {
+	if len(raw) < 4 || raw[0] != 0xff || raw[1] != 0xd8 {
+		return 0, nil, false, fmt.Errorf("missing JPEG SOI header")
+	}
+	pos := 2
+	n := len(raw)
+	for pos < n {
+		// Find next 0xFF marker prefix; skip fill bytes per JPEG spec.
+		if raw[pos] != 0xff {
+			return 0, nil, false, fmt.Errorf("unexpected non-marker byte 0x%02x at offset %d", raw[pos], pos)
+		}
+		segStart := pos
+		for pos < n && raw[pos] == 0xff {
+			pos++
+		}
+		if pos >= n {
+			return 0, nil, false, fmt.Errorf("truncated JPEG marker at offset %d", segStart)
+		}
+		marker := raw[pos]
+		pos++
+		switch {
+		case marker == 0x00:
+			return 0, nil, false, fmt.Errorf("unexpected stuffed 0xFF00 outside scan data at offset %d", segStart)
+		case marker == 0xd9: // EOI
+			return numComponents, app14Spans, true, nil
+		case marker == 0xd8 || marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7):
+			// Standalone markers with no length field (SOI, TEM, RST0..RST7).
+			continue
+		}
+		if pos+2 > n {
+			return 0, nil, false, fmt.Errorf("truncated JPEG segment 0xFF%02X length at offset %d", marker, segStart)
+		}
+		segLen := int(binary.BigEndian.Uint16(raw[pos : pos+2]))
+		if segLen < 2 || pos+segLen > n {
+			return 0, nil, false, fmt.Errorf("corrupt or truncated JPEG segment 0xFF%02X (len=%d) at offset %d", marker, segLen, segStart)
+		}
+		payloadStart := pos + 2
+		segEnd := pos + segLen
+		payload := raw[payloadStart:segEnd]
+
+		// SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15 carry component count at payload[5].
+		if (marker >= 0xc0 && marker <= 0xc3) ||
+			(marker >= 0xc5 && marker <= 0xc7) ||
+			(marker >= 0xc9 && marker <= 0xcb) ||
+			(marker >= 0xcd && marker <= 0xcf) {
+			if len(payload) < 6 {
+				return 0, nil, false, fmt.Errorf("truncated JPEG SOF segment 0xFF%02X", marker)
+			}
+			numComponents = int(payload[5])
+		} else if marker == 0xee {
+			// Adobe APP14 marker (agy#1777): payload starts with "Adobe\x00" (version high byte 0x00)
+			// or standard 12-byte "Adobe" header.
+			if bytes.HasPrefix(payload, []byte("Adobe\x00")) || (len(payload) >= 12 && bytes.HasPrefix(payload, []byte("Adobe"))) {
+				app14Spans = append(app14Spans, jpegByteSpan{start: segStart, end: segEnd})
+			}
+		}
+
+		pos = segEnd
+		if marker == 0xda { // SOS: scan entropy-coded data until next non-stuffed/non-RST marker.
+			for pos < n {
+				ffIdx := bytes.IndexByte(raw[pos:], 0xff)
+				if ffIdx < 0 {
+					return numComponents, app14Spans, false, nil
+				}
+				mStart := pos + ffIdx
+				p := mStart
+				for p < n && raw[p] == 0xff {
+					p++
+				}
+				if p >= n {
+					return numComponents, app14Spans, false, nil
+				}
+				m := raw[p]
+				if m == 0x00 || (m >= 0xd0 && m <= 0xd7) {
+					pos = p + 1
+					continue
+				}
+				if m == 0xd9 {
+					return numComponents, app14Spans, true, nil
+				}
+				// Another segment follows (e.g. progressive JPEG DHT/SOS/COM): resume outer loop at mStart.
+				pos = mStart
+				break
+			}
+		}
+	}
+	return numComponents, app14Spans, false, nil
+}
+
+func spliceOutByteSpans(raw []byte, spans []jpegByteSpan) []byte {
+	if len(spans) == 0 {
+		return raw
+	}
+	removed := 0
+	for _, sp := range spans {
+		if sp.end > sp.start {
+			removed += sp.end - sp.start
+		}
+	}
+	out := make([]byte, 0, len(raw)-removed)
+	cursor := 0
+	for _, sp := range spans {
+		if sp.start < cursor || sp.end > len(raw) || sp.start > sp.end {
+			continue
+		}
+		out = append(out, raw[cursor:sp.start]...)
+		cursor = sp.end
+	}
+	out = append(out, raw[cursor:]...)
+	return out
+}
+
+func validateAndSanitizeJPEG(raw []byte, fieldPath string) ([]byte, bool, error) {
+	numComponents, app14Spans, hasEOI, scanErr := inspectJPEGSegments(raw)
+	if scanErr != nil {
+		return nil, false, newMMError(http.StatusBadRequest, fieldPath, "corrupt or truncated JPEG image: "+scanErr.Error())
+	}
+	if !hasEOI {
+		return nil, false, newMMError(http.StatusBadRequest, fieldPath, "corrupt or truncated JPEG image: missing EOI marker (FF D9)")
+	}
+	cfg, err := jpeg.DecodeConfig(bytes.NewReader(raw))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		msg := "corrupt or unreadable JPEG image header"
+		if err != nil {
+			msg += ": " + err.Error()
+		}
+		return nil, false, newMMError(http.StatusBadRequest, fieldPath, msg)
+	}
+	isGrayscale := numComponents == 1 || cfg.ColorModel == color.GrayModel
+	if isGrayscale && len(app14Spans) > 0 {
+		// agy#1777: grayscale JPEGs carrying an Adobe APP14 segment fail upstream with 400 INVALID_ARGUMENT.
+		// Strip the APP14 segment bytes directly without recompressing image scan data.
+		stripped := spliceOutByteSpans(raw, app14Spans)
+		if cfg2, err2 := jpeg.DecodeConfig(bytes.NewReader(stripped)); err2 == nil && cfg2.Width > 0 && cfg2.Height > 0 {
+			LogEvent("JPEG_GRAYSCALE_APP14_STRIPPED", "Stripped Adobe APP14 marker from grayscale JPEG before ACP send", map[string]any{
+				"origBytes":       len(raw),
+				"strippedBytes":   len(stripped),
+				"removedSegments": len(app14Spans),
+			})
+			return stripped, true, nil
+		}
+	}
+	return raw, false, nil
+}
+
+func validatePNGBytes(raw []byte, fieldPath string) error {
+	cfg, err := png.DecodeConfig(bytes.NewReader(raw))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		msg := "corrupt or unreadable PNG image header"
+		if err != nil {
+			msg += ": " + err.Error()
+		}
+		return newMMError(http.StatusBadRequest, fieldPath, msg)
+	}
+	// Walk PNG chunks from byte 8 (after 8-byte signature) to confirm structural framing and IEND chunk.
+	pos := 8
+	n := len(raw)
+	foundIEND := false
+	for pos < n {
+		if pos+12 > n {
+			return newMMError(http.StatusBadRequest, fieldPath, "corrupt or truncated PNG image: incomplete chunk header")
+		}
+		chunkLen := uint64(binary.BigEndian.Uint32(raw[pos : pos+4]))
+		chunkType := string(raw[pos+4 : pos+8])
+		nextPos := uint64(pos) + 12 + chunkLen
+		if nextPos > uint64(n) {
+			return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated PNG image: chunk %q exceeds payload length", chunkType))
+		}
+		if chunkType == "IEND" {
+			if chunkLen != 0 {
+				return newMMError(http.StatusBadRequest, fieldPath, "corrupt PNG image: non-empty IEND chunk")
+			}
+			foundIEND = true
+			break
+		}
+		pos = int(nextPos)
+	}
+	if !foundIEND {
+		return newMMError(http.StatusBadRequest, fieldPath, "corrupt or truncated PNG image: missing IEND chunk")
+	}
+	return nil
+}
+
+func validateGIFBytes(raw []byte, fieldPath string) error {
+	cfg, err := gif.DecodeConfig(bytes.NewReader(raw))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		msg := "corrupt or unreadable GIF image header"
+		if err != nil {
+			msg += ": " + err.Error()
+		}
+		return newMMError(http.StatusBadRequest, fieldPath, msg)
+	}
+	return nil
+}
+
+func validateWEBPBytes(raw []byte, fieldPath string) error {
+	if len(raw) < 20 {
+		return newMMError(http.StatusBadRequest, fieldPath, "corrupt or truncated WebP image: header shorter than 20 bytes")
+	}
+	riffSize := uint64(binary.LittleEndian.Uint32(raw[4:8]))
+	if riffSize < 12 {
+		return newMMError(http.StatusBadRequest, fieldPath, "corrupt WebP image: invalid RIFF length")
+	}
+	if uint64(len(raw)) < 8+riffSize {
+		return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated WebP image: RIFF expects %d bytes, got %d", 8+riffSize, len(raw)))
+	}
+	fourCC := string(raw[12:16])
+	switch fourCC {
+	case "VP8 ", "VP8L", "VP8X", "ALPH", "ANIM", "ANMF", "ICCP", "EXIF", "XMP ":
+	default:
+		return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt WebP image: unexpected chunk FourCC %q", fourCC))
+	}
+	chunkSize := uint64(binary.LittleEndian.Uint32(raw[16:20]))
+	if chunkSize == 0 || 20+chunkSize > uint64(len(raw)) {
+		return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated WebP image: chunk %q length (%d) invalid for %d-byte payload", fourCC, chunkSize, len(raw)))
+	}
+	return nil
+}
+
+func validateISOBMFFImageBytes(mime string, raw []byte, fieldPath string) error {
+	if len(raw) < 16 {
+		return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated %s image: ftyp box shorter than 16 bytes", mime))
+	}
+	n := uint64(len(raw))
+	boxSize := uint64(binary.BigEndian.Uint32(raw[0:4]))
+	var pos uint64
+	switch boxSize {
+	case 0:
+		pos = n
+	case 1:
+		if n < 24 {
+			return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated %s image: extended ftyp box header truncated", mime))
+		}
+		extSize := binary.BigEndian.Uint64(raw[8:16])
+		if extSize < 24 || extSize > n {
+			return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated %s image: extended ftyp box size %d invalid for %d-byte payload", mime, extSize, n))
+		}
+		pos = extSize
+	default:
+		if boxSize < 16 || boxSize > n {
+			return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated %s image: ftyp box size %d invalid for %d-byte payload", mime, boxSize, n))
+		}
+		pos = boxSize
+	}
+	// If additional container boxes follow ftyp, verify the next box header is not truncated mid-header.
+	if pos < n {
+		if n-pos < 8 {
+			return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated %s image: trailing box header truncated", mime))
+		}
+		nextSize := uint64(binary.BigEndian.Uint32(raw[pos : pos+4]))
+		if nextSize == 1 {
+			if n-pos < 16 {
+				return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated %s image: extended box header truncated", mime))
+			}
+			ext := binary.BigEndian.Uint64(raw[pos+8 : pos+16])
+			if ext < 16 || ext > n-pos {
+				return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated %s image: extended box length %d exceeds payload", mime, ext))
+			}
+		} else if nextSize != 0 && (nextSize < 8 || nextSize > n-pos) {
+			return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("corrupt or truncated %s image: box length %d exceeds payload", mime, nextSize))
+		}
+	}
+	return nil
+}
+
+// validateAndNormalizeImageBytes enforces lightweight format integrity after magic-byte sniffing
+// so corrupt/truncated images return clean HTTP 400 before reaching agy acp, and strips Adobe APP14
+// from grayscale JPEGs (agy#1777) without recompression.
+func validateAndNormalizeImageBytes(mime string, raw []byte, fieldPath string) ([]byte, bool, error) {
+	switch mime {
+	case "image/jpeg":
+		return validateAndSanitizeJPEG(raw, fieldPath)
+	case "image/png":
+		if err := validatePNGBytes(raw, fieldPath); err != nil {
+			return nil, false, err
+		}
+		return raw, false, nil
+	case "image/gif":
+		if err := validateGIFBytes(raw, fieldPath); err != nil {
+			return nil, false, err
+		}
+		return raw, false, nil
+	case "image/webp":
+		if err := validateWEBPBytes(raw, fieldPath); err != nil {
+			return nil, false, err
+		}
+		return raw, false, nil
+	case "image/heic", "image/heif":
+		if err := validateISOBMFFImageBytes(mime, raw, fieldPath); err != nil {
+			return nil, false, err
+		}
+		return raw, false, nil
+	default:
+		return raw, false, nil
+	}
+}
+
+func buildCanonicalInlineImage(raw []byte, cleanB64, fieldPath string) (map[string]any, error) {
+	if MaxImageBytes > 0 && len(raw) > MaxImageBytes {
+		return nil, newMMError(http.StatusRequestEntityTooLarge, fieldPath, fmt.Sprintf("image size (%d bytes) exceeds %d byte limit", len(raw), MaxImageBytes))
+	}
+	sniffed, ok := sniffAllowedImageMime(raw)
+	if !ok || !allowedImageMimeMap[sniffed] {
+		return nil, newMMError(http.StatusBadRequest, fieldPath, "unsupported or malformed image bytes; only PNG, JPEG, WEBP, GIF, HEIC, and HEIF magic headers are supported")
+	}
+	origCleanB64 := cleanB64
+	normalizedRaw, modified, valErr := validateAndNormalizeImageBytes(sniffed, raw, fieldPath)
+	if valErr != nil {
+		return nil, valErr
+	}
+	if modified {
+		raw = normalizedRaw
+		cleanB64 = base64.StdEncoding.EncodeToString(raw)
+	} else if cleanB64 == "" {
+		cleanB64 = base64.StdEncoding.EncodeToString(raw)
+	}
+	dig := inlineImageDigest(sniffed, raw)
+	meta := validatedInlineImageMeta{
+		mime:         sniffed,
+		decodedBytes: len(raw),
+		digest:       dig,
+	}
+	recordValidatedInlineImage(cleanB64, meta)
+	if modified && origCleanB64 != "" && origCleanB64 != cleanB64 {
+		origMeta := meta
+		origMeta.normalizedB64 = cleanB64
+		recordValidatedInlineImage(origCleanB64, origMeta)
+	}
+	return map[string]any{
+		"type":                    "image",
+		"mimeType":                sniffed,
+		"data":                    cleanB64,
+		"decodedBytes":            len(raw),
+		"digest":                  dig,
+		canonicalImageSentinelKey: canonicalImageStamp{},
+	}, nil
+}
+
+func decodeAndCanonicalizeImageB64(rawB64, fieldPath string, isHistorical bool) (map[string]any, error) {
+	if isHistorical {
+		if cachedBlk, handled, hErr := lookupValidatedHistoricalImage(rawB64, fieldPath); handled {
+			return cachedBlk, hErr
+		}
+	}
+	rawBytes, cleanB64, err := decodeBoundedBase64(rawB64, MaxImageBytes, http.StatusRequestEntityTooLarge, fieldPath, "image")
+	if err != nil {
+		return nil, err
+	}
+	return buildCanonicalInlineImage(rawBytes, cleanB64, fieldPath)
+}
+
+func sanitizeACPImageBlock(img map[string]any) map[string]any {
+	mimeStr, _ := img["mimeType"].(string)
+	dataStr, _ := img["data"].(string)
+	if mimeStr == "" {
+		mimeStr = "image/png"
+	}
+	return map[string]any{
+		"type":     "image",
+		"mimeType": mimeStr,
+		"data":     dataStr,
+	}
+}
+
+func normalizeMimeBase(mime string) string {
+	m := strings.ToLower(strings.TrimSpace(mime))
+	if idx := strings.IndexByte(m, ';'); idx >= 0 {
+		m = strings.TrimSpace(m[:idx])
+	}
+	return m
+}
+
+func isSupportedTextMIME(mime string) bool {
+	m := normalizeMimeBase(mime)
+	if m == "" {
+		return false
+	}
+	if strings.HasPrefix(m, "text/") {
+		return true
+	}
+	switch m {
+	case "application/json", "application/xml", "application/yaml", "application/x-yaml", "application/csv", "application/x-ndjson":
+		return true
+	}
+	if strings.HasPrefix(m, "application/") && (strings.HasSuffix(m, "+json") || strings.HasSuffix(m, "+xml")) {
+		return true
+	}
+	return false
+}
+
+var allowedTextExtensions = map[string]bool{
+	".txt":      true,
+	".md":       true,
+	".markdown": true,
+	".json":     true,
+	".jsonl":    true,
+	".ndjson":   true,
+	".csv":      true,
+	".tsv":      true,
+	".yaml":     true,
+	".yml":      true,
+	".xml":      true,
+	".log":      true,
+	".ini":      true,
+	".toml":     true,
+	".py":       true,
+	".go":       true,
+	".js":       true,
+	".ts":       true,
+	".tsx":      true,
+	".jsx":      true,
+	".html":     true,
+	".css":      true,
+	".sql":      true,
+	".sh":       true,
+}
+
+func isAllowedTextExtension(filename string) bool {
+	ext := strings.ToLower(path.Ext(strings.TrimSpace(filename)))
+	return allowedTextExtensions[ext]
+}
+
+func unpackUTF8TextBytes(raw []byte, label, fieldPath string) (map[string]any, error) {
+	maxBytes := MaxTextFileBytes
+	if maxBytes <= 0 {
+		maxBytes = 2 * 1024 * 1024
+	}
+	if len(raw) > maxBytes {
+		return nil, newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("text file (%d bytes) exceeds %d byte limit", len(raw), maxBytes))
+	}
+	if bytes.Contains(raw, []byte{0}) || !utf8.Valid(raw) {
+		return nil, newMMError(http.StatusBadRequest, fieldPath, "file attachment is not valid UTF-8 text")
+	}
+	name := strings.TrimSpace(label)
+	if name == "" {
+		name = "attachment.txt"
+	}
+	return map[string]any{
+		"type": "text",
+		"text": fmt.Sprintf("[File: %s]\n%s", name, string(raw)),
+	}, nil
+}
+
+func rejectUnsupportedMedia(mime, fieldPath string) error {
+	m := normalizeMimeBase(mime)
+	if m == "" {
+		return newMMError(http.StatusBadRequest, fieldPath, "missing or unsupported media attachment")
+	}
+	if m == "application/pdf" || strings.HasPrefix(m, "audio/") || strings.HasPrefix(m, "video/") {
+		return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("unsupported attachment media_type %q: upstream agy acp PromptCapabilities{Image:true, Audio:false} only accepts image/* binary blocks and rejects PDF/audio/video blobs (no silent drop); send raster images (PNG/JPEG/WEBP/GIF/HEIC/HEIF) or UTF-8 text files (<=2MB)", m))
+	}
+	return newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("unsupported attachment media_type %q; only raster images (PNG/JPEG/WEBP/GIF/HEIC/HEIF) and UTF-8 text files (<=2MB) are supported", m))
+}
+
+func hasPrefixFold(s, pfx string) bool {
+	return len(s) >= len(pfx) && strings.EqualFold(s[:len(pfx)], pfx)
+}
+
+func parseDataURI(rawURL string) (mime string, isBase64 bool, payload string, ok bool) {
+	if !hasPrefixFold(rawURL, "data:") {
+		return "", false, "", false
+	}
+	comma := strings.IndexByte(rawURL, ',')
+	if comma < 5 {
+		return "", false, "", false
+	}
+	header := rawURL[5:comma]
+	payload = rawURL[comma+1:]
+	parts := strings.Split(header, ";")
+	mime = normalizeMimeBase(parts[0])
+	if mime == "" {
+		mime = "text/plain"
+	}
+	for _, p := range parts[1:] {
+		if strings.EqualFold(strings.TrimSpace(p), "base64") {
+			isBase64 = true
+		}
+	}
+	return mime, isBase64, payload, true
+}
+
+func isPublicNetipAddr(addr netip.Addr) bool {
+	if !addr.IsValid() || addr.Zone() != "" {
+		return false
+	}
+	addr = addr.Unmap()
+	if !addr.IsValid() || !addr.IsGlobalUnicast() {
+		return false
+	}
+	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsMulticast() || addr.IsUnspecified() || addr.IsInterfaceLocalMulticast() {
+		return false
+	}
+	for _, pfx := range blockedIPPrefixes {
+		if pfx.Contains(addr) {
+			return false
+		}
+	}
+	return true
+}
+
+var blockedIPPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("::/96"),
+	netip.MustParsePrefix("::ffff:0:0/96"),
+	netip.MustParsePrefix("::ffff:0:0:0/96"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/32"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("fec0::/10"),
+}
+
+func validateRemoteImageURLSyntax(rawURL, fieldPath string) (string, error) {
+	uStr := strings.TrimSpace(rawURL)
+	if uStr == "" {
+		return "", newMMError(http.StatusBadRequest, fieldPath, "empty image URL")
+	}
+	if hasPrefixFold(uStr, "gs://") || hasPrefixFold(uStr, "files/") {
+		return "", newMMError(http.StatusBadRequest, fieldPath, "hosted Gemini Files / gs:// references are not supported; pass inline base64 or a public http(s) image URL")
+	}
+	if !hasPrefixFold(uStr, "http://") && !hasPrefixFold(uStr, "https://") {
+		return "", newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("unsupported URL scheme in %q; only http(s) and data: URIs are allowed", truncateRunes(uStr, 64)))
+	}
+	if !FetchRemoteImages {
+		return "", newMMError(http.StatusBadRequest, fieldPath, "remote image URLs are disabled (AGY_FETCH_IMAGES=false); send inline data:image/...;base64,... instead")
+	}
+	parsed, err := url.Parse(uStr)
+	if err != nil || parsed.Host == "" {
+		return "", newMMError(http.StatusBadRequest, fieldPath, "malformed remote image URL")
+	}
+	if strings.EqualFold(parsed.Hostname(), "generativelanguage.googleapis.com") && strings.Contains(strings.ToLower(parsed.Path), "/files/") {
+		return "", newMMError(http.StatusBadRequest, fieldPath, "hosted Gemini Files / gs:// references are not supported; pass inline base64 or a public http(s) image URL")
+	}
+	if parsed.User != nil {
+		return "", newMMError(http.StatusBadRequest, fieldPath, "credentials inside remote image URL are not permitted")
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return "", newMMError(http.StatusBadRequest, fieldPath, "missing hostname in remote image URL")
+	}
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return "", newMMError(http.StatusBadRequest, fieldPath, "loopback image URL rejected")
+	}
+	if port := parsed.Port(); port != "" && port != "80" && port != "443" {
+		return "", newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("port %q is not allowed for remote image URLs (only 80/443)", port))
+	}
+	if addr, errA := netip.ParseAddr(host); errA == nil && !isPublicNetipAddr(addr) {
+		return "", newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("non-public remote image IP %q rejected", host))
+	}
+	return uStr, nil
+}
+
+// extractSystemTextStrict converts system/developer prompt fields to plain text while rejecting
+// any image, file, or binary payload inside system/developer prompts with HTTP 400.
+func extractSystemTextStrict(sys any, fieldPath string) (string, error) {
+	switch v := sys.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return v, nil
+	case map[string]any:
+		if parts, ok := v["parts"].([]any); ok {
+			return extractSystemTextStrict(parts, fieldPath+".parts")
+		}
+		if t, ok := v["text"].(string); ok {
+			bType, _ := v["type"].(string)
+			if bType == "" || bType == "text" || bType == "input_text" || bType == "output_text" {
+				return t, nil
+			}
+		}
+		return "", newMMError(http.StatusBadRequest, fieldPath, "system/developer prompts only support plain text")
+	case []any:
+		var parts []string
+		for i, item := range v {
+			itemPath := fmt.Sprintf("%s[%d]", fieldPath, i)
+			switch b := item.(type) {
+			case string:
+				parts = append(parts, b)
+			case map[string]any:
+				if mapField(b, "inlineData", "inline_data") != nil || mapField(b, "fileData", "file_data") != nil {
+					return "", newMMError(http.StatusBadRequest, itemPath, "system/developer prompts cannot contain binary or file attachments")
+				}
+				bType, _ := b["type"].(string)
+				switch bType {
+				case "", "text", "input_text", "output_text":
+					t, okT := b["text"].(string)
+					if !okT {
+						return "", newMMError(http.StatusBadRequest, itemPath, "system/developer text block must contain a string text field")
+					}
+					parts = append(parts, t)
+				default:
+					return "", newMMError(http.StatusBadRequest, itemPath, fmt.Sprintf("system/developer prompt cannot contain %q block", bType))
+				}
+			default:
+				return "", newMMError(http.StatusBadRequest, itemPath, "invalid item in system/developer prompt")
+			}
+		}
+		return strings.Join(parts, "\n"), nil
+	default:
+		return "", newMMError(http.StatusBadRequest, fieldPath, "invalid type for system/developer prompt")
+	}
+}
+
+func normalizeDataURIBlock(rawURI, filename, fieldPath string, allowTextFile bool) (map[string]any, error) {
+	return normalizeDataURIBlockWithCtx(rawURI, filename, fieldPath, allowTextFile, false, false, nil, false)
+}
+
+func normalizeDataURIBlockWithHistory(rawURI, filename, fieldPath string, allowTextFile, isHistorical bool) (map[string]any, error) {
+	return normalizeDataURIBlockWithCtx(rawURI, filename, fieldPath, allowTextFile, false, isHistorical, nil, false)
+}
+
+func normalizeDataURIBlockWithCtx(rawURI, filename, fieldPath string, allowTextFile, allowMediaRelay, isHistorical bool, mctx *mediaNormalizeContext, inToolResult bool) (map[string]any, error) {
+	mime, isB64, payload, ok := parseDataURI(rawURI)
+	if !ok {
+		return nil, newMMError(http.StatusBadRequest, fieldPath, "malformed data: URI")
+	}
+	if mime == "image/svg+xml" {
+		return nil, newMMError(http.StatusBadRequest, fieldPath, "image/svg+xml attachments are not supported")
+	}
+	if strings.HasPrefix(mime, "image/") {
+		if !isB64 {
+			return nil, newMMError(http.StatusBadRequest, fieldPath, "image data: URI must use ;base64 encoding")
+		}
+		return decodeAndCanonicalizeImageB64(payload, fieldPath, isHistorical)
+	}
+	if allowTextFile && isSupportedTextMIME(mime) {
+		var raw []byte
+		if isB64 {
+			var err error
+			raw, _, err = decodeBoundedBase64(payload, MaxTextFileBytes, http.StatusBadRequest, fieldPath, "text file")
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			unesc, err := url.PathUnescape(payload)
+			if err != nil {
+				return nil, newMMError(http.StatusBadRequest, fieldPath, "invalid percent-encoding in text data: URI")
+			}
+			raw = []byte(unesc)
+		}
+		label := strings.TrimSpace(filename)
+		if label == "" {
+			label = mime
+		}
+		return unpackUTF8TextBytes(raw, label, fieldPath)
+	}
+	if allowMediaRelay && (mime == "application/pdf" || strings.HasPrefix(mime, "audio/") || strings.HasPrefix(mime, "video/")) {
+		if !isB64 {
+			return nil, newMMError(http.StatusBadRequest, fieldPath, "media data: URI must use ;base64 encoding")
+		}
+		return normalizeMediaAttachmentWithCtx(mctx, mime, payload, filename, fieldPath, inToolResult)
+	}
+	return nil, rejectUnsupportedMedia(mime, fieldPath)
+}
+
+func normalizeURLOrDataImageBlock(rawURL, fieldPath string, allowTextDataURI bool) (map[string]any, error) {
+	return normalizeURLOrDataImageBlockWithHistory(rawURL, fieldPath, allowTextDataURI, false)
+}
+
+func normalizeURLOrDataImageBlockWithHistory(rawURL, fieldPath string, allowTextDataURI, isHistorical bool) (map[string]any, error) {
+	uStr := strings.TrimSpace(rawURL)
+	if hasPrefixFold(uStr, "data:") {
+		return normalizeDataURIBlockWithHistory(uStr, "", fieldPath, allowTextDataURI, isHistorical)
+	}
+	cleanURL, err := validateRemoteImageURLSyntax(uStr, fieldPath)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"type": "image_ref",
+		"url":  cleanURL,
+	}, nil
+}
+
+func normalizeAnthropicFileOrDocBlock(b map[string]any, fieldPath string) (map[string]any, error) {
+	return normalizeAnthropicFileOrDocBlockWithCtx(b, fieldPath, nil, false)
+}
+
+func normalizeAnthropicFileOrDocBlockWithCtx(b map[string]any, fieldPath string, mctx *mediaNormalizeContext, inToolResult bool) (map[string]any, error) {
+	bType, _ := b["type"].(string)
+	if bType == "document" {
+		src, _ := b["source"].(map[string]any)
+		if src == nil {
+			return nil, newMMError(http.StatusBadRequest, fieldPath+".source", "document block missing source")
+		}
+		sType, _ := src["type"].(string)
+		mime, _ := src["media_type"].(string)
+		title, _ := b["title"].(string)
+		switch sType {
+		case "text":
+			if mime != "" && !isSupportedTextMIME(mime) {
+				return nil, rejectUnsupportedMedia(mime, fieldPath+".source.media_type")
+			}
+			txt, _ := src["data"].(string)
+			return unpackUTF8TextBytes([]byte(txt), title, fieldPath+".source.data")
+		case "base64":
+			if isSupportedTextMIME(mime) {
+				dataStr, _ := src["data"].(string)
+				raw, _, err := decodeBoundedBase64(dataStr, MaxTextFileBytes, http.StatusBadRequest, fieldPath+".source.data", "text file")
+				if err != nil {
+					return nil, err
+				}
+				return unpackUTF8TextBytes(raw, title, fieldPath+".source.data")
+			}
+			lowMime := normalizeMimeBase(mime)
+			if lowMime == "application/pdf" || strings.HasPrefix(lowMime, "audio/") || strings.HasPrefix(lowMime, "video/") {
+				dataStr, _ := src["data"].(string)
+				return normalizeMediaAttachmentWithCtx(mctx, lowMime, dataStr, title, fieldPath+".source.data", inToolResult)
+			}
+			return nil, rejectUnsupportedMedia(mime, fieldPath+".source.media_type")
+		case "url":
+			return nil, rejectExternalMediaURL("document/PDF", fieldPath+".source.url")
+		case "file":
+			return nil, newMMError(http.StatusBadRequest, fieldPath+".source", "hosted file_id references are not supported; inline the UTF-8 text, PDF, or image")
+		default:
+			return nil, rejectUnsupportedMedia(mime, fieldPath+".source")
+		}
+	}
+
+	// OpenAI Chat ("file") or Responses ("input_file")
+	fileMap := b
+	subPath := fieldPath
+	if sub, ok := b["file"].(map[string]any); ok {
+		fileMap = sub
+		subPath = fieldPath + ".file"
+	}
+	if fid, _ := fileMap["file_id"].(string); strings.TrimSpace(fid) != "" {
+		return nil, newMMError(http.StatusBadRequest, subPath+".file_id", "hosted file_id references are not supported")
+	}
+	if fid, _ := b["file_id"].(string); strings.TrimSpace(fid) != "" {
+		return nil, newMMError(http.StatusBadRequest, fieldPath+".file_id", "hosted file_id references are not supported")
+	}
+	if fURL, _ := fileMap["file_url"].(string); strings.TrimSpace(fURL) != "" {
+		return nil, rejectExternalMediaURL("file/PDF/audio/video", subPath+".file_url")
+	}
+	if fURL, _ := b["file_url"].(string); strings.TrimSpace(fURL) != "" {
+		return nil, rejectExternalMediaURL("file/PDF/audio/video", fieldPath+".file_url")
+	}
+	filename, _ := fileMap["filename"].(string)
+	if filename == "" {
+		filename, _ = b["filename"].(string)
+	}
+	fileData, _ := fileMap["file_data"].(string)
+	if fileData == "" {
+		fileData, _ = b["file_data"].(string)
+	}
+	fileData = strings.TrimSpace(fileData)
+	if fileData == "" {
+		return nil, newMMError(http.StatusBadRequest, subPath, "file attachment missing file_data")
+	}
+	if hasPrefixFold(fileData, "data:") {
+		return normalizeDataURIBlockWithCtx(fileData, filename, subPath+".file_data", true, true, false, mctx, inToolResult)
+	}
+	if inferredMediaMime := mediaMimeFromFilename(filename); inferredMediaMime != "" {
+		return normalizeMediaAttachmentWithCtx(mctx, inferredMediaMime, fileData, filename, subPath+".file_data", inToolResult)
+	}
+	if !isAllowedTextExtension(filename) {
+		return nil, newMMError(http.StatusBadRequest, subPath+".filename", fmt.Sprintf("unsupported file extension for %q; only UTF-8 text/code extensions, PDF/media attachments, or image/text data: URIs are accepted", filename))
+	}
+	raw, _, err := decodeBoundedBase64(fileData, MaxTextFileBytes, http.StatusBadRequest, subPath+".file_data", "text file")
+	if err != nil {
+		return nil, err
+	}
+	return unpackUTF8TextBytes(raw, filename, subPath+".file_data")
+}
+
+func normalizeMediaContentBlockWithCtx(b map[string]any, bType, fieldPath string, mctx *mediaNormalizeContext, inToolResult bool) (map[string]any, error) {
+	switch bType {
+	case "input_audio":
+		sub := b
+		subPath := fieldPath
+		if ia, ok := b["input_audio"].(map[string]any); ok && ia != nil {
+			sub = ia
+			subPath = fieldPath + ".input_audio"
+		}
+		dataStr, _ := sub["data"].(string)
+		dataStr = strings.TrimSpace(dataStr)
+		if hasPrefixFold(dataStr, "data:") {
+			return normalizeDataURIBlockWithCtx(dataStr, "", subPath+".data", false, true, false, mctx, inToolResult)
+		}
+		formatStr := strings.ToLower(strings.TrimSpace(stringField(sub, "format", "")))
+		mime := inputAudioFormatToMime[formatStr]
+		if mime == "" && strings.HasPrefix(formatStr, "audio/") {
+			mime = normalizeMimeBase(formatStr)
+		}
+		if mime == "" {
+			mime = normalizeMimeBase(stringField(sub, "mimeType", "media_type"))
+		}
+		if mime == "" {
+			mime = "audio/wav"
+		}
+		return normalizeMediaAttachmentWithCtx(mctx, mime, dataStr, "audio."+formatStr, subPath+".data", inToolResult)
+
+	case "audio_url", "video_url":
+		var uStr string
+		switch u := b[bType].(type) {
+		case string:
+			uStr = u
+		case map[string]any:
+			uStr, _ = u["url"].(string)
+		}
+		if uStr == "" {
+			uStr, _ = b["url"].(string)
+		}
+		uStr = strings.TrimSpace(uStr)
+		if uStr == "" {
+			return nil, newMMError(http.StatusBadRequest, fieldPath, bType+" block missing url")
+		}
+		if hasPrefixFold(uStr, "data:") {
+			return normalizeDataURIBlockWithCtx(uStr, "", fieldPath, false, true, false, mctx, inToolResult)
+		}
+		return nil, rejectExternalMediaURL("audio/video", fieldPath)
+
+	case "audio", "video":
+		if src, ok := b["source"].(map[string]any); ok && src != nil {
+			sType, _ := src["type"].(string)
+			mime := normalizeMimeBase(stringField(src, "media_type", "mimeType"))
+			switch sType {
+			case "base64":
+				dataStr, _ := src["data"].(string)
+				return normalizeMediaAttachmentWithCtx(mctx, mime, dataStr, "", fieldPath+".source.data", inToolResult)
+			case "url":
+				return nil, rejectExternalMediaURL("audio/video", fieldPath+".source.url")
+			default:
+				return nil, newMMError(http.StatusBadRequest, fieldPath+".source.type", fmt.Sprintf("unsupported %s source type %q", bType, sType))
+			}
+		}
+		sub := b
+		if nested, ok := b[bType].(map[string]any); ok && nested != nil {
+			sub = nested
+		}
+		if uStr, _ := sub["url"].(string); strings.TrimSpace(uStr) != "" {
+			uStr = strings.TrimSpace(uStr)
+			if hasPrefixFold(uStr, "data:") {
+				return normalizeDataURIBlockWithCtx(uStr, "", fieldPath+".url", false, true, false, mctx, inToolResult)
+			}
+			return nil, rejectExternalMediaURL("audio/video", fieldPath+".url")
+		}
+		dataStr, _ := sub["data"].(string)
+		if hasPrefixFold(strings.TrimSpace(dataStr), "data:") {
+			return normalizeDataURIBlockWithCtx(strings.TrimSpace(dataStr), "", fieldPath+".data", false, true, false, mctx, inToolResult)
+		}
+		mime := normalizeMimeBase(stringField(sub, "mimeType", "media_type"))
+		if mime == "" {
+			if fmtStr := strings.ToLower(strings.TrimSpace(stringField(sub, "format", ""))); fmtStr != "" {
+				if mapped, ok := inputAudioFormatToMime[fmtStr]; ok && bType == "audio" {
+					mime = mapped
+				} else {
+					mime = bType + "/" + fmtStr
+				}
+			}
+		}
+		return normalizeMediaAttachmentWithCtx(mctx, mime, dataStr, "", fieldPath+".data", inToolResult)
+	}
+	return nil, newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("unsupported media block type %q", bType))
+}
+
+func normalizeContentBlock(raw any, fieldPath string) (map[string]any, error) {
+	return normalizeContentBlockWithCtx(raw, fieldPath, false, nil, false)
+}
+
+func normalizeContentBlockWithHistory(raw any, fieldPath string, isHistorical bool) (map[string]any, error) {
+	return normalizeContentBlockWithCtx(raw, fieldPath, isHistorical, nil, false)
+}
+
+func normalizeContentBlockWithCtx(raw any, fieldPath string, isHistorical bool, mctx *mediaNormalizeContext, inToolResult bool) (map[string]any, error) {
+	b, ok := raw.(map[string]any)
+	if !ok {
+		if s, okS := raw.(string); okS {
+			return map[string]any{"type": "text", "text": s}, nil
+		}
+		return nil, newMMError(http.StatusBadRequest, fieldPath, "content block must be an object")
+	}
+	if b["cache_control"] != nil {
+		cleaned := make(map[string]any, len(b)-1)
+		for k, v := range b {
+			if k != "cache_control" {
+				cleaned[k] = v
+			}
+		}
+		b = cleaned
+	}
+	bType, _ := b["type"].(string)
+	switch bType {
+	case "text", "input_text", "output_text":
+		return b, nil
+	case "media_relay":
+		if isCanonicalMediaRelayBlock(b) {
+			return b, nil
+		}
+		return nil, newMMError(http.StatusBadRequest, fieldPath, "unsupported content block type \"media_relay\"")
+	case "refusal":
+		if ref, okR := b["refusal"].(string); okR {
+			return map[string]any{"type": "text", "text": ref}, nil
+		}
+		return b, nil
+	case "thinking", "redacted_thinking", "tool_use":
+		return b, nil
+	case "tool_result":
+		if bc, exists := b["content"]; exists && bc != nil {
+			normChild, err := normalizeContentValueWithCtx(bc, fieldPath+".content", isHistorical, mctx, true)
+			if err != nil {
+				return nil, err
+			}
+			cloned := make(map[string]any, len(b))
+			for k, v := range b {
+				cloned[k] = v
+			}
+			cloned["content"] = normChild
+			return cloned, nil
+		}
+		return b, nil
+	case "image":
+		// Only trust the canonical fast-path when stamped by our unexported in-memory sentinel.
+		if isCanonicalizedImageBlock(b) {
+			if nBytes, okB := toInt(b["decodedBytes"]); okB && MaxImageBytes > 0 && nBytes > MaxImageBytes {
+				return nil, newMMError(http.StatusRequestEntityTooLarge, fieldPath, fmt.Sprintf("image size (%d bytes) exceeds %d byte limit", nBytes, MaxImageBytes))
+			}
+			return b, nil
+		}
+		if b["decodedBytes"] != nil || b["digest"] != nil || b[canonicalImageSentinelKey] != nil {
+			cleaned := make(map[string]any, len(b))
+			for k, v := range b {
+				if k == "decodedBytes" || k == "digest" || k == canonicalImageSentinelKey {
+					continue
+				}
+				cleaned[k] = v
+			}
+			b = cleaned
+		}
+		if dataStr, okD := b["data"].(string); okD && b["source"] == nil {
+			if rawMime, _ := b["mimeType"].(string); rawMime != "" {
+				if strings.EqualFold(normalizeMimeBase(rawMime), "image/svg+xml") {
+					return nil, newMMError(http.StatusBadRequest, fieldPath+".mimeType", "image/svg+xml attachments are not supported")
+				}
+				if !hasPrefixFold(strings.TrimSpace(rawMime), "image/") {
+					return nil, rejectUnsupportedMedia(rawMime, fieldPath+".mimeType")
+				}
+			}
+			if rawMime, _ := b["media_type"].(string); rawMime != "" {
+				if strings.EqualFold(normalizeMimeBase(rawMime), "image/svg+xml") {
+					return nil, newMMError(http.StatusBadRequest, fieldPath+".media_type", "image/svg+xml attachments are not supported")
+				}
+				if !hasPrefixFold(strings.TrimSpace(rawMime), "image/") {
+					return nil, rejectUnsupportedMedia(rawMime, fieldPath+".media_type")
+				}
+			}
+			return decodeAndCanonicalizeImageB64(dataStr, fieldPath+".data", isHistorical)
+		}
+		src, _ := b["source"].(map[string]any)
+		if src == nil {
+			return nil, newMMError(http.StatusBadRequest, fieldPath+".source", "image block missing source")
+		}
+		sType, _ := src["type"].(string)
+		switch sType {
+		case "base64":
+			mime, _ := src["media_type"].(string)
+			if strings.EqualFold(normalizeMimeBase(mime), "image/svg+xml") {
+				return nil, newMMError(http.StatusBadRequest, fieldPath+".source.media_type", "image/svg+xml attachments are not supported")
+			}
+			if mime != "" && !hasPrefixFold(strings.TrimSpace(mime), "image/") {
+				return nil, rejectUnsupportedMedia(mime, fieldPath+".source.media_type")
+			}
+			dataStr, _ := src["data"].(string)
+			return decodeAndCanonicalizeImageB64(dataStr, fieldPath+".source.data", isHistorical)
+		case "url":
+			uStr, _ := src["url"].(string)
+			return normalizeURLOrDataImageBlockWithHistory(uStr, fieldPath+".source.url", false, isHistorical)
+		case "file":
+			return nil, newMMError(http.StatusBadRequest, fieldPath+".source", "hosted file_id references are not supported in image blocks")
+		default:
+			return nil, newMMError(http.StatusBadRequest, fieldPath+".source.type", fmt.Sprintf("unsupported image source type %q", sType))
+		}
+	case "image_ref":
+		uStr, _ := b["url"].(string)
+		return normalizeURLOrDataImageBlockWithHistory(uStr, fieldPath+".url", false, isHistorical)
+	case "image_url", "input_image":
+		var uStr string
+		switch u := b["image_url"].(type) {
+		case string:
+			uStr = u
+		case map[string]any:
+			uStr, _ = u["url"].(string)
+		}
+		if uStr == "" {
+			uStr, _ = b["url"].(string)
+		}
+		if uStr == "" {
+			if fid, _ := b["file_id"].(string); strings.TrimSpace(fid) != "" {
+				return nil, newMMError(http.StatusBadRequest, fieldPath+".file_id", "hosted file_id references are not supported")
+			}
+			return nil, newMMError(http.StatusBadRequest, fieldPath, bType+" block missing image URL")
+		}
+		return normalizeURLOrDataImageBlockWithHistory(uStr, fieldPath, false, isHistorical)
+	case "file", "input_file", "document":
+		return normalizeAnthropicFileOrDocBlockWithCtx(b, fieldPath, mctx, inToolResult)
+	case "input_audio", "audio", "audio_url", "video", "video_url":
+		return normalizeMediaContentBlockWithCtx(b, bType, fieldPath, mctx, inToolResult)
+	default:
+		if b["file_id"] != nil {
+			return nil, newMMError(http.StatusBadRequest, fieldPath+".file_id", "hosted file_id references are not supported")
+		}
+		if b["file_data"] != nil {
+			return normalizeAnthropicFileOrDocBlockWithCtx(b, fieldPath, mctx, inToolResult)
+		}
+		if b["input_audio"] != nil {
+			return normalizeMediaContentBlockWithCtx(b, "input_audio", fieldPath, mctx, inToolResult)
+		}
+		if b["audio"] != nil {
+			return normalizeMediaContentBlockWithCtx(b, "audio", fieldPath, mctx, inToolResult)
+		}
+		if b["video"] != nil {
+			return normalizeMediaContentBlockWithCtx(b, "video", fieldPath, mctx, inToolResult)
+		}
+		if inl := mapField(b, "inlineData", "inline_data"); inl != nil {
+			return normalizeGeminiInlineAttachmentWithCtx(inl, fieldPath+".inlineData", isHistorical, mctx, inToolResult)
+		}
+		if fd := mapField(b, "fileData", "file_data"); fd != nil {
+			return normalizeGeminiFileAttachmentWithCtx(fd, fieldPath+".fileData", mctx, inToolResult)
+		}
+		return b, nil
+	}
+}
+
+func normalizeContentValue(val any, fieldPath string) (any, error) {
+	return normalizeContentValueWithCtx(val, fieldPath, false, nil, false)
+}
+
+func normalizeContentValueWithHistory(val any, fieldPath string, isHistorical bool) (any, error) {
+	return normalizeContentValueWithCtx(val, fieldPath, isHistorical, nil, false)
+}
+
+func normalizeContentValueWithCtx(val any, fieldPath string, isHistorical bool, mctx *mediaNormalizeContext, inToolResult bool) (any, error) {
+	switch v := val.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		return v, nil
+	case map[string]any:
+		nb, err := normalizeContentBlockWithCtx(v, fieldPath, isHistorical, mctx, inToolResult)
+		if err != nil {
+			return nil, err
+		}
+		return []any{nb}, nil
+	case []any:
+		out := make([]any, 0, len(v))
+		for i, item := range v {
+			nb, err := normalizeContentBlockWithCtx(item, fmt.Sprintf("%s[%d]", fieldPath, i), isHistorical, mctx, inToolResult)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, nb)
+		}
+		return out, nil
+	case []map[string]any:
+		out := make([]any, 0, len(v))
+		for i, item := range v {
+			nb, err := normalizeContentBlockWithCtx(item, fmt.Sprintf("%s[%d]", fieldPath, i), isHistorical, mctx, inToolResult)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, nb)
+		}
+		return out, nil
+	default:
+		return val, nil
+	}
+}
+
+func normalizeGeminiInlineAttachment(inl map[string]any, fieldPath string) (map[string]any, error) {
+	return normalizeGeminiInlineAttachmentWithCtx(inl, fieldPath, false, nil, false)
+}
+
+func normalizeGeminiInlineAttachmentWithHistory(inl map[string]any, fieldPath string, isHistorical bool) (map[string]any, error) {
+	return normalizeGeminiInlineAttachmentWithCtx(inl, fieldPath, isHistorical, nil, false)
+}
+
+func normalizeGeminiInlineAttachmentWithCtx(inl map[string]any, fieldPath string, isHistorical bool, mctx *mediaNormalizeContext, inToolResult bool) (map[string]any, error) {
+	mime := strings.TrimSpace(stringField(inl, "mimeType", "mime_type"))
+	data := strings.TrimSpace(stringField(inl, "data", ""))
+	lowMime := normalizeMimeBase(mime)
+	if data == "" {
+		return nil, newMMError(http.StatusBadRequest, fieldPath+".data", "inlineData missing data")
+	}
+	if lowMime == "image/svg+xml" {
+		return nil, newMMError(http.StatusBadRequest, fieldPath+".mimeType", "image/svg+xml attachments are not supported")
+	}
+	if strings.HasPrefix(lowMime, "image/") {
+		return decodeAndCanonicalizeImageB64(data, fieldPath+".data", isHistorical)
+	}
+	if isSupportedTextMIME(lowMime) {
+		raw, _, err := decodeBoundedBase64(data, MaxTextFileBytes, http.StatusBadRequest, fieldPath+".data", "text file")
+		if err != nil {
+			return nil, err
+		}
+		return unpackUTF8TextBytes(raw, "inline ("+lowMime+")", fieldPath+".data")
+	}
+	if lowMime == "application/pdf" || strings.HasPrefix(lowMime, "audio/") || strings.HasPrefix(lowMime, "video/") {
+		return normalizeMediaAttachmentWithCtx(mctx, lowMime, data, "", fieldPath+".data", inToolResult)
+	}
+	return nil, rejectUnsupportedMedia(lowMime, fieldPath+".mimeType")
+}
+
+func normalizeGeminiFileAttachment(fd map[string]any, fieldPath string) (map[string]any, error) {
+	return normalizeGeminiFileAttachmentWithCtx(fd, fieldPath, nil, false)
+}
+
+func normalizeGeminiFileAttachmentWithCtx(fd map[string]any, fieldPath string, mctx *mediaNormalizeContext, inToolResult bool) (map[string]any, error) {
+	uri := strings.TrimSpace(stringField(fd, "fileUri", "file_uri"))
+	mime := strings.TrimSpace(stringField(fd, "mimeType", "mime_type"))
+	if uri == "" {
+		return nil, newMMError(http.StatusBadRequest, fieldPath+".fileUri", "fileData missing fileUri")
+	}
+	if hasPrefixFold(uri, "data:") {
+		return normalizeDataURIBlockWithCtx(uri, "", fieldPath+".fileUri", true, true, false, mctx, inToolResult)
+	}
+	if mime != "" {
+		lowMime := normalizeMimeBase(mime)
+		if lowMime == "application/pdf" || strings.HasPrefix(lowMime, "audio/") || strings.HasPrefix(lowMime, "video/") {
+			return nil, rejectExternalMediaURL(lowMime, fieldPath+".fileUri")
+		}
+		if lowMime == "image/svg+xml" || !strings.HasPrefix(lowMime, "image/") {
+			return nil, rejectUnsupportedMedia(lowMime, fieldPath+".mimeType")
+		}
+	}
+	cleanURL, err := validateRemoteImageURLSyntax(uri, fieldPath+".fileUri")
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"type": "image_ref",
+		"url":  cleanURL,
+	}, nil
+}
+
+// CanonicalizeAndValidateMessages runs Stage 1 validation & canonicalization across all 4 protocols.
+func CanonicalizeAndValidateMessages(body map[string]any, messages []map[string]any, protocol string) error {
+	return canonicalizeAndValidateMessagesWithCtx(body, messages, protocol, newMediaNormalizeContext(body, messages))
+}
+
+func canonicalizeAndValidateMessagesWithCtx(body map[string]any, messages []map[string]any, protocol string, mctx *mediaNormalizeContext) error {
+	if body != nil {
+		if sys, hasSys := body["system"]; hasSys && sys != nil {
+			sysStr, err := extractSystemTextStrict(sys, "system")
+			if err != nil {
+				return err
+			}
+			body["system"] = sysStr
+		}
+	}
+	if mctx == nil {
+		mctx = newMediaNormalizeContext(body, messages)
+	}
+	turnStartIdx := latestTurnStartIndex(messages)
+	for i, m := range messages {
+		if m == nil {
+			continue
+		}
+		delete(m, "cache_control")
+		msgPath := fmt.Sprintf("messages[%d]", i)
+		if m["audio"] != nil {
+			return newMMError(http.StatusBadRequest, msgPath+".audio", "unsupported audio message input: send audio as an inline input_audio / audio_url data: URI block")
+		}
+		if c, hasC := m["content"]; hasC && c != nil {
+			normContent, err := normalizeContentValueWithCtx(c, msgPath+".content", i < turnStartIdx, mctx, false)
+			if err != nil {
+				return err
+			}
+			m["content"] = normContent
+		}
+	}
+	return nil
+}
+
+func walkMessageMediaBlocks(m map[string]any, visit func(b map[string]any, inToolResult bool)) {
+	if m == nil {
+		return
+	}
+	var walkArr func(val any, inTR bool)
+	walkArr = func(val any, inTR bool) {
+		switch arr := val.(type) {
+		case []any:
+			for _, item := range arr {
+				if bm, ok := item.(map[string]any); ok {
+					bType, _ := bm["type"].(string)
+					if bType == "tool_result" {
+						walkArr(bm["content"], true)
+						continue
+					}
+					visit(bm, inTR)
+				}
+			}
+		case []map[string]any:
+			for _, bm := range arr {
+				bType, _ := bm["type"].(string)
+				if bType == "tool_result" {
+					walkArr(bm["content"], true)
+					continue
+				}
+				visit(bm, inTR)
+			}
+		case map[string]any:
+			bType, _ := arr["type"].(string)
+			if bType == "tool_result" {
+				walkArr(arr["content"], true)
+				return
+			}
+			visit(arr, inTR)
+		}
+	}
+	walkArr(m["content"], false)
+}
+
+func inlineImageDecodedBytes(b map[string]any) int {
+	if isCanonicalizedImageBlock(b) {
+		if n, ok := toInt(b["decodedBytes"]); ok && n > 0 {
+			return n
+		}
+	} else if n, ok := b["decodedBytes"].(int); ok && n > 0 {
+		// Go-native int only (never produced by encoding/json unmarshal of untrusted HTTP JSON,
+		// and normalizeContentBlock strips untrusted decodedBytes on Stage 1 anyway).
+		return n
+	}
+	if dataStr, ok := b["data"].(string); ok && dataStr != "" {
+		clean := cleanBase64Whitespace(dataStr)
+		return (len(clean) * 3) / 4
+	}
+	if src, ok := b["source"].(map[string]any); ok {
+		if dataStr, okD := src["data"].(string); okD && dataStr != "" {
+			clean := cleanBase64Whitespace(dataStr)
+			return (len(clean) * 3) / 4
+		}
+	}
+	return 0
+}
+
+func inlineImageSummaryKB(b map[string]any) int {
+	kb := inlineImageDecodedBytes(b) / 1024
+	if kb < 1 {
+		kb = 1
+	}
+	return kb
+}
+
+func imageFingerprintTokens(m map[string]any) []string {
+	var tokens []string
+	walkMessageMediaBlocks(m, func(b map[string]any, _ bool) {
+		bType, _ := b["type"].(string)
+		switch bType {
+		case "image":
+			if isCanonicalizedImageBlock(b) {
+				if dig, ok := b["digest"].(string); ok && dig != "" {
+					tokens = append(tokens, "img:"+dig)
+					return
+				}
+			}
+			if dataStr, ok := b["data"].(string); ok && dataStr != "" {
+				tokens = append(tokens, "img:"+inlineImageDigest("image", []byte(dataStr)))
+				return
+			}
+			if src, ok := b["source"].(map[string]any); ok {
+				if dataStr, okD := src["data"].(string); okD && dataStr != "" {
+					tokens = append(tokens, "img:"+inlineImageDigest("image", []byte(dataStr)))
+				}
+			}
+		case "image_ref":
+			if u, ok := b["url"].(string); ok && u != "" {
+				tokens = append(tokens, "imgurl:"+shortSha256(u))
+			}
+		case "media_relay":
+			if isCanonicalMediaRelayBlock(b) {
+				if dig, ok := b["digest"].(string); ok && dig != "" {
+					tokens = append(tokens, "media:"+dig)
+				}
+			}
+		case "image_url", "input_image":
+			var uStr string
+			switch u := b["image_url"].(type) {
+			case string:
+				uStr = u
+			case map[string]any:
+				uStr, _ = u["url"].(string)
+			}
+			if uStr == "" {
+				uStr, _ = b["url"].(string)
+			}
+			if uStr != "" {
+				tokens = append(tokens, "imgurl:"+shortSha256(uStr))
+			}
+		}
+	})
+	return tokens
+}
+
+func latestTurnStartIndex(messages []map[string]any) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if role, _ := messages[i]["role"].(string); role == "assistant" {
+			if i+1 < len(messages) {
+				return i + 1
+			}
+			return len(messages)
+		}
+	}
+	return 0
+}
+
+func countMessageImagesAndBytes(m map[string]any) (count int, bytesSum int) {
+	walkMessageMediaBlocks(m, func(b map[string]any, _ bool) {
+		bType, _ := b["type"].(string)
+		switch bType {
+		case "image":
+			count++
+			bytesSum += inlineImageDecodedBytes(b)
+		case "image_ref", "image_url", "input_image":
+			count++
+		}
+	})
+	return count, bytesSum
+}
+
+// validateLatestTurnImageBudget enforces model-family MaxImages (400) and prompt byte budget
+// (413) on the current turn while returning total image count across the request for count_tokens.
+func validateLatestTurnImageBudget(messages []map[string]any, m *ModelInfo) (latestImgs, totalImgs, latestBytes int, err error) {
+	maxImgs := effectiveModelMaxImages(m)
+	modelName := DefaultModelID
+	if m != nil && m.ID != "" {
+		modelName = m.ID
+	}
+	start := latestTurnStartIndex(messages)
+	for i, msg := range messages {
+		cnt, bSum := countMessageImagesAndBytes(msg)
+		totalImgs += cnt
+		if i >= start {
+			latestImgs += cnt
+			latestBytes += bSum
+		}
+	}
+	if maxImgs > 0 && latestImgs > maxImgs {
+		return latestImgs, totalImgs, latestBytes, newMMError(
+			http.StatusBadRequest,
+			"messages",
+			fmt.Sprintf("latest turn has %d image(s), exceeding limit of %d for model %s", latestImgs, maxImgs, modelName),
+		)
+	}
+	if MaxPromptImageBytes > 0 && latestBytes > MaxPromptImageBytes {
+		return latestImgs, totalImgs, latestBytes, newMMError(
+			http.StatusRequestEntityTooLarge,
+			"messages",
+			fmt.Sprintf("latest turn inline images (%d decoded bytes) exceed %d byte prompt limit", latestBytes, MaxPromptImageBytes),
+		)
+	}
+	return latestImgs, totalImgs, latestBytes, nil
+}
