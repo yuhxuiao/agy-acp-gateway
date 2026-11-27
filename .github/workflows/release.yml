@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create and publish (e.g. v2.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Offline & Race Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-gateway/go.mod
+          cache-dependency-path: go-gateway/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Go format, vet & race tests
+        working-directory: go-gateway
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [[ -n "$unformatted" ]]; then
+            echo "Unformatted Go files:" >&2
+            printf '%s\n' "$unformatted" >&2
+            exit 1
+          fi
+          CGO_ENABLED=0 go vet ./... ./testdata/fakeacp/...
+          go test -race -count=1 ./... ./testdata/fakeacp/...
+
+      - name: Python unit & shell syntax checks
+        run: |
+          set -euo pipefail
+          python3 -W error -m unittest discover -s scripts -p "test_*.py" -v
+          python3 -W error -m unittest discover -s deploy/prod-upgrader -p "test_*.py" -v
+          bash -n scripts/gw.sh scripts/agy-upgrade.sh deploy/prod-upgrader/gateway_release.sh
+          sh -n deploy/prod-upgrader/gateway_release.sh
+
+  release:
+    name: Build & Publish Release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_TAG: ${{ inputs.tag }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go-gateway/go.mod
+          cache-dependency-path: go-gateway/go.sum
+
+      - name: Cross-compile pure-Go binaries & SHA256SUMS
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG" >&2
+            exit 1
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+          DIST="${RUNNER_TEMP}/release-dist"
+          mkdir -p "${DIST}/stage"
+          echo "RELEASE_DIST=${DIST}" >> "$GITHUB_ENV"
+
+          targets=(
+            "linux amd64"
+            "linux arm64"
+            "darwin amd64"
+            "darwin arm64"
+          )
+
+          for entry in "${targets[@]}"; do
+            read -r goos goarch <<< "$entry"
+            pkg="agy-acp-gateway_${TAG}_${goos}_${goarch}"
+            stage="${DIST}/stage/${pkg}"
+            mkdir -p "$stage"
+            (
+              cd go-gateway
+              CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+                go build -trimpath -ldflags="-s -w" -o "${stage}/agy-acp-gateway" .
+            )
+            chmod 755 "${stage}/agy-acp-gateway"
+            cp LICENSE README.md README_ZH.md .env.example "$stage/"
+            tar -C "${DIST}/stage" -czf "${DIST}/${pkg}.tar.gz" "$pkg"
+          done
+
+          (
+            cd "$DIST"
+            sha256sum agy-acp-gateway_"${TAG}"_*.tar.gz > SHA256SUMS
+            cat SHA256SUMS
+          )
+
+      - name: Create or update GitHub Release
+        run: |
+          set -euo pipefail
+          TAG="$RELEASE_TAG"
+          DIST="$RELEASE_DIST"
+          NOTES_FILE="${DIST}/release-notes.md"
+          cat > "$NOTES_FILE" <<'EOF'
+          Precompiled zero-CGO (`CGO_ENABLED=0`) `agy-acp-gateway` binaries (`linux_amd64`, `linux_arm64`, `darwin_amd64`, `darwin_arm64`) and `SHA256SUMS`.
+
+          - Google's proprietary `agy` CLI (`agy-acp-900k`) is **never** bundled. Install the official `agy` CLI locally and apply the open-source patchers (`third_party/agy-context-unlock/agy-patch.py` and `tools/agy_extra_patch.py`, or `scripts/agy-upgrade.sh`) before running.
+          - Native Windows binaries are omitted because the gateway uses POSIX process-group cleanup (`linux/amd64` builds run on Linux, Docker, and WSL2).
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${DIST}"/*.tar.gz "${DIST}/SHA256SUMS" --clobber
+          else
+            gh release create "$TAG" \
+              "${DIST}"/*.tar.gz "${DIST}/SHA256SUMS" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes-file "$NOTES_FILE"
+          fi

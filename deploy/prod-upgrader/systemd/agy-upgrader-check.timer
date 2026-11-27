@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily agy-acp-gateway update check
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=45min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
