@@ -84,6 +84,8 @@ type Snapshot struct {
 	ConvDirEnv                   string
 	AppConvDirRaw                string
 	UpgradeDirEnv                string
+	BlockedAgyVersionsRaw        string
+	BlockedAgyVersionsEnvSet     bool
 	UpstreamProxy                string
 	ChildGoMemLimit              string
 	ChildGatewayGoMemLimit       string
@@ -424,6 +426,7 @@ func LoadFromEnv() *Snapshot {
 	monSoftPro, monSoftProSet := envIntWithSet("AGY_MONITOR_SOFT_CAP_PRO", 2100)
 	monDrainPro, monDrainProSet := envIntWithSet("AGY_MONITOR_DRAIN_CAP_PRO", 2900)
 	monHardPro, monHardProSet := envIntWithSet("AGY_MONITOR_HARD_CAP_PRO", 3400)
+	blockedAgyVersionsRaw, blockedAgyVersionsEnvSet := os.LookupEnv("AGY_BLOCKED_VERSIONS")
 	return &Snapshot{
 		ProjectHome:                  home,
 		PatchedAgyBin:                EnvStr("AGY_ACP_BIN", filepath.Join(home, "bin", "agy-acp-900k")),
@@ -495,6 +498,8 @@ func LoadFromEnv() *Snapshot {
 		ConvDirEnv:                   strings.TrimSpace(os.Getenv("AGY_CONV_DIR")),
 		AppConvDirRaw:                strings.TrimSpace(os.Getenv("AGY_APP_CONV_DIR")),
 		UpgradeDirEnv:                strings.TrimSpace(os.Getenv("AGY_UPGRADE_DIR")),
+		BlockedAgyVersionsRaw:        blockedAgyVersionsRaw,
+		BlockedAgyVersionsEnvSet:     blockedAgyVersionsEnvSet,
 		UpstreamProxy:                strings.TrimSpace(os.Getenv("AGY_UPSTREAM_PROXY")),
 		ChildGoMemLimit:              EnvStr("AGY_CHILD_GOMEMLIMIT", "150MiB"),
 		ChildGatewayGoMemLimit:       EnvStr("AGY_CHILD_GATEWAY_GOMEMLIMIT", "80MiB"),

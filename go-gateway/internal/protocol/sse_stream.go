@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -209,6 +210,13 @@ func (s *SSEStreamSession) WriteRaw(raw string) bool {
 	return s.writeLocked(raw)
 }
 
+// WriteRawBytes commits headers if needed, renews the write deadline, writes raw bytes without string copy, and flushes.
+func (s *SSEStreamSession) WriteRawBytes(raw []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writeBytesLocked(raw)
+}
+
 // WriteSSEEvent marshals payload as JSON and writes an `event: <ev>\ndata: <json>\n\n` frame.
 func (s *SSEStreamSession) WriteSSEEvent(evName string, payload any) bool {
 	s.mu.Lock()
@@ -302,6 +310,55 @@ func (sw *StreamWriter) CommitErrorStatus(statusCode int, extraHeaders map[strin
 // WriteRaw writes raw bytes with header commitment, write-deadline renewal, and Flush.
 func (sw *StreamWriter) WriteRaw(raw string) bool {
 	return sw.s.writeLocked(raw)
+}
+
+// WriteRawBytes writes raw bytes without string conversion, with header commitment, write-deadline renewal, and Flush.
+func (sw *StreamWriter) WriteRawBytes(raw []byte) bool {
+	return sw.s.writeBytesLocked(raw)
+}
+
+type streamChunkWriter struct {
+	s *SSEStreamSession
+}
+
+func (cw *streamChunkWriter) Write(p []byte) (int, error) {
+	if cw.s.writeFailed {
+		return 0, http.ErrAbortHandler
+	}
+	if !cw.s.headersCommitted {
+		cw.s.applyStreamHeadersLocked()
+		cw.s.headersCommitted = true
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	cw.s.renewDeadlineLocked()
+	n, err := cw.s.w.Write(p)
+	if err != nil {
+		cw.s.writeFailed = true
+	}
+	return n, err
+}
+
+// WriteStream commits headers if needed and invokes fn with an io.Writer that renews write
+// deadlines per chunk, then flushes once after fn completes.
+func (sw *StreamWriter) WriteStream(fn func(w io.Writer) error) bool {
+	if sw.s.writeFailed || fn == nil {
+		return false
+	}
+	if !sw.s.headersCommitted {
+		sw.s.applyStreamHeadersLocked()
+		sw.s.headersCommitted = true
+	}
+	cw := &streamChunkWriter{s: sw.s}
+	if err := fn(cw); err != nil {
+		sw.s.writeFailed = true
+		return false
+	}
+	if sw.s.flusher != nil {
+		sw.s.flusher.Flush()
+	}
+	return !sw.s.writeFailed
 }
 
 // WriteSSEEvent writes `event: <evName>\ndata: <json>\n\n` with deadline renewal & Flush.

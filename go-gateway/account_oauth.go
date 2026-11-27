@@ -963,6 +963,7 @@ func (am *AccountManager) probeAccountModelsTier(acc AccountProfile) (tierLabel 
 	cmd := exec.CommandContext(ctx, PatchedAgyBin, am.accountModelsCmdArgs(acc.ID)...)
 	cmd.Dir = homeDir
 	cmd.Env = am.buildAccountSubprocessEnv(homeDir, proxy)
+	configureQuotaSubprocess(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "已写入凭据", 0
@@ -1050,6 +1051,7 @@ func (am *AccountManager) ProbeAccountEgress(accountID string) (map[string]any, 
 		cmd := exec.CommandContext(ctx, PatchedAgyBin, am.accountModelsCmdArgs(acc.ID)...)
 		cmd.Dir = homeDir
 		cmd.Env = am.buildAccountSubprocessEnv(homeDir, proxyStr)
+		configureQuotaSubprocess(cmd)
 		out, cmdErr := cmd.CombinedOutput()
 		cancel()
 		if cmdErr != nil {

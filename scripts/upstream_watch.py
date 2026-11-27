@@ -11,7 +11,21 @@ import re
 import tarfile
 import urllib.request
 
-from agy_upgrade import ROOT, STATE, build_candidate, checked_path, sha, source_digest, upgrade_lock, version, write_json
+from agy_upgrade import (
+    DEFAULT_BLOCKED_AGY_VERSIONS,
+    ROOT,
+    STATE,
+    allow_blocked_env,
+    blocked_agy_reason,
+    build_candidate,
+    checked_path,
+    ensure_version_not_blocked,
+    sha,
+    source_digest,
+    upgrade_lock,
+    version,
+    write_json,
+)
 
 OFFICIAL = "google-antigravity/antigravity-cli"
 UPDATER_MANIFEST_BASE = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests"
@@ -162,7 +176,8 @@ def _extract_verified_binary(archive, directory, expected_tag):
     return binary
 
 
-def download_official(release):
+def download_official(release, *, allow_blocked=False):
+    ensure_version_not_blocked(release.get("tag_name", ""), allow_blocked=allow_blocked, context="official agy")
     if release.get("source") != "manifest":
         try:
             asset = select_asset(release)
@@ -239,8 +254,16 @@ def _attempt_digest(release):
 
 
 def snapshot(release):
-    data = {"checked_at": dt.datetime.now(dt.timezone.utc).isoformat(), "official": {
-        "version": release["tag_name"], "published_at": release.get("published_at", ""), "url": release.get("html_url", "")}, "references": []}
+    reason = blocked_agy_reason(release.get("tag_name", ""))
+    official = {
+        "version": release["tag_name"],
+        "published_at": release.get("published_at", ""),
+        "url": release.get("html_url", ""),
+        "blocked": bool(reason),
+    }
+    if reason:
+        official["blocked_reason"] = reason
+    data = {"checked_at": dt.datetime.now(dt.timezone.utc).isoformat(), "official": official, "references": []}
     for repo in REFERENCES:
         item = {"repo": repo}
         for kind, suffix in [("release", "releases/latest"), ("commit", "commits?per_page=1")]:
@@ -261,15 +284,36 @@ def main():
     ap.add_argument("--download", action="store_true", help="download and verify the official stable asset only")
     ap.add_argument("--prepare", action="store_true", help="prepare changed stable versions with fake/ACP checks, zero prompts")
     ap.add_argument("--official-only", action="store_true", help="skip reference repository metadata")
+    ap.add_argument("--allow-blocked", action="store_true", help="override DEFAULT_BLOCKED_AGY_VERSIONS guard")
     args = ap.parse_args()
     with upgrade_lock():
         release = latest_official()
-        data = {"official": {"version": release["tag_name"], "published_at": release.get("published_at", "")}} if args.official_only else snapshot(release)
+        blocked_reason = blocked_agy_reason(release["tag_name"])
+        override_blocked = bool(args.allow_blocked or allow_blocked_env())
+        if args.official_only:
+            official_info = {
+                "version": release["tag_name"],
+                "published_at": release.get("published_at", ""),
+                "blocked": bool(blocked_reason),
+            }
+            if blocked_reason:
+                official_info["blocked_reason"] = blocked_reason
+            data = {"official": official_info}
+        else:
+            data = snapshot(release)
         write_json(STATE/"upstream-latest.json", data)
         if args.download:
-            binary = download_official(release)
+            binary = download_official(release, allow_blocked=override_blocked)
             print(json.dumps({"version": release["tag_name"], "binary": str(binary), "sha256": sha(binary)}))
         elif args.prepare and version(ROOT/"bin/agy-acp-900k") != release["tag_name"]:
+            if blocked_reason and not override_blocked:
+                print(json.dumps({
+                    "status": "blocked",
+                    "version": release["tag_name"],
+                    "reason": blocked_reason,
+                    "generation_requests": 0,
+                }))
+                return 0
             digest = _attempt_digest(release)
             key = hashlib.sha256((digest+source_digest()).encode()).hexdigest()
             attempt = STATE/"attempts"/(key+".json")
@@ -278,14 +322,17 @@ def main():
                 return 0
             write_json(attempt, {"status": "started", "version": release["tag_name"]})
             try:
-                binary = download_official(release)
-                stage = build_candidate(binary, contract=True, live=False)
+                binary = download_official(release, allow_blocked=override_blocked)
+                stage = build_candidate(binary, contract=True, live=False, allow_blocked=override_blocked)
                 write_json(attempt, {"status": "candidate_ready_for_live_acceptance", "candidate": str(stage), "generation_requests": 0})
             except Exception as exc:
                 write_json(attempt, {"status": "failed", "error_type": type(exc).__name__, "automatic_retry": False})
                 raise
         else:
-            print(json.dumps({"status": "checked", "latest": release["tag_name"], "generation_requests": 0}))
+            out = {"status": "checked", "latest": release["tag_name"], "blocked": bool(blocked_reason), "generation_requests": 0}
+            if blocked_reason:
+                out["blocked_reason"] = blocked_reason
+            print(json.dumps(out))
     return 0
 
 

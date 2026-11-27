@@ -66,6 +66,9 @@ func classifyUpstreamError(err error) (statusCode int, errType string, retryAfte
 	if err == nil {
 		return http.StatusOK, "", false, ""
 	}
+	if errors.Is(err, context.Canceled) {
+		return 499, "request_cancelled", false, "Request cancelled by client"
+	}
 	safeMsg := redactSecretsInString(err.Error())
 	var switchErr *ModelSwitchError
 	if errors.As(err, &switchErr) {

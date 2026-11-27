@@ -762,6 +762,9 @@ type AccountHealthView struct {
 
 func accountCooldownFamily(canonicalModelID string) string {
 	low := strings.ToLower(strings.TrimSpace(canonicalModelID))
+	if isImageGenCanonicalModel(low) {
+		return "image_gen"
+	}
 	if low == "gemini-4-argon" {
 		return "argon"
 	}
@@ -914,20 +917,6 @@ func (am *AccountManager) AccountLastImageGenAt(accountID string) time.Time {
 		return st.lastImageGenAt
 	}
 	return time.Time{}
-}
-
-func (am *AccountManager) RecordAccountImageGenSuccess(accountID string, at time.Time) {
-	id := strings.ToLower(strings.TrimSpace(accountID))
-	if id == "" || isChildAccountWorker() {
-		return
-	}
-	if at.IsZero() {
-		at = time.Now()
-	}
-	am.healthMu.Lock()
-	st := am.ensureHealthRuntimeLocked(id)
-	st.lastImageGenAt = at
-	am.healthMu.Unlock()
 }
 
 func (am *AccountManager) ClearAccountImageGenWarm(accountID string) {
@@ -1931,33 +1920,8 @@ func (am *AccountManager) evaluateAccountQuota(acc AccountProfile, dashPort int,
 		}
 		return quotaGroupsModelQuotaState(snap.Groups, snap.ArgonPool, canonicalModelID, now)
 	}
-	if dashPort <= 0 {
-		return false, 0.5, time.Time{}
-	}
-	cacheKey := fmt.Sprintf("%s|http://127.0.0.1:%d", acc.ID, dashPort)
-	cachedQuota, fetchedAt, ok := lookupCachedPeerQuota(cacheKey)
-	peerDashCacheMu.Lock()
-	lastAttempt := peerQuotaLiteLastAttempt[cacheKey]
-	shouldTrigger := !testing.Testing() &&
-		(!ok || now.Sub(fetchedAt) > 60*time.Second) &&
-		now.Sub(lastAttempt) > 10*time.Second
-	if shouldTrigger {
-		peerQuotaLiteLastAttempt[cacheKey] = now
-	}
-	peerDashCacheMu.Unlock()
-
-	if shouldTrigger {
-		peer := gwcfg.DashboardPeerConfig{
-			ID:      acc.ID,
-			Label:   acc.ID,
-			BaseURL: fmt.Sprintf("http://127.0.0.1:%d", dashPort),
-		}
-		fallbackKey := defaultPeerAPIKey(gwcfg.Current())
-		go func(p gwcfg.DashboardPeerConfig, k string) {
-			_, _, _ = fetchPeerQuotaLite(p, false, k)
-		}(peer, fallbackKey)
-	}
-	if !ok || now.Sub(fetchedAt) > 20*time.Minute {
+	cachedQuota, ok := getPeerQuotaFreshOrTrigger(acc.ID, dashPort, now)
+	if !ok {
 		return false, 0.5, time.Time{}
 	}
 	return quotaGroupsModelQuotaState(cachedQuota.Groups, cachedQuota.ArgonPool, canonicalModelID, now)
@@ -2644,6 +2608,7 @@ func (am *AccountManager) PerformAccountActionEx(req AccountActionRequest) (map[
 			cmd := exec.CommandContext(ctx, PatchedAgyBin, am.accountModelsCmdArgs(acc.ID)...)
 			cmd.Dir = homeDir
 			cmd.Env = am.buildAccountSubprocessEnv(homeDir, proxy)
+			configureQuotaSubprocess(cmd)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				statusCode, errType, msg := classifyHealthCheckFailure(string(out), err.Error(), proxy, cmd.Env)
 				am.RecordAccountOutcome(acc.ID, DefaultModelID, statusCode, errType, "", msg)
@@ -3176,6 +3141,9 @@ func classifyChildErrorBody(statusCode int, bodyBytes []byte) (effectiveStatus i
 }
 
 func shouldRetryChildPreStreamFailure(effectiveStatus int, errType, errMsg string) bool {
+	if isGlobalWorkerSlotError(effectiveStatus, errType, errMsg, nil) {
+		return false
+	}
 	if isVerificationRequiredError(errType, errMsg) {
 		return true
 	}
@@ -3210,6 +3178,12 @@ func classifyStructuredStreamError(errType, errStatus, errMsg string, errCode in
 		return true, http.StatusTooManyRequests, "rate_limit_error", cleanMsg
 	case errCode == http.StatusUnauthorized || strings.Contains(low, "authentication_error") || strings.Contains(low, "unauthenticated") || strings.Contains(low, "3501") || strings.Contains(low, "invalid_grant"):
 		return true, http.StatusUnauthorized, "authentication_error", cleanMsg
+	case strings.Contains(low, "timeout_error"):
+		et := strings.TrimSpace(errType)
+		if et == "" {
+			et = "timeout_error"
+		}
+		return true, http.StatusGatewayTimeout, et, cleanMsg
 	case errCode >= 500 || strings.Contains(low, "unavailable") || strings.Contains(low, "internal_error"):
 		sc := errCode
 		if sc < 500 {
@@ -3220,6 +3194,16 @@ func classifyStructuredStreamError(errType, errStatus, errMsg string, errCode in
 			et = "api_error"
 		}
 		return true, sc, et, cleanMsg
+	case strings.Contains(low, "api_error") ||
+		strings.Contains(low, "image_generation_failed") ||
+		strings.Contains(low, "image_artifact_error") ||
+		strings.Contains(low, "image_read_failed") ||
+		strings.Contains(low, "session_init_failed"):
+		et := strings.TrimSpace(errType)
+		if et == "" {
+			et = "api_error"
+		}
+		return true, http.StatusBadGateway, et, cleanMsg
 	default:
 		return false, http.StatusOK, "", ""
 	}
@@ -3271,6 +3255,8 @@ func extractJSONErrorEnvelope(raw []byte) (isErr bool, errType, errStatus, errMs
 		case string:
 			if eo.Type == "" {
 				eo.Type = v
+			} else if eo.Status == "" {
+				eo.Status = v
 			}
 		}
 		if eo.Type == "" && eo.Status == "" && eo.Message == "" && codeInt == 0 {
@@ -3370,11 +3356,35 @@ var hopByHopProxyHeaders = []string{
 }
 
 const (
-	internalLocalSlotFullHeader = "X-Agy-Local-Slot-Full"
-	internalSlotUsageHeader     = "X-Agy-Slot-Usage"
-	localSlotBusyHintTTL        = 3 * time.Second
-	localSlotUsageHintTTL       = 5 * time.Second
+	internalLocalSlotFullHeader  = "X-Agy-Local-Slot-Full"
+	internalGlobalSlotFullHeader = "X-Agy-Global-Slot-Full"
+	internalSlotUsageHeader      = "X-Agy-Slot-Usage"
+	localSlotBusyHintTTL         = 3 * time.Second
+	localSlotUsageHintTTL        = 5 * time.Second
 )
+
+var staticSkipProxyHeaders = func() map[string]bool {
+	m := make(map[string]bool, len(hopByHopProxyHeaders)+3)
+	for _, h := range hopByHopProxyHeaders {
+		m[http.CanonicalHeaderKey(h)] = true
+	}
+	m[http.CanonicalHeaderKey(internalLocalSlotFullHeader)] = true
+	m[http.CanonicalHeaderKey(internalGlobalSlotFullHeader)] = true
+	m[http.CanonicalHeaderKey(internalSlotUsageHeader)] = true
+	return m
+}()
+
+func isGlobalWorkerSlotError(statusCode int, errType, errMsg string, hdr http.Header) bool {
+	if hdr != nil && strings.TrimSpace(hdr.Get(internalGlobalSlotFullHeader)) == "1" {
+		return true
+	}
+	if statusCode != 529 && statusCode != http.StatusTooManyRequests && statusCode != http.StatusServiceUnavailable && statusCode != http.StatusOK && statusCode != 0 {
+		return false
+	}
+	low := strings.ToLower(strings.TrimSpace(errMsg))
+	return strings.Contains(low, "all global live worker slots are busy") ||
+		strings.Contains(low, "global worker admission queue")
+}
 
 func isLocalWorkerSlotError(statusCode int, errType, errMsg string, hdr http.Header) bool {
 	if hdr != nil && strings.TrimSpace(hdr.Get(internalLocalSlotFullHeader)) == "1" {
@@ -3483,21 +3493,22 @@ func (am *AccountManager) EffectiveOccupiedSlots(accID string, inFlight int64, m
 }
 
 func copyCleanProxyResponseHeaders(dst, src http.Header) {
-	skip := make(map[string]bool, len(hopByHopProxyHeaders)+6)
-	for _, h := range hopByHopProxyHeaders {
-		skip[http.CanonicalHeaderKey(h)] = true
-	}
-	skip[http.CanonicalHeaderKey(internalLocalSlotFullHeader)] = true
-	skip[http.CanonicalHeaderKey(internalSlotUsageHeader)] = true
-	for _, connVal := range src.Values("Connection") {
-		for _, tok := range strings.Split(connVal, ",") {
-			if t := strings.TrimSpace(tok); t != "" {
-				skip[http.CanonicalHeaderKey(t)] = true
+	var dynSkip map[string]bool
+	if connVals := src.Values("Connection"); len(connVals) > 0 {
+		for _, connVal := range connVals {
+			for _, tok := range strings.Split(connVal, ",") {
+				if t := strings.TrimSpace(tok); t != "" {
+					if dynSkip == nil {
+						dynSkip = make(map[string]bool, 4)
+					}
+					dynSkip[http.CanonicalHeaderKey(t)] = true
+				}
 			}
 		}
 	}
 	for k, vals := range src {
-		if skip[http.CanonicalHeaderKey(k)] {
+		ck := http.CanonicalHeaderKey(k)
+		if staticSkipProxyHeaders[ck] || (dynSkip != nil && dynSkip[ck]) {
 			continue
 		}
 		dst.Del(k)
@@ -3633,6 +3644,9 @@ func markRoutedSkipHealth(r *http.Request) {
 func recordPrimaryDirectOutcome(r *http.Request, statusCode int, errType, retryAfterHdr, errMsg string) {
 	if meta, ok := routedAccountMetaFromRequest(r); ok && !meta.skipHealth.Load() {
 		if meta.outcomeRecorded.CompareAndSwap(false, true) {
+			if isGlobalWorkerSlotError(statusCode, errType, errMsg, nil) {
+				return
+			}
 			if isLocalWorkerSlotError(statusCode, errType, errMsg, nil) {
 				GlobalAccountManager.RecordLocalSlotHint(meta.accountID, -1, true, time.Now())
 				return

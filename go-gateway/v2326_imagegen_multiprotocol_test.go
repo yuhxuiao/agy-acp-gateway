@@ -9,9 +9,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"image/png"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +25,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"agy-acp-gateway-go/internal/protocol"
 )
 
 func makeDistinctTestPNG(r, g, b uint8) []byte {
@@ -1233,5 +1238,734 @@ func TestV2326_P1_6_ImageGenGlobalConcurrencyCapCtxCancelAndP2_4Errors(t *testin
 	var errJSON map[string]any
 	if err := json.Unmarshal(recStreamErr.Body.Bytes(), &errJSON); err != nil || errJSON["error"] == nil {
 		t.Fatalf("expected valid JSON error object before SSE commit, got err=%v body=%s", err, recStreamErr.Body.String())
+	}
+}
+
+func TestV2327_GeminiRebindUnidentifiedToolResultsHibernatedPath(t *testing.T) {
+	makeReqAndNorm := func(t *testing.T, body map[string]any) (*http.Request, *normalizedGeminiRequest, string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18890/v1beta/models/gemini-4-carbon:generateContent", nil)
+		req.Header.Set("X-Session-Id", "gem-hib-conv-1")
+		norm, err := normalizeGeminiV1BetaRequest("gemini-4-carbon", body, false)
+		if err != nil {
+			t.Fatalf("normalizeGeminiV1BetaRequest failed: %v", err)
+		}
+		sysText := normalizeSystemText(norm.Body["system"])
+		toolsCatalog := sanitizeToolsCatalog(norm.Body["tools"])
+		baseKey := deriveConversationKey(req, norm.Body, sysText, toolsCatalog, norm.Messages)
+		return req, norm, baseKey
+	}
+
+	collectToolIDs := func(norm *normalizedGeminiRequest) (uses []string, results []string) {
+		for _, m := range norm.Messages {
+			arr, _ := m["content"].([]any)
+			for _, item := range arr {
+				bm, _ := item.(map[string]any)
+				switch bm["type"] {
+				case "tool_use":
+					if id, _ := bm["id"].(string); id != "" {
+						uses = append(uses, id)
+					}
+				case "tool_result":
+					if id, _ := bm["tool_use_id"].(string); id != "" {
+						results = append(results, id)
+					}
+				}
+			}
+		}
+		return uses, results
+	}
+
+	t.Run("single_hibernated_match", func(t *testing.T) {
+		gs := NewGatewayServer()
+		t.Cleanup(gs.Close)
+
+		body := map[string]any{
+			"tools": []any{
+				map[string]any{
+					"functionDeclarations": []any{
+						map[string]any{"name": "read_file", "description": "read a file"},
+					},
+				},
+			},
+			"contents": []any{
+				map[string]any{"role": "user", "parts": []any{map[string]any{"text": "read main.go"}}},
+				map[string]any{"role": "model", "parts": []any{
+					map[string]any{"functionCall": map[string]any{"name": "read_file", "args": map[string]any{"path": "main.go"}}},
+				}},
+				map[string]any{"role": "user", "parts": []any{
+					map[string]any{"functionResponse": map[string]any{"name": "read_file", "response": map[string]any{"content": "package main"}}},
+				}},
+			},
+		}
+		req, norm, baseKey := makeReqAndNorm(t, body)
+		sess := NewAcpProjectSession(baseKey, DefaultCwd, "")
+		sess.HibernatedParkedCalls = map[string]HibernatedCallMeta{
+			"mcp_hib_real_1": {ToolName: "read_file", Seq: 1},
+		}
+		sess.HibernatedParkedCallIDs = map[string]bool{"mcp_hib_real_1": true}
+		gs.mu.Lock()
+		gs.sessions[baseKey] = sess
+		gs.mu.Unlock()
+
+		gs.rebindUnidentifiedGeminiToolResults(req, norm)
+		uses, results := collectToolIDs(norm)
+		if len(uses) != 1 || uses[0] != "mcp_hib_real_1" || len(results) != 1 || results[0] != "mcp_hib_real_1" {
+			t.Fatalf("expected single hibernated rebind to mcp_hib_real_1, got uses=%v results=%v", uses, results)
+		}
+	})
+
+	t.Run("ambiguous_hibernated_fail_closed", func(t *testing.T) {
+		gs := NewGatewayServer()
+		t.Cleanup(gs.Close)
+
+		body := map[string]any{
+			"tools": []any{
+				map[string]any{
+					"functionDeclarations": []any{
+						map[string]any{"name": "read_file", "description": "read a file"},
+					},
+				},
+			},
+			"contents": []any{
+				map[string]any{"role": "user", "parts": []any{map[string]any{"text": "read main.go"}}},
+				map[string]any{"role": "model", "parts": []any{
+					map[string]any{"functionCall": map[string]any{"name": "read_file", "args": map[string]any{"path": "main.go"}}},
+				}},
+				map[string]any{"role": "user", "parts": []any{
+					map[string]any{"functionResponse": map[string]any{"name": "read_file", "response": map[string]any{"content": "package main"}}},
+				}},
+			},
+		}
+		req, norm, baseKey := makeReqAndNorm(t, body)
+		s1 := NewAcpProjectSession(baseKey, DefaultCwd, "")
+		s1.HibernatedParkedCalls = map[string]HibernatedCallMeta{"mcp_hib_a": {ToolName: "read_file", Seq: 1}}
+		s1.HibernatedParkedCallIDs = map[string]bool{"mcp_hib_a": true}
+		s2 := NewAcpProjectSession(baseKey+"#2", DefaultCwd, "")
+		s2.HibernatedParkedCalls = map[string]HibernatedCallMeta{"mcp_hib_b": {ToolName: "read_file", Seq: 1}}
+		s2.HibernatedParkedCallIDs = map[string]bool{"mcp_hib_b": true}
+		gs.mu.Lock()
+		gs.sessions[baseKey] = s1
+		gs.sessions[baseKey+"#2"] = s2
+		gs.mu.Unlock()
+
+		gs.rebindUnidentifiedGeminiToolResults(req, norm)
+		uses, results := collectToolIDs(norm)
+		if len(uses) != 1 || !strings.HasPrefix(uses[0], "gemini_fifo_") || len(results) != 1 || !strings.HasPrefix(results[0], "gemini_fifo_") {
+			t.Fatalf("expected ambiguous hibernated sessions to fail closed and keep gemini_fifo_*, got uses=%v results=%v", uses, results)
+		}
+	})
+
+	t.Run("explicit_and_anonymous_mix", func(t *testing.T) {
+		gs := NewGatewayServer()
+		t.Cleanup(gs.Close)
+
+		body := map[string]any{
+			"tools": []any{
+				map[string]any{
+					"functionDeclarations": []any{
+						map[string]any{"name": "read_file", "description": "read a file"},
+					},
+				},
+			},
+			"contents": []any{
+				map[string]any{"role": "user", "parts": []any{map[string]any{"text": "read two files"}}},
+				map[string]any{"role": "model", "parts": []any{
+					map[string]any{"functionCall": map[string]any{"id": "mcp_hib_1", "name": "read_file", "args": map[string]any{"path": "a.go"}}},
+					map[string]any{"functionCall": map[string]any{"name": "read_file", "args": map[string]any{"path": "b.go"}}},
+				}},
+				map[string]any{"role": "user", "parts": []any{
+					map[string]any{"functionResponse": map[string]any{"id": "mcp_hib_1", "name": "read_file", "response": map[string]any{"content": "A"}}},
+					map[string]any{"functionResponse": map[string]any{"name": "read_file", "response": map[string]any{"content": "B"}}},
+				}},
+			},
+		}
+		req, norm, baseKey := makeReqAndNorm(t, body)
+		sess := NewAcpProjectSession(baseKey, DefaultCwd, "")
+		sess.HibernatedParkedCalls = map[string]HibernatedCallMeta{
+			"mcp_hib_1": {ToolName: "read_file", Seq: 1},
+			"mcp_hib_2": {ToolName: "read_file", Seq: 2},
+		}
+		sess.HibernatedParkedCallIDs = map[string]bool{"mcp_hib_1": true, "mcp_hib_2": true}
+		gs.mu.Lock()
+		gs.sessions[baseKey] = sess
+		gs.mu.Unlock()
+
+		gs.rebindUnidentifiedGeminiToolResults(req, norm)
+		uses, results := collectToolIDs(norm)
+		if len(uses) != 2 || uses[0] != "mcp_hib_1" || uses[1] != "mcp_hib_2" ||
+			len(results) != 2 || results[0] != "mcp_hib_1" || results[1] != "mcp_hib_2" {
+			t.Fatalf("expected explicit+anon mix to keep mcp_hib_1 and rebind anon to mcp_hib_2, got uses=%v results=%v", uses, results)
+		}
+	})
+
+	t.Run("global_worker_slot_header_classifier", func(t *testing.T) {
+		if !isGeminiGlobalWorkerSlotError(529, "All global live worker slots are busy; retry shortly") {
+			t.Fatal("expected 529 global live worker slot error to match")
+		}
+		if !isGeminiGlobalWorkerSlotError(http.StatusTooManyRequests, "Global worker admission queue is full; retry shortly") {
+			t.Fatal("expected 429-mapped global admission queue error to match")
+		}
+		if isGeminiGlobalWorkerSlotError(529, "All live worker slots are busy; retry shortly") {
+			t.Fatal("local worker slot error must NOT match global worker slot classifier")
+		}
+		if isGeminiGlobalWorkerSlotError(http.StatusInternalServerError, "All global live worker slots are busy") {
+			t.Fatal("500 status must NOT match global worker slot classifier")
+		}
+	})
+}
+
+func TestV2327_ImageGenSafetyValveRestartAndToSSoftError(t *testing.T) {
+	setLowCgroupMemoryForTest(t)
+	StopImageGenEngine()
+
+	origIdle := imageGenIdleTTL
+	origMaxGen := imageGenMaxGenerations
+	origMaxAge := imageGenMaxEngineAge
+	origMaxErr := imageGenMaxConsecErrors
+	t.Cleanup(func() {
+		imageGenIdleTTL = origIdle
+		imageGenMaxGenerations = origMaxGen
+		imageGenMaxEngineAge = origMaxAge
+		imageGenMaxConsecErrors = origMaxErr
+		StopImageGenEngine()
+	})
+	imageGenIdleTTL = 30 * time.Second
+
+	t.Run("gen_count_safety_valve_restarts_engine", func(t *testing.T) {
+		StopImageGenEngine()
+		imageGenMaxGenerations = 2
+		imageGenMaxConsecErrors = 10
+		imageGenMaxEngineAge = 20 * time.Minute
+
+		eng1, rel1, err1 := GlobalImageGen.acquire(context.Background())
+		if err1 != nil {
+			t.Fatalf("acquire #1 failed: %v", err1)
+		}
+		gen1 := eng1.CurrentGen()
+		rel1(true)
+		if !GlobalImageGen.IsWarm() {
+			t.Fatal("engine should stay warm after 1st generation (below cap 2)")
+		}
+
+		_, rel2, err2 := GlobalImageGen.acquire(context.Background())
+		if err2 != nil {
+			t.Fatalf("acquire #2 failed: %v", err2)
+		}
+		rel2(true)
+		if GlobalImageGen.IsWarm() {
+			t.Fatal("expected gen_count safety valve to stop engine at genCount==2")
+		}
+
+		eng3, rel3, err3 := GlobalImageGen.acquire(context.Background())
+		if err3 != nil {
+			t.Fatalf("acquire #3 after recycle failed: %v", err3)
+		}
+		gen3 := eng3.CurrentGen()
+		rel3(true)
+		if gen3 <= gen1 {
+			t.Fatalf("expected fresh engine generation after recycle (> %d), got %d", gen1, gen3)
+		}
+	})
+
+	t.Run("consecutive_errors_safety_valve_restarts_engine", func(t *testing.T) {
+		StopImageGenEngine()
+		imageGenMaxGenerations = 40
+		imageGenMaxConsecErrors = 2
+		imageGenMaxEngineAge = 20 * time.Minute
+
+		_, rel1, err1 := GlobalImageGen.acquire(context.Background())
+		if err1 != nil {
+			t.Fatalf("acquire #1 failed: %v", err1)
+		}
+		rel1(false)
+		if !GlobalImageGen.IsWarm() {
+			t.Fatal("engine should stay warm after 1 error (below cap 2)")
+		}
+
+		_, rel2, err2 := GlobalImageGen.acquire(context.Background())
+		if err2 != nil {
+			t.Fatalf("acquire #2 failed: %v", err2)
+		}
+		rel2(false)
+		if GlobalImageGen.IsWarm() {
+			t.Fatal("expected consecutive_errors safety valve to stop engine at consecutiveErrors==2")
+		}
+	})
+
+	t.Run("engine_age_safety_valve_restarts_engine", func(t *testing.T) {
+		StopImageGenEngine()
+		imageGenMaxGenerations = 40
+		imageGenMaxConsecErrors = 10
+		imageGenMaxEngineAge = 15 * time.Millisecond
+
+		_, rel1, err1 := GlobalImageGen.acquire(context.Background())
+		if err1 != nil {
+			t.Fatalf("acquire #1 failed: %v", err1)
+		}
+		time.Sleep(25 * time.Millisecond)
+		rel1(true)
+		if GlobalImageGen.IsWarm() {
+			t.Fatal("expected engine_age safety valve to stop engine after maxEngineAge elapsed")
+		}
+	})
+
+	t.Run("classifyImageGenError_unwraps_tos_SoftError_503_without_retripping", func(t *testing.T) {
+		if tripped, _ := IsTosTripped(); tripped {
+			t.Skip("ToS breaker already tripped in process")
+		}
+		directSE := &SoftError{
+			StatusCode: http.StatusServiceUnavailable,
+			ErrorType:  "tos_circuit_breaker",
+			Message:    "Antigravity ToS circuit breaker is tripped; operator intervention required",
+		}
+		gotDirect := classifyImageGenError(directSE, nil, "")
+		if gotDirect.StatusCode != http.StatusServiceUnavailable || gotDirect.ErrType != "tos_circuit_breaker" || gotDirect.ErrCode != "tos_circuit_breaker" {
+			t.Fatalf("expected 503 tos_circuit_breaker for direct SoftError, got %+v", gotDirect)
+		}
+		wrappedSE := fmt.Errorf("acquire failed: %w", directSE)
+		gotWrapped := classifyImageGenError(wrappedSE, nil, "")
+		if gotWrapped.StatusCode != http.StatusServiceUnavailable || gotWrapped.ErrType != "tos_circuit_breaker" || gotWrapped.ErrCode != "tos_circuit_breaker" {
+			t.Fatalf("expected 503 tos_circuit_breaker for wrapped SoftError, got %+v", gotWrapped)
+		}
+		if tripped, _ := IsTosTripped(); tripped {
+			t.Fatal("classifyImageGenError must NOT re-trip global ToS circuit breaker when unwrapping SoftError")
+		}
+	})
+}
+
+func makeLargeMultiChunkTestPNGAndJPEG(t *testing.T) (pngBytes []byte, jpegBytes []byte) {
+	t.Helper()
+	// 256x256 deterministic noisy RGBA image -> >120KB PNG (exercises >=3 48KB raw chunks + tail padding) and valid JPEG.
+	img := image.NewRGBA(image.Rect(0, 0, 256, 256))
+	var state uint32 = 0x12345678
+	for y := 0; y < 256; y++ {
+		for x := 0; x < 256; x++ {
+			state = state*1664525 + 1013904223
+			img.SetRGBA(x, y, color.RGBA{
+				R: uint8(state >> 24),
+				G: uint8(state >> 16),
+				B: uint8(state >> 8),
+				A: 255,
+			})
+		}
+	}
+	var pngBuf bytes.Buffer
+	if err := png.Encode(&pngBuf, img); err != nil {
+		t.Fatalf("png.Encode failed: %v", err)
+	}
+	var jpgBuf bytes.Buffer
+	if err := jpeg.Encode(&jpgBuf, img, &jpeg.Options{Quality: 85}); err != nil {
+		t.Fatalf("jpeg.Encode failed: %v", err)
+	}
+	if pngBuf.Len() <= 96*1024 {
+		t.Fatalf("expected test PNG > 96KB to exercise multi-chunk streaming, got %d bytes", pngBuf.Len())
+	}
+	return pngBuf.Bytes(), jpgBuf.Bytes()
+}
+
+func TestV2327_ImageGenStreamingBase64ByteExactAndMarkdownScanner(t *testing.T) {
+	origPNG, origJPEG := makeLargeMultiChunkTestPNGAndJPEG(t)
+
+	// Verify pooled fastPNGEncoder transcode produces valid decodable PNG.
+	transcoded, err := transcodeToPNGSerial(origJPEG, "image/jpeg")
+	if err != nil {
+		t.Fatalf("transcodeToPNGSerial failed: %v", err)
+	}
+	if mime, ok := sniffAllowedImageMime(transcoded); !ok || mime != "image/png" {
+		t.Fatalf("expected PNG magic after fastPNGEncoder transcode, got mime=%q ok=%v", mime, ok)
+	}
+	if _, err := png.Decode(bytes.NewReader(transcoded)); err != nil {
+		t.Fatalf("png.Decode on fastPNGEncoder output failed: %v", err)
+	}
+
+	makeResults := func() []generatedImageResult {
+		return []generatedImageResult{
+			{Raw: append([]byte(nil), origPNG...), Mime: "image/png"},
+			{Raw: append([]byte(nil), origJPEG...), Mime: "image/jpeg"},
+		}
+	}
+
+	t.Run("openai_images_json_stream_byte_exact", func(t *testing.T) {
+		res := makeResults()
+		rec := httptest.NewRecorder()
+		writeOpenAIImagesJSONResponse(rec, "png", res)
+		if res[0].Raw != nil || res[1].Raw != nil {
+			t.Fatal("expected writeOpenAIImagesJSONResponse to clear Raw slices immediately")
+		}
+		var parsed struct {
+			Created      int64  `json:"created"`
+			OutputFormat string `json:"output_format"`
+			Data         []struct {
+				B64JSON string `json:"b64_json"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+			t.Fatalf("invalid streamed JSON: %v", err)
+		}
+		if parsed.OutputFormat != "png" || len(parsed.Data) != 2 {
+			t.Fatalf("unexpected response metadata: %+v", parsed)
+		}
+		got0, err0 := base64.StdEncoding.DecodeString(parsed.Data[0].B64JSON)
+		got1, err1 := base64.StdEncoding.DecodeString(parsed.Data[1].B64JSON)
+		if err0 != nil || err1 != nil || !bytes.Equal(got0, origPNG) || !bytes.Equal(got1, origJPEG) {
+			t.Fatalf("OpenAI images streamed base64 mismatch: err0=%v err1=%v match0=%v match1=%v",
+				err0, err1, bytes.Equal(got0, origPNG), bytes.Equal(got1, origJPEG))
+		}
+	})
+
+	t.Run("chat_non_stream_json_byte_exact", func(t *testing.T) {
+		res := makeResults()
+		rec := httptest.NewRecorder()
+		writeChatImageJSONResponse(rec, "chatcmpl-test", 1700000000, imageGenServedModel, res, 12)
+		if res[0].Raw != nil || res[1].Raw != nil {
+			t.Fatal("expected writeChatImageJSONResponse to clear Raw slices immediately")
+		}
+		var parsed struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil || len(parsed.Choices) != 1 {
+			t.Fatalf("invalid chat non-stream JSON: err=%v bodyLen=%d", err, rec.Body.Len())
+		}
+		var refs []chatImageRef
+		stripped := extractAndStripMarkdownDataImages(parsed.Choices[0].Message.Content, "content", &refs)
+		if stripped != "[image]\n\n[image]" || len(refs) != 2 {
+			t.Fatalf("expected two markdown images separated by \\n\\n, got stripped=%q refs=%d", stripped, len(refs))
+		}
+		vi0, err0 := decodeEditImageString(refs[0].url, "r0")
+		vi1, err1 := decodeEditImageString(refs[1].url, "r1")
+		if err0 != nil || err1 != nil || !bytes.Equal(vi0.raw, origPNG) || !bytes.Equal(vi1.raw, origJPEG) {
+			t.Fatalf("chat non-stream decoded bytes mismatch: err0=%v err1=%v match0=%v match1=%v",
+				err0, err1, bytes.Equal(vi0.raw, origPNG), bytes.Equal(vi1.raw, origJPEG))
+		}
+	})
+
+	t.Run("chat_sse_chunked_48kb_raw_byte_exact", func(t *testing.T) {
+		res := makeResults()
+		rec := httptest.NewRecorder()
+		stream := protocol.NewSSEStreamSession(rec, protocol.SSEStreamOptions{})
+		stream.DoLocked(func(sw *protocol.StreamWriter) {
+			writeChatImageSSEChunks(sw, "chatcmpl-sse", 1700000000, imageGenServedModel, res, 12)
+		})
+		if res[0].Raw != nil || res[1].Raw != nil {
+			t.Fatal("expected writeChatImageSSEChunks to clear Raw slices immediately")
+		}
+		var contentBuilder strings.Builder
+		dataFrames := 0
+		sawDone := false
+		sc := bufio.NewScanner(bytes.NewReader(rec.Body.Bytes()))
+		sc.Buffer(make([]byte, 0, 128*1024), 512*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			payload := strings.TrimPrefix(line, "data: ")
+			if payload == "[DONE]" {
+				sawDone = true
+				continue
+			}
+			dataFrames++
+			var frame struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+				} `json:"choices"`
+			}
+			if err := json.Unmarshal([]byte(payload), &frame); err != nil {
+				t.Fatalf("invalid SSE JSON frame: %v", err)
+			}
+			if len(frame.Choices) > 0 {
+				contentBuilder.WriteString(frame.Choices[0].Delta.Content)
+			}
+		}
+		if !sawDone || dataFrames < 6 {
+			t.Fatalf("expected multi-chunk SSE stream ending with [DONE], sawDone=%v dataFrames=%d", sawDone, dataFrames)
+		}
+		var refs []chatImageRef
+		stripped := extractAndStripMarkdownDataImages(contentBuilder.String(), "sse", &refs)
+		if stripped != "[image]\n\n[image]" || len(refs) != 2 {
+			t.Fatalf("expected 2 images from concatenated SSE chunks, got stripped=%q refs=%d", stripped, len(refs))
+		}
+		vi0, err0 := decodeEditImageString(refs[0].url, "r0")
+		vi1, err1 := decodeEditImageString(refs[1].url, "r1")
+		if err0 != nil || err1 != nil || !bytes.Equal(vi0.raw, origPNG) || !bytes.Equal(vi1.raw, origJPEG) {
+			t.Fatalf("chat SSE decoded bytes mismatch: err0=%v err1=%v match0=%v match1=%v",
+				err0, err1, bytes.Equal(vi0.raw, origPNG), bytes.Equal(vi1.raw, origJPEG))
+		}
+	})
+
+	t.Run("gemini_v1beta_sse_and_array_stream_byte_exact", func(t *testing.T) {
+		for _, useSSE := range []bool{true, false} {
+			res := makeResults()
+			rec := httptest.NewRecorder()
+			stream := protocol.NewSSEStreamSession(rec, protocol.SSEStreamOptions{})
+			stream.DoLocked(func(sw *protocol.StreamWriter) {
+				ok := sw.WriteStream(func(out io.Writer) error {
+					bw := bufio.NewWriterSize(out, 32*1024)
+					if useSSE {
+						_, _ = bw.WriteString("data: ")
+					} else {
+						_, _ = bw.WriteString("[\n")
+					}
+					if err := writeGeminiImageResponseJSONToBuf(bw, "gem_img_1", imageGenServedModel, res, 15); err != nil {
+						return err
+					}
+					if useSSE {
+						_, _ = bw.WriteString("\n\n")
+					} else {
+						_, _ = bw.WriteString("\n]\n")
+					}
+					return bw.Flush()
+				})
+				if !ok {
+					t.Errorf("WriteStream returned false (useSSE=%v)", useSSE)
+				}
+			})
+			if res[0].Raw != nil || res[1].Raw != nil {
+				t.Fatalf("expected Gemini streaming writer to clear Raw slices (useSSE=%v)", useSSE)
+			}
+			type gemResp struct {
+				Candidates []struct {
+					Content struct {
+						Parts []struct {
+							InlineData struct {
+								MimeType string `json:"mimeType"`
+								Data     string `json:"data"`
+							} `json:"inlineData"`
+						} `json:"parts"`
+					} `json:"content"`
+				} `json:"candidates"`
+			}
+			var got gemResp
+			if useSSE {
+				raw := strings.TrimSpace(rec.Body.String())
+				if !strings.HasPrefix(raw, "data: ") {
+					t.Fatalf("expected SSE data: prefix, got %.40q", raw)
+				}
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(raw, "data: ")), &got); err != nil {
+					t.Fatalf("unmarshal Gemini SSE JSON failed: %v", err)
+				}
+			} else {
+				var arr []gemResp
+				if err := json.Unmarshal(rec.Body.Bytes(), &arr); err != nil || len(arr) != 1 {
+					t.Fatalf("unmarshal Gemini JSON array failed: err=%v len=%d", err, len(arr))
+				}
+				got = arr[0]
+			}
+			if len(got.Candidates) != 2 {
+				t.Fatalf("expected 2 candidates (useSSE=%v), got %d", useSSE, len(got.Candidates))
+			}
+			d0, e0 := base64.StdEncoding.DecodeString(got.Candidates[0].Content.Parts[0].InlineData.Data)
+			d1, e1 := base64.StdEncoding.DecodeString(got.Candidates[1].Content.Parts[0].InlineData.Data)
+			if e0 != nil || e1 != nil || !bytes.Equal(d0, origPNG) || !bytes.Equal(d1, origJPEG) {
+				t.Fatalf("Gemini streamed bytes mismatch (useSSE=%v): e0=%v e1=%v match0=%v match1=%v",
+					useSSE, e0, e1, bytes.Equal(d0, origPNG), bytes.Equal(d1, origJPEG))
+			}
+		}
+	})
+
+	t.Run("single_pass_markdown_data_image_scanner", func(t *testing.T) {
+		bigB64 := base64.StdEncoding.EncodeToString(origPNG)
+		input := "Keep ![link](https://example.com/a.png) and ![broken](data:image/png;base64,ABC " +
+			"and ![img1](data:image/png;base64," + bigB64 + ") plus ![outer ![inner](data:image/jpeg;base64,AAAA)"
+		var refs []chatImageRef
+		cleaned := extractAndStripMarkdownDataImages(input, "msg.0", &refs)
+		wantCleaned := "Keep ![link](https://example.com/a.png) and ![broken](data:image/png;base64,ABC and [image] plus [image]"
+		if cleaned != wantCleaned {
+			t.Fatalf("unexpected stripped markdown:\ngot:  %q\nwant: %q", cleaned, wantCleaned)
+		}
+		if len(refs) != 2 || refs[0].url != "data:image/png;base64,"+bigB64 || refs[1].url != "data:image/jpeg;base64,AAAA" {
+			t.Fatalf("unexpected extracted refs: count=%d", len(refs))
+		}
+	})
+}
+
+func TestV2327_MultipartStreamingEditStaging(t *testing.T) {
+	origHome := PureApiHome
+	tmpHome := t.TempDir()
+	PureApiHome = tmpHome
+	t.Cleanup(func() { PureApiHome = origHome })
+
+	pngA := makeDistinctTestPNG(220, 30, 40)
+	pngB := makeDistinctTestPNG(30, 40, 220)
+
+	assertNoTempDirsLeaked := func(t *testing.T) {
+		t.Helper()
+		tmpRoot := filepath.Join(tmpHome, "tmp")
+		entries, err := os.ReadDir(tmpRoot)
+		if err != nil {
+			return
+		}
+		for _, ent := range entries {
+			if strings.HasPrefix(ent.Name(), "imagegen-") {
+				t.Fatalf("leaked temp edit dir: %s", filepath.Join(tmpRoot, ent.Name()))
+			}
+		}
+	}
+
+	t.Run("streams_multiple_images_regardless_of_field_order", func(t *testing.T) {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		fw1, _ := mw.CreateFormFile("image", "first.png")
+		_, _ = fw1.Write(pngA)
+		_ = mw.WriteField("prompt", "blend these two")
+		_ = mw.WriteField("output_format", "png")
+		fw2, _ := mw.CreateFormFile("image[]", "second.png")
+		_, _ = fw2.Write(pngB)
+		_ = mw.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18890/v1/images/edits", &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		params, tmpDir, absPaths, code, msg := parseImageEditsMultipart(httptest.NewRecorder(), req, 701)
+		if tmpDir != "" {
+			defer os.RemoveAll(tmpDir)
+		}
+		if code != 0 || msg != "" {
+			t.Fatalf("expected success, got code=%d msg=%s", code, msg)
+		}
+		if params.Prompt != "blend these two" || params.OutputFormat != "png" || len(absPaths) != 2 {
+			t.Fatalf("unexpected params=%+v paths=%v", params, absPaths)
+		}
+		gotA, errA := os.ReadFile(absPaths[0])
+		gotB, errB := os.ReadFile(absPaths[1])
+		if errA != nil || errB != nil || !bytes.Equal(gotA, pngA) || !bytes.Equal(gotB, pngB) {
+			t.Fatalf("staged file bytes mismatch: errA=%v errB=%v", errA, errB)
+		}
+	})
+
+	t.Run("rejects_bad_magic_after_32B_sniff_without_temp_leak", func(t *testing.T) {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		_ = mw.WriteField("prompt", "bad magic")
+		fw, _ := mw.CreateFormFile("image", "spoof.png")
+		_, _ = fw.Write([]byte("<html>this is definitely not a png image payload</html>"))
+		_ = mw.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18890/v1/images/edits", &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		_, tmpDir, _, code, _ := parseImageEditsMultipart(httptest.NewRecorder(), req, 702)
+		if code != http.StatusBadRequest || tmpDir != "" {
+			t.Fatalf("expected 400 and empty tmpDir, got code=%d tmpDir=%q", code, tmpDir)
+		}
+		assertNoTempDirsLeaked(t)
+	})
+
+	t.Run("rejects_oversize_413_and_cleans_up_temp", func(t *testing.T) {
+		origMax := MaxImageBytes
+		MaxImageBytes = 512
+		t.Cleanup(func() { MaxImageBytes = origMax })
+
+		oversize := append([]byte(nil), pngA...)
+		oversize = append(oversize, bytes.Repeat([]byte{0x42}, 1024)...)
+
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		_ = mw.WriteField("prompt", "too big")
+		fw, _ := mw.CreateFormFile("image", "big.png")
+		_, _ = fw.Write(oversize)
+		_ = mw.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18890/v1/images/edits", &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		_, tmpDir, _, code, _ := parseImageEditsMultipart(httptest.NewRecorder(), req, 703)
+		if code != http.StatusRequestEntityTooLarge || tmpDir != "" {
+			t.Fatalf("expected 413 and cleaned tmpDir, got code=%d tmpDir=%q", code, tmpDir)
+		}
+		assertNoTempDirsLeaked(t)
+	})
+
+	t.Run("rejects_more_than_maxImageEditInputs_and_cleans_up_temp", func(t *testing.T) {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		_ = mw.WriteField("prompt", "four images")
+		for i := 0; i < maxImageEditInputs+1; i++ {
+			fw, _ := mw.CreateFormFile("image[]", fmt.Sprintf("img_%d.png", i))
+			_, _ = fw.Write(pngA)
+		}
+		_ = mw.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18890/v1/images/edits", &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		_, tmpDir, _, code, _ := parseImageEditsMultipart(httptest.NewRecorder(), req, 704)
+		if code != http.StatusBadRequest || tmpDir != "" {
+			t.Fatalf("expected 400 for >%d images, got code=%d tmpDir=%q", maxImageEditInputs, code, tmpDir)
+		}
+		assertNoTempDirsLeaked(t)
+	})
+}
+
+func TestV2327_TruncatedPDFMissingEOFRejected400(t *testing.T) {
+	validShort := []byte("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n")
+	if !verifyMediaMagicBytes("application/pdf", validShort) {
+		t.Fatalf("expected valid PDF with %s to pass magic check", "%%EOF")
+	}
+
+	validLarge := append([]byte("%PDF-1.7\n"), bytes.Repeat([]byte("A"), 10000)...)
+	validLarge = append(validLarge, []byte("\n%%EOF\n")...)
+	if !verifyMediaMagicBytes("application/pdf", validLarge) {
+		t.Fatalf("expected large PDF with %s in trailing 4096B to pass magic check", "%%EOF")
+	}
+
+	truncated := []byte("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nstream\nabcdef12345")
+	if verifyMediaMagicBytes("application/pdf", truncated) {
+		t.Fatalf("expected truncated PDF without %s to fail magic check", "%%EOF")
+	}
+
+	staleEOF := append([]byte("%PDF-1.4\n%%EOF\n"), bytes.Repeat([]byte("B"), 5000)...)
+	if verifyMediaMagicBytes("application/pdf", staleEOF) {
+		t.Fatalf("expected PDF whose only %s is >4096 bytes before EOF to fail magic check", "%%EOF")
+	}
+
+	// End-to-end HTTP 400 verification on /v1beta and /v1/messages.
+	gs := NewGatewayServer()
+	t.Cleanup(gs.Close)
+	h := gs.GatewayOnlyHandler()
+	truncB64 := base64.StdEncoding.EncodeToString(truncated)
+
+	msgPayload, _ := json.Marshal(map[string]any{
+		"model": "gemini-4-carbon",
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{
+				map[string]any{
+					"type": "document",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": "application/pdf",
+						"data":       truncB64,
+					},
+				},
+			},
+		}},
+	})
+	reqMsg := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18890/v1/messages", bytes.NewReader(msgPayload))
+	reqMsg.Header.Set("Content-Type", "application/json")
+	recMsg := httptest.NewRecorder()
+	h.ServeHTTP(recMsg, reqMsg)
+	if recMsg.Code != http.StatusBadRequest || !strings.Contains(recMsg.Body.String(), "%%EOF") {
+		t.Fatalf("expected HTTP 400 mentioning %%%%EOF for truncated PDF on /v1/messages, got %d: %s", recMsg.Code, recMsg.Body.String())
+	}
+
+	gemPayload, _ := json.Marshal(map[string]any{
+		"contents": []any{map[string]any{
+			"role": "user",
+			"parts": []any{
+				map[string]any{"text": "read this pdf"},
+				map[string]any{"inlineData": map[string]any{"mimeType": "application/pdf", "data": truncB64}},
+			},
+		}},
+	})
+	reqGem := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18890/v1beta/models/gemini-4-carbon:generateContent", bytes.NewReader(gemPayload))
+	reqGem.Header.Set("Content-Type", "application/json")
+	recGem := httptest.NewRecorder()
+	h.ServeHTTP(recGem, reqGem)
+	if recGem.Code != http.StatusBadRequest || !strings.Contains(recGem.Body.String(), "%%EOF") {
+		t.Fatalf("expected HTTP 400 mentioning %%%%EOF for truncated PDF on /v1beta, got %d: %s", recGem.Code, recGem.Body.String())
 	}
 }

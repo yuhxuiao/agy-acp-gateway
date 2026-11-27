@@ -491,8 +491,6 @@ type AccountManager struct {
 	memGovDoneCh           chan struct{}
 	memSnapMu              sync.RWMutex
 	memSnap                GlobalMemorySnapshot
-	preSpawnGovRunning     atomic.Bool
-	preSpawnGovLastNs      atomic.Int64
 	admitExecMu            sync.Mutex
 	admitStateMu           sync.Mutex
 	admitLeases            map[string]globalSpawnLease
@@ -813,19 +811,29 @@ type CgroupMemoryStatus struct {
 	HasLiveUsage    bool    `json:"hasLiveUsage"`
 }
 
+const cgroupMemCacheTTL = 250 * time.Millisecond
+
+type cachedCgroupMemStatus struct {
+	status CgroupMemoryStatus
+	readAt time.Time
+}
+
 var (
 	cgroupMemReaderMu       sync.RWMutex
 	cgroupMemReaderOverride func() CgroupMemoryStatus
+	cgroupMemCache          atomic.Pointer[cachedCgroupMemStatus]
 )
 
 func setCgroupMemoryReaderForTest(fn func() CgroupMemoryStatus) func() {
 	cgroupMemReaderMu.Lock()
 	prev := cgroupMemReaderOverride
 	cgroupMemReaderOverride = fn
+	cgroupMemCache.Store(nil)
 	cgroupMemReaderMu.Unlock()
 	return func() {
 		cgroupMemReaderMu.Lock()
 		cgroupMemReaderOverride = prev
+		cgroupMemCache.Store(nil)
 		cgroupMemReaderMu.Unlock()
 	}
 }
@@ -842,34 +850,146 @@ func parseCgroupPositiveBytes(raw string) int64 {
 	return b
 }
 
-func parseMemStatKV(raw string) map[string]int64 {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	out := make(map[string]int64, 32)
-	for _, line := range strings.Split(raw, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
+type cgroupMemStatFields struct {
+	anon            int64
+	hasAnon         bool
+	file            int64
+	activeFile      int64
+	inactiveFile    int64
+	hasInactiveFile bool
+	matched         bool
+}
+
+func parseMemStatV2(raw string) cgroupMemStatFields {
+	var out cgroupMemStatFields
+	for rest := raw; rest != ""; {
+		var line string
+		line, rest, _ = strings.Cut(rest, "\n")
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		if v, err := strconv.ParseInt(fields[1], 10, 64); err == nil && v >= 0 {
-			out[fields[0]] = v
+		k, valStr, ok := strings.Cut(line, " ")
+		if !ok {
+			k, valStr, ok = strings.Cut(line, "\t")
+			if !ok {
+				continue
+			}
+		}
+		switch k {
+		case "anon", "file", "active_file", "inactive_file":
+		default:
+			continue
+		}
+		valStr = strings.TrimSpace(valStr)
+		if sp := strings.IndexAny(valStr, " \t"); sp >= 0 {
+			valStr = valStr[:sp]
+		}
+		v, err := strconv.ParseInt(valStr, 10, 64)
+		if err != nil || v < 0 {
+			continue
+		}
+		out.matched = true
+		switch k {
+		case "anon":
+			out.anon = v
+			out.hasAnon = true
+		case "file":
+			out.file = v
+		case "active_file":
+			out.activeFile = v
+		case "inactive_file":
+			out.inactiveFile = v
+			out.hasInactiveFile = true
+		}
+	}
+	return out
+}
+
+func parseMemStatV1(raw string) cgroupMemStatFields {
+	var out cgroupMemStatFields
+	var hasTotalRSS, hasTotalCache, hasTotalAct, hasTotalInact bool
+	for rest := raw; rest != ""; {
+		var line string
+		line, rest, _ = strings.Cut(rest, "\n")
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		k, valStr, ok := strings.Cut(line, " ")
+		if !ok {
+			k, valStr, ok = strings.Cut(line, "\t")
+			if !ok {
+				continue
+			}
+		}
+		switch k {
+		case "total_rss", "rss", "total_cache", "cache", "total_active_file", "active_file", "total_inactive_file", "inactive_file":
+		default:
+			continue
+		}
+		valStr = strings.TrimSpace(valStr)
+		if sp := strings.IndexAny(valStr, " \t"); sp >= 0 {
+			valStr = valStr[:sp]
+		}
+		v, err := strconv.ParseInt(valStr, 10, 64)
+		if err != nil || v < 0 {
+			continue
+		}
+		out.matched = true
+		switch k {
+		case "total_rss":
+			out.anon = v
+			out.hasAnon = true
+			hasTotalRSS = true
+		case "rss":
+			if !hasTotalRSS {
+				out.anon = v
+				out.hasAnon = true
+			}
+		case "total_cache":
+			out.file = v
+			hasTotalCache = true
+		case "cache":
+			if !hasTotalCache {
+				out.file = v
+			}
+		case "total_active_file":
+			out.activeFile = v
+			hasTotalAct = true
+		case "active_file":
+			if !hasTotalAct {
+				out.activeFile = v
+			}
+		case "total_inactive_file":
+			out.inactiveFile = v
+			out.hasInactiveFile = true
+			hasTotalInact = true
+		case "inactive_file":
+			if !hasTotalInact {
+				out.inactiveFile = v
+				out.hasInactiveFile = true
+			}
 		}
 	}
 	return out
 }
 
 func parseProcMeminfoTotalBytes(procMeminfo string) int64 {
-	for _, line := range strings.Split(procMeminfo, "\n") {
+	for rest := procMeminfo; rest != ""; {
+		var line string
+		line, rest, _ = strings.Cut(rest, "\n")
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "MemTotal:") {
+		valStr, ok := strings.CutPrefix(line, "MemTotal:")
+		if !ok {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) >= 2 {
-			if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil && kb > 0 {
-				return kb * 1024
-			}
+		valStr = strings.TrimSpace(valStr)
+		if sp := strings.IndexAny(valStr, " \t"); sp >= 0 {
+			valStr = valStr[:sp]
+		}
+		if kb, err := strconv.ParseInt(valStr, 10, 64); err == nil && kb > 0 {
+			return kb * 1024
 		}
 	}
 	return 0
@@ -896,14 +1016,14 @@ func parseCgroupMemoryStatus(v2Current, v2Max, v2Stat, v1Usage, v1Limit, v1Stat,
 			st.LimitBytes = v1Lim
 			hasCgroupLimit = true
 		}
-		if kv := parseMemStatKV(v2Stat); len(kv) > 0 {
-			st.AnonBytes = kv["anon"]
-			st.FileBytes = kv["file"]
-			st.ActiveFileBytes = kv["active_file"]
-			st.InactiveFile = kv["inactive_file"]
-			if _, hasInact := kv["inactive_file"]; hasInact && st.CurrentBytes >= st.InactiveFile {
+		if kv := parseMemStatV2(v2Stat); kv.matched {
+			st.AnonBytes = kv.anon
+			st.FileBytes = kv.file
+			st.ActiveFileBytes = kv.activeFile
+			st.InactiveFile = kv.inactiveFile
+			if kv.hasInactiveFile && st.CurrentBytes >= st.InactiveFile {
 				st.WorkingSetBytes = st.CurrentBytes - st.InactiveFile
-			} else if _, hasAnon := kv["anon"]; hasAnon {
+			} else if kv.hasAnon {
 				st.WorkingSetBytes = st.AnonBytes + st.ActiveFileBytes
 				if st.CurrentBytes > 0 && st.WorkingSetBytes > st.CurrentBytes {
 					st.WorkingSetBytes = st.CurrentBytes
@@ -921,31 +1041,15 @@ func parseCgroupMemoryStatus(v2Current, v2Max, v2Stat, v1Usage, v1Limit, v1Stat,
 			st.LimitBytes = v1Lim
 			hasCgroupLimit = true
 		}
-		if kv := parseMemStatKV(v1Stat); len(kv) > 0 {
-			anon, hasAnon := kv["total_rss"]
-			if !hasAnon {
-				anon, hasAnon = kv["rss"]
-			}
-			file, hasFile := kv["total_cache"]
-			if !hasFile {
-				file = kv["cache"]
-			}
-			actFile, hasAct := kv["total_active_file"]
-			if !hasAct {
-				actFile = kv["active_file"]
-			}
-			inactFile, hasInact := kv["total_inactive_file"]
-			if !hasInact {
-				inactFile, hasInact = kv["inactive_file"]
-			}
-			st.AnonBytes = anon
-			st.FileBytes = file
-			st.ActiveFileBytes = actFile
-			st.InactiveFile = inactFile
-			if hasInact && st.CurrentBytes >= inactFile {
-				st.WorkingSetBytes = st.CurrentBytes - inactFile
-			} else if hasAnon {
-				st.WorkingSetBytes = anon + actFile
+		if kv := parseMemStatV1(v1Stat); kv.matched {
+			st.AnonBytes = kv.anon
+			st.FileBytes = kv.file
+			st.ActiveFileBytes = kv.activeFile
+			st.InactiveFile = kv.inactiveFile
+			if kv.hasInactiveFile && st.CurrentBytes >= kv.inactiveFile {
+				st.WorkingSetBytes = st.CurrentBytes - kv.inactiveFile
+			} else if kv.hasAnon {
+				st.WorkingSetBytes = kv.anon + kv.activeFile
 				if st.CurrentBytes > 0 && st.WorkingSetBytes > st.CurrentBytes {
 					st.WorkingSetBytes = st.CurrentBytes
 				}
@@ -967,15 +1071,7 @@ func parseCgroupMemoryStatus(v2Current, v2Max, v2Stat, v1Usage, v1Limit, v1Stat,
 	return st
 }
 
-// readCgroupMemoryStatus performs a lightweight live read of cgroup v2/v1 memory files
-// with zero external commands and safe fallback on non-cgroup/macOS environments.
-func readCgroupMemoryStatus() CgroupMemoryStatus {
-	cgroupMemReaderMu.RLock()
-	fn := cgroupMemReaderOverride
-	cgroupMemReaderMu.RUnlock()
-	if fn != nil {
-		return fn()
-	}
+func readCgroupMemoryStatusUncached() CgroupMemoryStatus {
 	readStr := func(p string) string {
 		b, err := os.ReadFile(p)
 		if err != nil {
@@ -1005,6 +1101,39 @@ func readCgroupMemoryStatus() CgroupMemoryStatus {
 		}
 	}
 	return parseCgroupMemoryStatus(v2Cur, v2Max, v2Stat, v1Usage, v1Limit, v1Stat, procMem)
+}
+
+// readCgroupMemoryStatusFresh forces a fresh uncached cgroup memory read (used immediately after
+// evicting workers or stopping ws-imagegen to avoid over-eviction from stale cache) and refreshes the 250ms cache.
+func readCgroupMemoryStatusFresh() CgroupMemoryStatus {
+	cgroupMemReaderMu.RLock()
+	fn := cgroupMemReaderOverride
+	cgroupMemReaderMu.RUnlock()
+	if fn != nil {
+		return fn()
+	}
+	st := readCgroupMemoryStatusUncached()
+	cgroupMemCache.Store(&cachedCgroupMemStatus{
+		status: st,
+		readAt: time.Now(),
+	})
+	return st
+}
+
+// readCgroupMemoryStatus performs a lightweight live read of cgroup v2/v1 memory files
+// with a 250ms lock-free atomic.Pointer cache (bypassed when test hooks are installed).
+func readCgroupMemoryStatus() CgroupMemoryStatus {
+	cgroupMemReaderMu.RLock()
+	fn := cgroupMemReaderOverride
+	cgroupMemReaderMu.RUnlock()
+	if fn != nil {
+		return fn()
+	}
+	now := time.Now()
+	if cached := cgroupMemCache.Load(); cached != nil && now.Sub(cached.readAt) < cgroupMemCacheTTL {
+		return cached.status
+	}
+	return readCgroupMemoryStatusFresh()
 }
 
 // parseHostMemLimitMB extracts container/host memory ceiling in MB from cgroup v2 memory.max,
@@ -1435,27 +1564,6 @@ func (am *AccountManager) collectGlobalWorkerSlots(now time.Time, timeout time.D
 	return totalLive, totalLogical, totalHibernated, cands
 }
 
-func sortGlobalWorkerCandidates(cands []globalWorkerCandidate) {
-	sort.Slice(cands, func(i, j int) bool {
-		a, b := cands[i], cands[j]
-		aParked := a.cand.Status == "PARKED"
-		bParked := b.cand.Status == "PARKED"
-		if aParked != bParked {
-			return !aParked
-		}
-		if a.cand.LruScore != b.cand.LruScore {
-			return a.cand.LruScore < b.cand.LruScore
-		}
-		if a.cand.IdleSec != b.cand.IdleSec {
-			return a.cand.IdleSec > b.cand.IdleSec
-		}
-		if a.target.accountID != b.target.accountID {
-			return a.target.accountID < b.target.accountID
-		}
-		return a.cand.ConvKey < b.cand.ConvKey
-	})
-}
-
 // sortGlobalWorkerCandidatesTiered orders cross-account eviction candidates strictly by
 // Watermark-Driven Tiered LRU:
 //
@@ -1619,6 +1727,9 @@ func (am *AccountManager) AcquireGlobalWorkerSlotExcluding(ctx context.Context, 
 	nonPreemptive := priorityHint == "probe"
 	_, highPct := effectiveMemPressureThresholds()
 
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if waitCtx.Err() != nil {
 		return "", &SoftError{StatusCode: 529, ErrorType: "overloaded_error", Message: "All global live worker slots are busy; retry shortly"}
 	}
@@ -1644,6 +1755,9 @@ func (am *AccountManager) AcquireGlobalWorkerSlotExcluding(ctx context.Context, 
 	defer am.removeAdmitWaiter(w)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if waitCtx.Err() != nil {
 			return "", &SoftError{StatusCode: 529, ErrorType: "overloaded_error", Message: "All global live worker slots are busy; retry shortly"}
 		}
@@ -1657,6 +1771,9 @@ func (am *AccountManager) AcquireGlobalWorkerSlotExcluding(ctx context.Context, 
 			case <-w.ch:
 				continue
 			case <-waitCtx.Done():
+				if err := ctx.Err(); err != nil {
+					return "", err
+				}
 				return "", &SoftError{StatusCode: 529, ErrorType: "overloaded_error", Message: "All global live worker slots are busy; retry shortly"}
 			}
 		}
@@ -1737,7 +1854,7 @@ func (am *AccountManager) AcquireGlobalWorkerSlotExcluding(ctx context.Context, 
 		// evicting conversation workers. (When highMem is false and only effectiveUsed >= burstMax,
 		// stopping idle ws-imagegen does not reduce conversation totalLive.)
 		if highMem && globalIdleImageGenStopHook != nil && globalIdleImageGenStopHook() {
-			mem = readCgroupMemoryStatus()
+			mem = readCgroupMemoryStatusFresh()
 			highMem = mem.HasLiveUsage && mem.LimitBytes > 0 && mem.UsagePct >= globalAdmitHighMemPct
 			if effectiveUsed < burstMax && !highMem {
 				if lid, ok := tryGrant(totalLive, totalLogical, totalHibernated, mem); ok {
@@ -1795,7 +1912,7 @@ func (am *AccountManager) AcquireGlobalWorkerSlotExcluding(ctx context.Context, 
 					totalLive = 0
 				}
 				totalHibernated += hibTotal
-				mem = readCgroupMemoryStatus()
+				mem = readCgroupMemoryStatusFresh()
 				if lid, ok := tryGrant(totalLive, totalLogical, totalHibernated, mem); ok {
 					am.admitExecMu.Unlock()
 					return lid, nil
@@ -1822,6 +1939,9 @@ func (am *AccountManager) AcquireGlobalWorkerSlotExcluding(ctx context.Context, 
 		case <-timer.C:
 		case <-waitCtx.Done():
 			timer.Stop()
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
 			return "", &SoftError{StatusCode: 529, ErrorType: "overloaded_error", Message: "All global live worker slots are busy; retry shortly"}
 		}
 	}
@@ -1833,6 +1953,9 @@ func acquireGlobalWorkerSlotFromParent(ctx context.Context, parentDashPort int, 
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, globalAdmitWaitTimeout+3*time.Second)
 	defer cancel()
@@ -1862,6 +1985,13 @@ func acquireGlobalWorkerSlotFromParent(ctx context.Context, parentDashPort int, 
 		return "", nil
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == 499 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return "", context.Canceled
+	}
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return "", nil
@@ -1869,6 +1999,9 @@ func acquireGlobalWorkerSlotFromParent(ctx context.Context, parentDashPort int, 
 	var out GlobalAdmitResponse
 	_ = json.NewDecoder(io.LimitReader(resp.Body, 32*1024)).Decode(&out)
 	if resp.StatusCode == 529 || (resp.StatusCode == http.StatusServiceUnavailable && out.StatusCode == 529) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		msg := strings.TrimSpace(out.Error)
 		if msg == "" {
 			msg = "All global live worker slots are busy; retry shortly"
@@ -1929,11 +2062,13 @@ func (am *AccountManager) hibernateGlobalVictimBatch(ctx context.Context, victim
 		g.convKeys = append(g.convKeys, v.cand.ConvKey)
 	}
 	apiKey := defaultPeerAPIKey(gwcfg.Current())
-	totalHib := 0
-	byAcc := make(map[string]int, len(order))
-	evicted := make(map[string]bool, len(victims))
-	for _, accID := range order {
-		g := grouped[accID]
+	type batchResult struct {
+		accID string
+		resp  HibernateLRUResponse
+		err   error
+	}
+	results := make([]batchResult, len(order))
+	execOne := func(idx int, accID string, g *batchGroup) {
 		req := HibernateLRURequest{
 			Count:         len(g.convKeys),
 			IncludeParked: includeParked,
@@ -1949,11 +2084,31 @@ func (am *AccountManager) hibernateGlobalVictimBatch(ctx context.Context, victim
 		} else {
 			resp, err = postChildHibernateLRU(ctx, g.target.dashPort, apiKey, req)
 		}
-		if err == nil && resp.Hibernated > 0 {
-			totalHib += resp.Hibernated
-			byAcc[accID] += resp.Hibernated
-			for _, k := range resp.HibernatedConvKeys {
-				evicted[accID+"|"+k] = true
+		results[idx] = batchResult{accID: accID, resp: resp, err: err}
+	}
+	if len(order) == 1 {
+		accID := order[0]
+		execOne(0, accID, grouped[accID])
+	} else {
+		var wg sync.WaitGroup
+		wg.Add(len(order))
+		for i, accID := range order {
+			go func(idx int, id string, grp *batchGroup) {
+				defer wg.Done()
+				execOne(idx, id, grp)
+			}(i, accID, grouped[accID])
+		}
+		wg.Wait()
+	}
+	totalHib := 0
+	byAcc := make(map[string]int, len(order))
+	evicted := make(map[string]bool, len(victims))
+	for _, r := range results {
+		if r.err == nil && r.resp.Hibernated > 0 {
+			totalHib += r.resp.Hibernated
+			byAcc[r.accID] += r.resp.Hibernated
+			for _, k := range r.resp.HibernatedConvKeys {
+				evicted[r.accID+"|"+k] = true
 			}
 		}
 	}
@@ -2019,7 +2174,7 @@ func (am *AccountManager) runGlobalMemoryGovernorTick(now time.Time) GlobalMemor
 		beforePct := mem.UsagePct
 		stopped := globalIdleImageGenStopHook()
 		if stopped && refreshMem {
-			mem = readCgroupMemoryStatus()
+			mem = readCgroupMemoryStatusFresh()
 			if logPressure {
 				LogEvent("GLOBAL_MEM_GOVERNOR_STOP_IMAGEGEN", fmt.Sprintf("Stopped idle ws-imagegen engine(s) under cgroup memory pressure (%.1f%% -> %.1f%%)", beforePct, mem.UsagePct), map[string]any{
 					"stopped":              1,
@@ -2072,7 +2227,7 @@ func (am *AccountManager) runGlobalMemoryGovernorTick(now time.Time) GlobalMemor
 				for k := range ev {
 					evictedSet[k] = true
 				}
-				mem = readCgroupMemoryStatus()
+				mem = readCgroupMemoryStatusFresh()
 				LogEvent("GLOBAL_MEM_GOVERNOR_HIBERNATE", fmt.Sprintf("Hibernated %d idle worker(s) across accounts to converge to global idle target %d", hibN, idleTarget), map[string]any{
 					"trigger":                   "global_worker_cap",
 					"reason":                    reason,
@@ -2103,7 +2258,7 @@ func (am *AccountManager) runGlobalMemoryGovernorTick(now time.Time) GlobalMemor
 				for k := range ev {
 					evictedSet[k] = true
 				}
-				mem = readCgroupMemoryStatus()
+				mem = readCgroupMemoryStatusFresh()
 				LogEvent("GLOBAL_MEM_GOVERNOR_HIBERNATE", fmt.Sprintf("Elastically offloaded %d parked worker(s) across accounts to converge to global idle target %d", hibN, idleTarget), map[string]any{
 					"trigger":                   "elastic_parked_offload",
 					"reason":                    "elastic_parked_offload",
@@ -2179,7 +2334,7 @@ func (am *AccountManager) runGlobalMemoryGovernorTick(now time.Time) GlobalMemor
 					for k := range ev {
 						evictedSet[k] = true
 					}
-					mem = readCgroupMemoryStatus()
+					mem = readCgroupMemoryStatusFresh()
 					if mem.HasLiveUsage && mem.UsagePct < targetPct {
 						break
 					}
@@ -2234,7 +2389,7 @@ func (am *AccountManager) runGlobalMemoryGovernorTick(now time.Time) GlobalMemor
 						for k := range ev {
 							evictedSet[k] = true
 						}
-						mem = readCgroupMemoryStatus()
+						mem = readCgroupMemoryStatusFresh()
 						LogEvent("GLOBAL_MEM_GOVERNOR_HIBERNATE", fmt.Sprintf("Proactively hibernated %d idle worker(s) (>=60s) under cgroup memory warning (%.1f%%)", hibN, startPct), map[string]any{
 							"trigger":               "mem_pressure_warn",
 							"thresholdPct":          warnPct,
@@ -2276,7 +2431,7 @@ func (am *AccountManager) runGlobalMemoryGovernorTick(now time.Time) GlobalMemor
 						for k := range ev {
 							evictedSet[k] = true
 						}
-						mem = readCgroupMemoryStatus()
+						mem = readCgroupMemoryStatusFresh()
 						LogEvent("GLOBAL_MEM_GOVERNOR_HIBERNATE", fmt.Sprintf("Elastically offloaded %d parked worker(s) under cgroup memory pressure (%.1f%% -> %.1f%%)", hibN, startPct, mem.UsagePct), map[string]any{
 							"trigger":               "elastic_parked_offload",
 							"reason":                "elastic_parked_offload",
@@ -2310,85 +2465,6 @@ func (am *AccountManager) runGlobalMemoryGovernorTick(now time.Time) GlobalMemor
 	}
 	am.memSnapMu.Unlock()
 	return res
-}
-
-// TryPreSpawnGlobalCapCheck performs a best-effort, single-flight, short-timeout global worker cap
-// check ahead of spawning a new session so multi-account bursts converge rapidly within GlobalMaxLiveWorkers.
-func (am *AccountManager) TryPreSpawnGlobalCapCheck(excludePrimaryConvKey string) {
-	if am == nil || isChildAccountWorker() {
-		return
-	}
-	gCap := am.EffectiveGlobalMaxLiveWorkers()
-	if gCap <= 0 {
-		return
-	}
-	now := time.Now()
-	// Coalesce burst checks: skip HTTP fan-out when a recent snapshot is well below cap.
-	snap := am.SnapshotGlobalMemory()
-	if !snap.UpdatedAt.IsZero() && now.Sub(snap.UpdatedAt) < 2*time.Second && snap.GlobalLiveWorkers < gCap-1 {
-		return
-	}
-	if lastNs := am.preSpawnGovLastNs.Load(); lastNs > 0 && now.Sub(time.Unix(0, lastNs)) < 250*time.Millisecond {
-		if snap.GlobalLiveWorkers < gCap {
-			return
-		}
-	}
-	if !am.preSpawnGovRunning.CompareAndSwap(false, true) {
-		return
-	}
-	defer func() {
-		am.preSpawnGovLastNs.Store(time.Now().UnixNano())
-		am.preSpawnGovRunning.Store(false)
-	}()
-
-	totalLive, totalLogical, totalHibernated, cands := am.collectGlobalWorkerSlots(now, 250*time.Millisecond, "", excludePrimaryConvKey)
-	if totalLive >= gCap {
-		sortGlobalWorkerCandidates(cands)
-		need := totalLive - gCap + 1
-		var victims []globalWorkerCandidate
-		for _, c := range cands {
-			if len(victims) >= need {
-				break
-			}
-			if c.cand.Status != "IDLE" {
-				continue
-			}
-			victims = append(victims, c)
-		}
-		if len(victims) > 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
-			reason := fmt.Sprintf("global_worker_cap_prespawn_%d", gCap)
-			hibN, byAcc, _ := am.hibernateGlobalVictimBatch(ctx, victims, false, reason)
-			cancel()
-			if hibN > 0 {
-				totalLive -= hibN
-				if totalLive < 0 {
-					totalLive = 0
-				}
-				totalHibernated += hibN
-				mem := readCgroupMemoryStatus()
-				LogEvent("GLOBAL_MEM_GOVERNOR_HIBERNATE", fmt.Sprintf("Pre-spawn hibernated %d idle worker(s) to preserve global cap %d", hibN, gCap), map[string]any{
-					"trigger":               "global_worker_cap_prespawn",
-					"hibernated":            hibN,
-					"byAccount":             byAcc,
-					"afterLiveWorkers":      totalLive,
-					"globalMaxLiveWorkers":  gCap,
-					"cgroupWorkingSetBytes": mem.WorkingSetBytes,
-					"cgroupLimitBytes":      mem.LimitBytes,
-				})
-			}
-		}
-	}
-	am.memSnapMu.Lock()
-	am.memSnap = GlobalMemorySnapshot{
-		UpdatedAt:                time.Now(),
-		GlobalLiveWorkers:        totalLive,
-		GlobalMaxLiveWorkers:     gCap,
-		GlobalLogicalSessions:    totalLogical,
-		GlobalHibernatedSessions: totalHibernated,
-		Cgroup:                   readCgroupMemoryStatus(),
-	}
-	am.memSnapMu.Unlock()
 }
 
 // startGlobalMemoryGovernor launches the 5s cross-account memory & worker governor in the master process.
@@ -3426,47 +3502,12 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 		return abortPlaceholder(err, true)
 	}
 
-	targetURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", gwPort))
-	rp := httputil.NewSingleHostReverseProxy(targetURL)
-	rp.FlushInterval = -1
-	baseDirector := rp.Director
-	rp.Director = func(req *http.Request) {
-		baseDirector(req)
-		req.Header.Del("X-Forwarded-Host")
-		req.Header.Del("X-Forwarded-Proto")
-		req.Header.Del("X-Forwarded-For")
-	}
 	tr := &http.Transport{
 		Proxy:               nil,
 		MaxIdleConns:        32,
 		MaxIdleConnsPerHost: 16,
 		IdleConnTimeout:     60 * time.Second,
-	}
-	rp.Transport = tr
-	accIDCopy := acc.ID
-	rp.ModifyResponse = func(resp *http.Response) error {
-		if resp != nil {
-			modelID := ""
-			if meta, ok := routedAccountMetaFromRequest(resp.Request); ok {
-				modelID = meta.modelID
-			}
-			am.RecordAccountOutcome(accIDCopy, modelID, resp.StatusCode, "", resp.Header.Get("Retry-After"), "")
-		}
-		return nil
-	}
-	rp.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
-		modelID := ""
-		if meta, ok := routedAccountMetaFromRequest(req); ok {
-			modelID = meta.modelID
-		}
-		redacted := gwcfg.RedactSecretsInString(proxyErr.Error())
-		am.RecordAccountOutcome(accIDCopy, modelID, http.StatusBadGateway, "account_worker_unreachable", "", redacted)
-		LogEvent("ACCOUNT_PROXY_ERR", "Child account worker reverse proxy error", map[string]any{
-			"accountId": accIDCopy,
-			"error":     redacted,
-		})
-		writeAccountRouteError(rw, req.URL.Path, http.StatusBadGateway, "account_worker_error", "account_worker_unreachable",
-			fmt.Sprintf("Account %q worker is temporarily unreachable; retry shortly.", accIDCopy))
+		DisableCompression:  true,
 	}
 
 	am.mu.Lock()
@@ -3482,7 +3523,6 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 	proc.gwPort = gwPort
 	proc.dashPort = dashPort
 	proc.cmd = cmd
-	proc.proxy = rp
 	proc.transport = tr
 	am.mu.Unlock()
 
@@ -3522,15 +3562,16 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 		}
 	}(proc, resolvedProxy, stderrTail)
 
-	cleanupFailed := func(err error) error {
+	cleanupFailed := func(err error) {
 		am.mu.Lock()
 		if am.workers[acc.ID] == proc {
 			delete(am.workers, acc.ID)
 		}
 		wasIntentional := proc.intentionalStop
+		wasStopped := proc.stopped
 		proc.intentionalStop = true
 		proc.stopped = true
-		if !wasIntentional {
+		if !wasIntentional && !wasStopped {
 			cs := am.crashStates[acc.ID]
 			cs.failures++
 			cs.backoffUntil = time.Now().Add(workerCrashBackoffDuration(cs.failures))
@@ -3561,23 +3602,39 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 				}
 			}(proc.done, pid)
 		}
-		return err
 	}
 
-	// Wait for child /healthz on loopback with bounded per-probe timeout, aborting immediately if child exits early
-	// or caller cancels. Allow 12s so large-DB child workers (hundreds of restored sessions) finish SQLite restore cleanly.
-	deadline := time.Now().Add(12 * time.Second)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
-	}
+	// Decouple the fixed 12s /healthz readiness polling from the triggering caller's ctx so that
+	// a single client disconnect never kills a healthy booting shared child worker or triggers crash backoff.
 	healthURL := fmt.Sprintf("http://127.0.0.1:%d/healthz", gwPort)
+	go am.pollAccountWorkerReady(acc, proc, healthURL, 12*time.Second, cleanupFailed)
+
+	select {
+	case <-proc.readyCh:
+		return proc.readyErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (am *AccountManager) pollAccountWorkerReady(acc AccountProfile, proc *accountWorkerProc, healthURL string, bootTimeout time.Duration, cleanupFailed func(error)) {
+	if bootTimeout <= 0 {
+		bootTimeout = 12 * time.Second
+	}
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), bootTimeout)
+	defer bootCancel()
+	deadline := time.Now().Add(bootTimeout)
 	healthy := false
 	for time.Now().Before(deadline) {
 		select {
 		case <-proc.done:
-			return cleanupFailed(fmt.Errorf("worker for account %q exited before becoming healthy", acc.ID))
-		case <-ctx.Done():
-			return cleanupFailed(ctx.Err())
+			cleanupFailed(fmt.Errorf("worker for account %q exited before becoming healthy", acc.ID))
+			return
+		case <-proc.readyCh:
+			return
+		case <-bootCtx.Done():
+			cleanupFailed(fmt.Errorf("worker for account %q healthz timeout", acc.ID))
+			return
 		default:
 		}
 		probeTimeout := time.Until(deadline)
@@ -3587,11 +3644,12 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 		if probeTimeout <= 0 {
 			break
 		}
-		probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
+		probeCtx, probeCancel := context.WithTimeout(bootCtx, probeTimeout)
 		reqH, reqErr := http.NewRequestWithContext(probeCtx, http.MethodGet, healthURL, nil)
 		if reqErr == nil {
 			resp, doErr := peerHTTPClient.Do(reqH)
 			if doErr == nil {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
 				_ = resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
 					probeCancel()
@@ -3601,27 +3659,40 @@ func (am *AccountManager) EnsureAccountWorkerRunningWithContext(ctx context.Cont
 			}
 		}
 		probeCancel()
-		time.Sleep(40 * time.Millisecond)
+		t := time.NewTimer(40 * time.Millisecond)
+		select {
+		case <-t.C:
+		case <-proc.done:
+			t.Stop()
+			cleanupFailed(fmt.Errorf("worker for account %q exited before becoming healthy", acc.ID))
+			return
+		case <-proc.readyCh:
+			t.Stop()
+			return
+		case <-bootCtx.Done():
+			t.Stop()
+			cleanupFailed(fmt.Errorf("worker for account %q healthz timeout", acc.ID))
+			return
+		}
 	}
 	if !healthy {
-		return cleanupFailed(fmt.Errorf("worker for account %q healthz timeout", acc.ID))
+		cleanupFailed(fmt.Errorf("worker for account %q healthz timeout", acc.ID))
+		return
 	}
 	am.mu.Lock()
 	if proc.stopped || am.workers[acc.ID] != proc {
-		err := proc.readyErr
 		am.mu.Unlock()
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf("worker for account %q was stopped during startup", acc.ID)
+		return
 	}
 	proc.healthyAt = time.Now()
 	proc.finishReady(nil)
 	routingSnap := am.routing
+	dashPort := proc.dashPort
 	am.mu.Unlock()
-	ign := acc.IgnoreBurnAnomaly
-	am.pushMonitorPolicyToChild(acc.ID, dashPort, routingSnap, &ign)
-	return nil
+	if dashPort > 0 {
+		ign := acc.IgnoreBurnAnomaly
+		am.pushMonitorPolicyToChild(acc.ID, dashPort, routingSnap, &ign)
+	}
 }
 
 func (am *AccountManager) StopAccountWorker(accountID string) {
@@ -3684,7 +3755,7 @@ func (am *AccountManager) StopAll() {
 func (am *AccountManager) IsWorkerRunning(accountID string) (running bool, gwPort, dashPort int) {
 	am.mu.RLock()
 	defer am.mu.RUnlock()
-	if w, ok := am.workers[accountID]; ok && w != nil && !w.stopped && w.proxy != nil && w.gwPort > 0 {
+	if w, ok := am.workers[accountID]; ok && w != nil && !w.stopped && (w.transport != nil || w.proxy != nil) && w.gwPort > 0 {
 		return true, w.gwPort, w.dashPort
 	}
 	return false, 0, 0
@@ -3809,35 +3880,9 @@ func isPrimaryModel5hExhausted(canonicalModelID string) bool {
 }
 
 func isAccountModel5hExhausted(accountID string, dashPort int, canonicalModelID string) bool {
-	if dashPort <= 0 {
-		return false
-	}
-	cacheKey := fmt.Sprintf("%s|http://127.0.0.1:%d", accountID, dashPort)
-	cachedQuota, fetchedAt, ok := lookupCachedPeerQuota(cacheKey)
 	now := time.Now()
-	// Trigger non-blocking background refresh via lightweight /api/internal/quota-lite
-	// when peer quota cache is missing or older than 60s (never waking child /api/dashboard cache).
-	peerDashCacheMu.Lock()
-	lastAttempt := peerQuotaLiteLastAttempt[cacheKey]
-	shouldTrigger := !testing.Testing() &&
-		(!ok || now.Sub(fetchedAt) > 60*time.Second) &&
-		now.Sub(lastAttempt) > 10*time.Second
-	if shouldTrigger {
-		peerQuotaLiteLastAttempt[cacheKey] = now
-	}
-	peerDashCacheMu.Unlock()
-	if shouldTrigger {
-		peer := gwcfg.DashboardPeerConfig{
-			ID:      accountID,
-			Label:   accountID,
-			BaseURL: fmt.Sprintf("http://127.0.0.1:%d", dashPort),
-		}
-		fallbackKey := defaultPeerAPIKey(gwcfg.Current())
-		go func(p gwcfg.DashboardPeerConfig, k string) {
-			_, _, _ = fetchPeerQuotaLite(p, false, k)
-		}(peer, fallbackKey)
-	}
-	if !ok || now.Sub(fetchedAt) > 20*time.Minute {
+	cachedQuota, ok := getPeerQuotaFreshOrTrigger(accountID, dashPort, now)
+	if !ok {
 		return false
 	}
 	return quotaGroupsModel5hExhausted(cachedQuota.Groups, cachedQuota.ArgonPool, canonicalModelID, now)
@@ -6230,8 +6275,11 @@ func (am *AccountManager) TryRouteAPIRequestWithFinish(w http.ResponseWriter, r 
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 			_ = resp.Body.Close()
 			effStatus, eType, eMsg := classifyChildErrorBody(resp.StatusCode, errBody)
-			localSlotFull := isLocalWorkerSlotError(effStatus, eType, eMsg, resp.Header)
-			if localSlotFull {
+			globalSlotFull := isGlobalWorkerSlotError(effStatus, eType, eMsg, resp.Header)
+			localSlotFull := !globalSlotFull && isLocalWorkerSlotError(effStatus, eType, eMsg, resp.Header)
+			if globalSlotFull {
+				// Global admission saturation is shared across all accounts; never poison account cooldown or failover-cascade.
+			} else if localSlotFull {
 				am.RecordLocalSlotHint(acc.ID, -1, true, time.Now())
 			} else if !isNonUpstream {
 				am.RecordAccountOutcome(acc.ID, modelID, effStatus, eType, resp.Header.Get("Retry-After"), eMsg)
@@ -6241,7 +6289,7 @@ func (am *AccountManager) TryRouteAPIRequestWithFinish(w http.ResponseWriter, r 
 				statusCode: resp.StatusCode, headers: resp.Header.Clone(), body: errBody,
 				isStructured: true, failoverCount: attempt,
 			}
-			if allowHop && r.Context().Err() == nil && shouldRetryChildPreStreamFailure(effStatus, eType, eMsg) {
+			if allowHop && r.Context().Err() == nil && !globalSlotFull && shouldRetryChildPreStreamFailure(effStatus, eType, eMsg) {
 				pick.ReleaseFlight()
 				am.RecordAccountFailoverOut(acc.ID)
 				if excluded == nil {
@@ -6294,7 +6342,9 @@ func (am *AccountManager) TryRouteAPIRequestWithFinish(w http.ResponseWriter, r 
 		if !isNonUpstream {
 			if isStreamingResp {
 				if completed {
-					if isLocalWorkerSlotError(midStatus, midType, midMsg, resp.Header) {
+					if isGlobalWorkerSlotError(midStatus, midType, midMsg, resp.Header) {
+						// Global admission saturation mid-stream (e.g. after SSE heartbeat); never poison account cooldown.
+					} else if isLocalWorkerSlotError(midStatus, midType, midMsg, resp.Header) {
 						am.RecordLocalSlotHint(acc.ID, -1, true, time.Now())
 					} else {
 						am.RecordAccountOutcome(acc.ID, modelID, midStatus, midType, "", midMsg)

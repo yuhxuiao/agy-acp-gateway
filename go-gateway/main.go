@@ -35,27 +35,30 @@ func main() {
 		GlobalAccountManager.SetPrimaryCancelParkedFn(gw.CancelParkedConversation)
 	}
 
-	// Pre-warm SQLite index asynchronously so the first dashboard poll is instant, then release temp buffers to OS
-	go func() {
-		gwSids := getKnownGatewaySids()
-		convDir := ConversationsDir()
-		appConvDir := AppConversationsDir()
-		if GlobalStore.IsReady() {
-			if convDir != "" {
-				GlobalStore.SyncUsageStepsFromDir(convDir, gwSids)
+	// Pre-warm SQLite index asynchronously so the first dashboard poll is instant, then release temp buffers to OS.
+	// Child account workers skip full startup usage directory scans; the primary gateway owns usage telemetry sync.
+	if !isChildAccountWorker() {
+		go func() {
+			gwSids := getKnownGatewaySids()
+			convDir := ConversationsDir()
+			appConvDir := AppConversationsDir()
+			if GlobalStore.IsReady() {
+				if convDir != "" {
+					GlobalStore.SyncUsageStepsFromDir(convDir, gwSids)
+				}
+				if appConvDir != "" {
+					GlobalStore.SyncUsageStepsFromSourceDir(appConvDir, "APP", "AGY_APP", "Antigravity App", gwSids)
+				}
+			} else {
+				_ = readFallbackStepsFromDir(convDir, "HOST", "AGY_CLI", "AGY CLI", gwSids)
+				if appConvDir != "" {
+					_ = readFallbackStepsFromDir(appConvDir, "APP", "AGY_APP", "Antigravity App", gwSids)
+				}
 			}
-			if appConvDir != "" {
-				GlobalStore.SyncUsageStepsFromSourceDir(appConvDir, "APP", "AGY_APP", "Antigravity App", gwSids)
-			}
-		} else {
-			_ = readFallbackStepsFromDir(convDir, "HOST", "AGY_CLI", "AGY CLI", gwSids)
-			if appConvDir != "" {
-				_ = readFallbackStepsFromDir(appConvDir, "APP", "AGY_APP", "Antigravity App", gwSids)
-			}
-		}
-		runtime.GC()
-		debug.FreeOSMemory()
-	}()
+			runtime.GC()
+			debug.FreeOSMemory()
+		}()
+	}
 
 	srv18890 := gatewayHTTPServer(fmt.Sprintf("%s:%d", ListenHost, GatewayPort), gw.GatewayOnlyHandler())
 	srv18891 := gatewayHTTPServer(fmt.Sprintf("%s:%d", ListenHost, DashboardPort), gw.DashboardOnlyHandler())

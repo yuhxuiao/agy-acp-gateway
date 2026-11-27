@@ -297,7 +297,14 @@ func verifyMediaMagicBytes(mime string, raw []byte) bool {
 	}
 	switch m {
 	case "application/pdf":
-		return len(raw) >= 5 && bytes.HasPrefix(raw, []byte("%PDF-"))
+		if len(raw) < 10 || !bytes.HasPrefix(raw, []byte("%PDF-")) {
+			return false
+		}
+		tail := raw
+		if len(tail) > 4096 {
+			tail = raw[len(raw)-4096:]
+		}
+		return bytes.Contains(tail, []byte("%%EOF"))
 	case "video/mp4", "video/quicktime", "video/3gpp", "video/x-m4v", "audio/mp4", "audio/m4a", "audio/x-m4a":
 		return isValidISOBMFFMediaMagic(raw)
 	case "video/webm", "audio/webm":
@@ -481,6 +488,9 @@ func normalizeMediaAttachmentWithCtx(mctx *mediaNormalizeContext, mime, rawB64, 
 
 	// Magic-byte verification.
 	if !verifyMediaMagicBytes(m, decoded) {
+		if isPDF && bytes.HasPrefix(decoded, []byte("%PDF-")) {
+			return nil, newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("media attachment failed magic-byte verification for %q (truncated PDF missing trailing %%%%EOF marker)", m))
+		}
 		return nil, newMMError(http.StatusBadRequest, fieldPath, fmt.Sprintf("media attachment failed magic-byte verification for %q", m))
 	}
 

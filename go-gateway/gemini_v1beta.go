@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -66,6 +68,15 @@ func classifyGeminiUpstreamError(err error) (httpCode int, retryAfter bool, msg 
 		rawCode = http.StatusTooManyRequests
 	}
 	return rawCode, retry, errMsg
+}
+
+func isGeminiGlobalWorkerSlotError(statusCode int, errMsg string) bool {
+	if statusCode != 529 && statusCode != http.StatusTooManyRequests {
+		return false
+	}
+	low := strings.ToLower(strings.TrimSpace(errMsg))
+	return strings.Contains(low, "all global live worker slots are busy") ||
+		strings.Contains(low, "global worker admission queue")
 }
 
 func (gs *GatewayServer) handleGeminiV1Beta(w http.ResponseWriter, r *http.Request, reqID int64) {
@@ -1311,8 +1322,13 @@ func (gs *GatewayServer) handleGeminiGenerateContent(w http.ResponseWriter, r *h
 			if retryAfter {
 				w.Header().Set("Retry-After", extractRetryAfterHeaderValue(errMsg))
 			}
-			if isChildAccountWorker() && isLocalWorkerSlotError(httpCode, errType, errMsg, nil) {
-				w.Header().Set(internalLocalSlotFullHeader, "1")
+			if isChildAccountWorker() {
+				if isLocalWorkerSlotError(httpCode, errType, errMsg, nil) {
+					w.Header().Set(internalLocalSlotFullHeader, "1")
+				}
+				if isGeminiGlobalWorkerSlotError(httpCode, errMsg) {
+					w.Header().Set("X-Agy-Global-Slot-Full", "1")
+				}
 			}
 			writeGeminiError(w, httpCode, errMsg)
 			return
@@ -1456,11 +1472,19 @@ func (gs *GatewayServer) handleGeminiGenerateContent(w http.ResponseWriter, r *h
 				if retryAfter {
 					extra = map[string]string{"Retry-After": extractRetryAfterHeaderValue(errMsg)}
 				}
-				if isChildAccountWorker() && isLocalWorkerSlotError(httpCode, errType, errMsg, nil) {
-					if extra == nil {
-						extra = map[string]string{}
+				if isChildAccountWorker() {
+					if isLocalWorkerSlotError(httpCode, errType, errMsg, nil) {
+						if extra == nil {
+							extra = map[string]string{}
+						}
+						extra[internalLocalSlotFullHeader] = "1"
 					}
-					extra[internalLocalSlotFullHeader] = "1"
+					if isGeminiGlobalWorkerSlotError(httpCode, errMsg) {
+						if extra == nil {
+							extra = map[string]string{}
+						}
+						extra["X-Agy-Global-Slot-Full"] = "1"
+					}
 				}
 				status := httpCode
 				if status == 529 {
@@ -1548,27 +1572,43 @@ func parseGeminiImageResponseMime(raw string) (string, error) {
 	}
 }
 
-func buildGeminiImageCandidates(results []generatedImageResult) []map[string]any {
-	cands := make([]map[string]any, len(results))
-	for i := range results {
-		cands[i] = map[string]any{
-			"index": i,
-			"content": map[string]any{
-				"role": "model",
-				"parts": []map[string]any{
-					{
-						"inlineData": map[string]any{
-							"mimeType": results[i].Mime,
-							"data":     results[i].B64,
-						},
-					},
-				},
-			},
-			"finishReason": "STOP",
-		}
-		results[i].B64 = ""
+// writeGeminiImageResponseJSONToBuf streams a Gemini generateContent image response directly to bw,
+// base64-encoding each image in place and releasing results[i].Raw immediately after writing.
+func writeGeminiImageResponseJSONToBuf(bw *bufio.Writer, respID, modelVersion string, results []generatedImageResult, promptTok int) error {
+	candTok := len(results) * 256
+	respIDJSON, _ := json.Marshal(respID)
+	modelJSON, _ := json.Marshal(modelVersion)
+	if _, err := fmt.Fprintf(bw, `{"responseId":%s,"modelVersion":%s,"candidates":[`, respIDJSON, modelJSON); err != nil {
+		return err
 	}
-	return cands
+	for i := range results {
+		if i > 0 {
+			if err := bw.WriteByte(','); err != nil {
+				return err
+			}
+		}
+		mimeJSON, _ := json.Marshal(results[i].Mime)
+		if _, err := fmt.Fprintf(bw, `{"index":%d,"content":{"role":"model","parts":[{"inlineData":{"mimeType":%s,"data":"`, i, mimeJSON); err != nil {
+			results[i].Raw = nil
+			return err
+		}
+		enc := base64.NewEncoder(base64.StdEncoding, bw)
+		_, wErr := enc.Write(results[i].Raw)
+		cErr := enc.Close()
+		results[i].Raw = nil
+		if wErr != nil {
+			return wErr
+		}
+		if cErr != nil {
+			return cErr
+		}
+		if _, err := bw.WriteString(`"}}]},"finishReason":"STOP"}`); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintf(bw, `],"usageMetadata":{"promptTokenCount":%d,"candidatesTokenCount":%d,"totalTokenCount":%d}}`,
+		promptTok, candTok, promptTok+candTok)
+	return err
 }
 
 func (gs *GatewayServer) handleGeminiImageGenerateContent(w http.ResponseWriter, r *http.Request, reqID int64, reqModel string, rawBody map[string]any, isStream bool) {
@@ -1793,24 +1833,17 @@ func (gs *GatewayServer) handleGeminiImageGenerateContent(w http.ResponseWriter,
 			writeGeminiError(w, imgErr.StatusCode, imgErr.Message)
 			return
 		}
-		candTok := len(results) * 256
-		cands := buildGeminiImageCandidates(results)
-		results = nil
-
-		payload := map[string]any{
-			"responseId":   respID,
-			"modelVersion": imageGenServedModel,
-			"candidates":   cands,
-			"usageMetadata": map[string]any{
-				"promptTokenCount":     promptTok,
-				"candidatesTokenCount": candTok,
-				"totalTokenCount":      promptTok + candTok,
-			},
-		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("X-Agy-Served-Model", imageGenServedModel)
-		_ = json.NewEncoder(w).Encode(payload)
-		clear(cands)
+		bw := bufio.NewWriterSize(w, 32*1024)
+		if err := writeGeminiImageResponseJSONToBuf(bw, respID, imageGenServedModel, results, promptTok); err == nil {
+			_ = bw.WriteByte('\n')
+			_ = bw.Flush()
+		}
+		for i := range results {
+			results[i].Raw = nil
+		}
+		results = nil
 		return
 	}
 
@@ -1833,6 +1866,7 @@ func (gs *GatewayServer) handleGeminiImageGenerateContent(w http.ResponseWriter,
 			sw.WriteRaw("\n")
 		}
 	})
+	defer stream.StopHeartbeat()
 
 	results, imgErr := generateImageBatch(r.Context(), reqID, params, absPaths)
 	stream.StopHeartbeat()
@@ -1845,7 +1879,7 @@ func (gs *GatewayServer) handleGeminiImageGenerateContent(w http.ResponseWriter,
 			if !sw.HeadersCommitted() {
 				sw.CommitErrorStatus(imgErr.StatusCode, nil, "application/json; charset=utf-8")
 				b, _ := json.Marshal(buildGeminiErrorPayload(imgErr.StatusCode, imgErr.Message))
-				sw.WriteRaw(string(b) + "\n")
+				sw.WriteRawBytes(append(b, '\n'))
 				return
 			}
 			errBytes, _ := json.Marshal(buildGeminiErrorPayload(imgErr.StatusCode, imgErr.Message))
@@ -1858,29 +1892,35 @@ func (gs *GatewayServer) handleGeminiImageGenerateContent(w http.ResponseWriter,
 		return
 	}
 
-	candTok := len(results) * 256
-	cands := buildGeminiImageCandidates(results)
-	results = nil
-	payload := map[string]any{
-		"responseId":   respID,
-		"modelVersion": imageGenServedModel,
-		"candidates":   cands,
-		"usageMetadata": map[string]any{
-			"promptTokenCount":     promptTok,
-			"candidatesTokenCount": candTok,
-			"totalTokenCount":      promptTok + candTok,
-		},
-	}
-	b, _ := json.Marshal(payload)
-	clear(cands)
-	payload = nil
-
 	stream.DoLocked(func(sw *protocol.StreamWriter) {
-		if useSSE {
-			sw.WriteRaw(fmt.Sprintf("data: %s\n\n", string(b)))
-		} else {
-			sw.WriteRaw("[\n" + string(b) + "\n]\n")
-		}
+		sw.WriteStream(func(out io.Writer) error {
+			bw := bufio.NewWriterSize(out, 32*1024)
+			if useSSE {
+				if _, err := bw.WriteString("data: "); err != nil {
+					return err
+				}
+			} else {
+				if _, err := bw.WriteString("[\n"); err != nil {
+					return err
+				}
+			}
+			if err := writeGeminiImageResponseJSONToBuf(bw, respID, imageGenServedModel, results, promptTok); err != nil {
+				return err
+			}
+			if useSSE {
+				if _, err := bw.WriteString("\n\n"); err != nil {
+					return err
+				}
+			} else {
+				if _, err := bw.WriteString("\n]\n"); err != nil {
+					return err
+				}
+			}
+			return bw.Flush()
+		})
 	})
-	b = nil
+	for i := range results {
+		results[i].Raw = nil
+	}
+	results = nil
 }

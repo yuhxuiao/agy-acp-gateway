@@ -150,8 +150,9 @@ type DeltaChunk struct {
 // acpRPCError is a JSON-RPC error object returned by agy (as opposed to a transport failure or
 // timeout). Error() keeps the raw JSON so existing substring classification still applies.
 var (
-	acpMsgChunkBytes     = []byte(`"agent_message_chunk"`)
-	acpThoughtChunkBytes = []byte(`"agent_thought_chunk"`)
+	acpSessionUpdateMethodBytes = []byte(`"session/update"`)
+	acpMsgChunkBytes            = []byte(`"agent_message_chunk"`)
+	acpThoughtChunkBytes        = []byte(`"agent_thought_chunk"`)
 )
 
 // acpTextChunkListener is an optional zero-map fast-path implemented by AcpProjectSession
@@ -207,7 +208,51 @@ type acpUpdatePayload struct {
 	} `json:"content"`
 }
 
+type acpFlatSessionUpdateParams struct {
+	SessionID string           `json:"sessionId"`
+	Update    acpUpdatePayload `json:"update"`
+}
+
+type acpFastTextUpdateMsg struct {
+	ID     any                        `json:"id"`
+	Method string                     `json:"method"`
+	Params acpFlatSessionUpdateParams `json:"params"`
+}
+
+func dispatchAcpTextChunk(e *SharedAcpEngine, sessionID, updType, text string) {
+	v, ok := e.sessionListeners.Load(sessionID)
+	if !ok {
+		return
+	}
+	l, okL := v.(acp.SessionListener)
+	if !okL || l == nil {
+		return
+	}
+	if guard, okG := l.(acpPreChunkGuard); okG {
+		if !guard.ObservePreChunkGuard(updType, text) {
+			return
+		}
+	}
+	if fast, okFast := l.(acpTextChunkListener); okFast {
+		fast.HandleSessionTextChunk(updType, text)
+		return
+	}
+	l.HandleSessionUpdate(map[string]any{
+		"sessionUpdate": updType,
+		"content":       map[string]any{"text": text},
+	})
+}
+
 func dispatchAcpSessionUpdate(e *SharedAcpEngine, rawParams json.RawMessage) {
+	if bytes.Contains(rawParams, acpMsgChunkBytes) || bytes.Contains(rawParams, acpThoughtChunkBytes) {
+		var flat acpFlatSessionUpdateParams
+		if json.Unmarshal(rawParams, &flat) == nil &&
+			flat.SessionID != "" &&
+			(flat.Update.SessionUpdate == "agent_message_chunk" || flat.Update.SessionUpdate == "agent_thought_chunk") {
+			dispatchAcpTextChunk(e, flat.SessionID, flat.Update.SessionUpdate, flat.Update.Content.Text)
+			return
+		}
+	}
 	var env acpSessionUpdateEnvelope
 	if json.Unmarshal(rawParams, &env) != nil || env.SessionID == "" || len(env.Update) == 0 {
 		return
@@ -219,26 +264,6 @@ func dispatchAcpSessionUpdate(e *SharedAcpEngine, rawParams json.RawMessage) {
 	l, okL := v.(acp.SessionListener)
 	if !okL || l == nil {
 		return
-	}
-	if bytes.Contains(env.Update, acpMsgChunkBytes) || bytes.Contains(env.Update, acpThoughtChunkBytes) {
-		var typed acpUpdatePayload
-		if json.Unmarshal(env.Update, &typed) == nil &&
-			(typed.SessionUpdate == "agent_message_chunk" || typed.SessionUpdate == "agent_thought_chunk") {
-			if guard, okG := l.(acpPreChunkGuard); okG {
-				if !guard.ObservePreChunkGuard(typed.SessionUpdate, typed.Content.Text) {
-					return
-				}
-			}
-			if fast, okFast := l.(acpTextChunkListener); okFast {
-				fast.HandleSessionTextChunk(typed.SessionUpdate, typed.Content.Text)
-				return
-			}
-			l.HandleSessionUpdate(map[string]any{
-				"sessionUpdate": typed.SessionUpdate,
-				"content":       map[string]any{"text": typed.Content.Text},
-			})
-			return
-		}
 	}
 	var generic map[string]any
 	if json.Unmarshal(env.Update, &generic) == nil {
@@ -306,6 +331,13 @@ func newAuxiliaryAcpEngine(agentName string) *SharedAcpEngine {
 	e := &SharedAcpEngine{agentName: agentName, appDataDir: appDir, auxiliary: true}
 	e.bootCond = sync.NewCond(&e.mu)
 	return e
+}
+
+func (e *SharedAcpEngine) pipeBufSize() int {
+	if e != nil && (e.auxiliary || isChildAccountWorker()) {
+		return 64 * 1024
+	}
+	return 256 * 1024
 }
 
 func (e *SharedAcpEngine) CurrentGen() uint64 {
@@ -516,7 +548,7 @@ func (e *SharedAcpEngine) EnsureStarted() error {
 	replyCh := make(chan map[string]any, 256)
 	e.exitDone = done
 	e.replyCh = replyCh
-	e.stdin = bufio.NewWriterSize(stdinPipe, 256*1024)
+	e.stdin = bufio.NewWriterSize(stdinPipe, e.pipeBufSize())
 	e.stdinCloser = stdinPipe
 	e.mu.Unlock()
 
@@ -843,6 +875,36 @@ type splitActivityRPCEngine interface {
 	RPCWithSplitActivity(ctx context.Context, method string, params any, maxDuration time.Duration, lastActivityElapsedNs *atomic.Int64, start time.Time, phaseFn func() promptIdlePhase) (json.RawMessage, error)
 }
 
+func (e *SharedAcpEngine) sendPendingRPC(method string, params any) (int64, chan rpcResult, error) {
+	if method != "session/close" && method != "session/cancel" {
+		if err := circuitError(); err != nil {
+			return 0, nil, err
+		}
+	}
+	id := e.nextID.Add(1)
+	ch := make(chan rpcResult, 1)
+	e.pending.Store(id, ch)
+	err := e.sendRawJSON(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		e.pending.Delete(id)
+		return 0, nil, err
+	}
+	return id, ch, nil
+}
+
+func unwrapRPCResult(res rpcResult) (json.RawMessage, error) {
+	if res.Err != nil && IsTosViolationError(res.Err.Error()) {
+		TripTosCircuitBreaker(res.Err.Error())
+		return nil, newCircuitError()
+	}
+	return res.Result, res.Err
+}
+
 func (e *SharedAcpEngine) RPCWithSplitActivity(ctx context.Context, method string, params any, maxDuration time.Duration, lastActivityElapsedNs *atomic.Int64, start time.Time, phaseFn func() promptIdlePhase) (json.RawMessage, error) {
 	if phaseFn == nil {
 		return e.RPCWithActivity(ctx, method, params, PromptIdleTimeout, maxDuration, lastActivityElapsedNs, start)
@@ -853,25 +915,11 @@ func (e *SharedAcpEngine) RPCWithSplitActivity(ctx context.Context, method strin
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if method != "session/close" && method != "session/cancel" {
-		if err := circuitError(); err != nil {
-			return nil, err
-		}
-	}
-	id := e.nextID.Add(1)
-	ch := make(chan rpcResult, 1)
-	e.pending.Store(id, ch)
-	defer e.pending.Delete(id)
-
-	err := e.sendRawJSON(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"method":  method,
-		"params":  params,
-	})
+	id, ch, err := e.sendPendingRPC(method, params)
 	if err != nil {
 		return nil, err
 	}
+	defer e.pending.Delete(id)
 
 	if start.IsZero() {
 		start = time.Now()
@@ -903,11 +951,7 @@ func (e *SharedAcpEngine) RPCWithSplitActivity(ctx context.Context, method strin
 	for {
 		select {
 		case res := <-ch:
-			if res.Err != nil && IsTosViolationError(res.Err.Error()) {
-				TripTosCircuitBreaker(res.Err.Error())
-				return nil, newCircuitError()
-			}
-			return res.Result, res.Err
+			return unwrapRPCResult(res)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-hardTimer.C:
@@ -955,25 +999,11 @@ func (e *SharedAcpEngine) RPCWithActivity(ctx context.Context, method string, pa
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if method != "session/close" && method != "session/cancel" {
-		if err := circuitError(); err != nil {
-			return nil, err
-		}
-	}
-	id := e.nextID.Add(1)
-	ch := make(chan rpcResult, 1)
-	e.pending.Store(id, ch)
-	defer e.pending.Delete(id)
-
-	err := e.sendRawJSON(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"method":  method,
-		"params":  params,
-	})
+	id, ch, err := e.sendPendingRPC(method, params)
 	if err != nil {
 		return nil, err
 	}
+	defer e.pending.Delete(id)
 
 	if idleTimeout <= 0 {
 		idleTimeout = 1800 * time.Second
@@ -996,11 +1026,7 @@ func (e *SharedAcpEngine) RPCWithActivity(ctx context.Context, method string, pa
 	for {
 		select {
 		case res := <-ch:
-			if res.Err != nil && IsTosViolationError(res.Err.Error()) {
-				TripTosCircuitBreaker(res.Err.Error())
-				return nil, newCircuitError()
-			}
-			return res.Result, res.Err
+			return unwrapRPCResult(res)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-hardTimer.C:
@@ -1028,25 +1054,11 @@ func (e *SharedAcpEngine) RPCWithActivity(ctx context.Context, method string, pa
 }
 
 func (e *SharedAcpEngine) RPC(method string, params any, timeout time.Duration) (json.RawMessage, error) {
-	if method != "session/close" && method != "session/cancel" {
-		if err := circuitError(); err != nil {
-			return nil, err
-		}
-	}
-	id := e.nextID.Add(1)
-	ch := make(chan rpcResult, 1)
-	e.pending.Store(id, ch)
-	defer e.pending.Delete(id)
-
-	err := e.sendRawJSON(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"method":  method,
-		"params":  params,
-	})
+	id, ch, err := e.sendPendingRPC(method, params)
 	if err != nil {
 		return nil, err
 	}
+	defer e.pending.Delete(id)
 
 	if timeout <= 0 {
 		timeout = 180 * time.Second
@@ -1055,11 +1067,7 @@ func (e *SharedAcpEngine) RPC(method string, params any, timeout time.Duration) 
 	defer timer.Stop()
 	select {
 	case res := <-ch:
-		if res.Err != nil && IsTosViolationError(res.Err.Error()) {
-			TripTosCircuitBreaker(res.Err.Error())
-			return nil, newCircuitError()
-		}
-		return res.Result, res.Err
+		return unwrapRPCResult(res)
 	case <-timer.C:
 		return nil, fmt.Errorf("ACP RPC %s timed out after %v", method, timeout)
 	}
@@ -1133,32 +1141,46 @@ func (e *SharedAcpEngine) CancelSession(sid string) {
 	})
 }
 
+const maxAcpReuseLineBufBytes = 1024 * 1024
+
 func readJSONRPCLine(br *bufio.Reader, maxBytes int) ([]byte, error) {
+	line, _, err := readJSONRPCLineReuse(br, maxBytes, nil)
+	return line, err
+}
+
+func readJSONRPCLineReuse(br *bufio.Reader, maxBytes int, reuseBuf []byte) ([]byte, []byte, error) {
 	if maxBytes <= 0 {
 		maxBytes = maxAcpInboundLineBytes
 	}
-	var buf []byte
+	buf := reuseBuf[:0]
+	usedBuf := false
 	for {
 		frag, err := br.ReadSlice('\n')
 		if errors.Is(err, bufio.ErrBufferFull) {
 			if len(buf)+len(frag) > maxBytes {
-				return nil, errAcpStdoutLineTooLong
+				return nil, nil, errAcpStdoutLineTooLong
 			}
 			buf = append(buf, frag...)
+			usedBuf = true
 			continue
 		}
-		if len(buf) == 0 {
+		if !usedBuf {
 			trimmed := bytes.TrimRight(frag, "\r\n")
 			if len(trimmed) > maxBytes {
-				return nil, errAcpStdoutLineTooLong
+				return nil, nil, errAcpStdoutLineTooLong
 			}
-			return trimmed, err
+			return trimmed, reuseBuf, err
 		}
 		if len(buf)+len(frag) > maxBytes {
-			return nil, errAcpStdoutLineTooLong
+			return nil, nil, errAcpStdoutLineTooLong
 		}
 		buf = append(buf, frag...)
-		return bytes.TrimRight(buf, "\r\n"), err
+		trimmed := bytes.TrimRight(buf, "\r\n")
+		nextBuf := buf
+		if cap(nextBuf) > maxAcpReuseLineBufBytes {
+			nextBuf = nil
+		}
+		return trimmed, nextBuf, err
 	}
 }
 
@@ -1282,16 +1304,37 @@ func (e *SharedAcpEngine) readStdoutLoop(stdoutPipe any, cmd *exec.Cmd, myGen ui
 	if !ok {
 		return
 	}
-	br := bufio.NewReaderSize(r, 256*1024)
+	br := bufio.NewReaderSize(r, e.pipeBufSize())
+	var lineBuf []byte
 	var loopErr error
 
 	for {
-		line, readErr := readJSONRPCLine(br, maxAcpInboundLineBytes)
+		var line []byte
+		var readErr error
+		line, lineBuf, readErr = readJSONRPCLineReuse(br, maxAcpInboundLineBytes, lineBuf)
 		if len(line) > 0 {
 			recordAcpLine("in", line)
 			if McpTrace {
 				pv := boundPeerStringUTF8(redactSecretsInString(string(line)), 400)
 				LogEvent("ACP_IN", pv, nil)
+			}
+			if bytes.Contains(line, acpSessionUpdateMethodBytes) &&
+				(bytes.Contains(line, acpMsgChunkBytes) || bytes.Contains(line, acpThoughtChunkBytes)) {
+				var fast acpFastTextUpdateMsg
+				if json.Unmarshal(line, &fast) == nil &&
+					fast.ID == nil &&
+					fast.Method == "session/update" &&
+					fast.Params.SessionID != "" &&
+					(fast.Params.Update.SessionUpdate == "agent_message_chunk" || fast.Params.Update.SessionUpdate == "agent_thought_chunk") {
+					dispatchAcpTextChunk(e, fast.Params.SessionID, fast.Params.Update.SessionUpdate, fast.Params.Update.Content.Text)
+					if readErr != nil {
+						if !errors.Is(readErr, io.EOF) {
+							loopErr = readErr
+						}
+						break
+					}
+					continue
+				}
 			}
 			var msg struct {
 				ID     any             `json:"id"`

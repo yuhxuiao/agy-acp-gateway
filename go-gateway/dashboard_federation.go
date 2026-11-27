@@ -81,9 +81,10 @@ var (
 		},
 		Transport: &http.Transport{
 			Proxy:               nil, // Internal peer calls must never inherit external HTTP_PROXY.
-			MaxIdleConns:        16,
-			MaxIdleConnsPerHost: 4,
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 16,
 			IdleConnTimeout:     30 * time.Second,
+			DisableCompression:  true,
 		},
 	}
 )
@@ -342,6 +343,41 @@ func lookupCachedPeerQuota(cacheKey string) (QuotaSnapshot, time.Time, bool) {
 		return dDash.decoded.Quota, dDash.fetchedAt, true
 	}
 	return QuotaSnapshot{}, time.Time{}, false
+}
+
+// getPeerQuotaFreshOrTrigger returns a cached QuotaSnapshot for accountID if fresh (<20m)
+// and triggers a throttled non-blocking /api/internal/quota-lite refresh when missing or >60s old.
+func getPeerQuotaFreshOrTrigger(accountID string, dashPort int, now time.Time) (QuotaSnapshot, bool) {
+	if dashPort <= 0 {
+		return QuotaSnapshot{}, false
+	}
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", dashPort)
+	cacheKey := accountID + "|" + baseURL
+	cachedQuota, fetchedAt, ok := lookupCachedPeerQuota(cacheKey)
+	peerDashCacheMu.Lock()
+	lastAttempt := peerQuotaLiteLastAttempt[cacheKey]
+	shouldTrigger := !testing.Testing() &&
+		(!ok || now.Sub(fetchedAt) > 60*time.Second) &&
+		now.Sub(lastAttempt) > 10*time.Second
+	if shouldTrigger {
+		peerQuotaLiteLastAttempt[cacheKey] = now
+	}
+	peerDashCacheMu.Unlock()
+	if shouldTrigger {
+		peer := gwcfg.DashboardPeerConfig{
+			ID:      accountID,
+			Label:   accountID,
+			BaseURL: baseURL,
+		}
+		fallbackKey := defaultPeerAPIKey(gwcfg.Current())
+		go func(p gwcfg.DashboardPeerConfig, k string) {
+			_, _, _ = fetchPeerQuotaLite(p, false, k)
+		}(peer, fallbackKey)
+	}
+	if !ok || now.Sub(fetchedAt) > 20*time.Minute {
+		return QuotaSnapshot{}, false
+	}
+	return cachedQuota, true
 }
 
 // fetchPeerQuotaLite fetches lightweight quota state from a child worker's GET /api/internal/quota-lite

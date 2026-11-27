@@ -12,7 +12,6 @@ services:
       # Raise mem_limit (e.g. 6144m) when running 10+ concurrent workers across multiple accounts.
       AGY_LISTEN_HOST: "0.0.0.0"
       AGY_MAX_LIVE_WORKERS: "${AGY_MAX_LIVE_WORKERS:-8}"
-      AGY_GLOBAL_MAX_LIVE_WORKERS: "${AGY_GLOBAL_MAX_LIVE_WORKERS:-8}"
       AGY_GLOBAL_IDLE_TARGET: "${AGY_GLOBAL_IDLE_TARGET:-8}"
       AGY_GLOBAL_BURST_MAX_LIVE_WORKERS: "${AGY_GLOBAL_BURST_MAX_LIVE_WORKERS:-0}"
       AGY_IDLE_WORKER_TTL_SEC: "${AGY_IDLE_WORKER_TTL_SEC:-180}"

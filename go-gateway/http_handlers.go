@@ -629,6 +629,12 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodPost && path == "/api/internal/cancel-parked-session" {
+		if !isLoopbackRemoteAddr(r.RemoteAddr) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"loopback only"}`))
+			return
+		}
 		var body struct {
 			SessionKey string   `json:"sessionKey"`
 			CallIDs    []string `json:"callIds"`
@@ -1065,6 +1071,7 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				body["system"] = strings.Join(sysParts, "\n\n")
 			}
 			body["messages"] = convMsgs
+			delete(body, "input")
 			if rawTools, okT := body["tools"].([]any); okT {
 				var normTools []any
 				for _, rt := range rawTools {
@@ -1222,6 +1229,8 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		delete(body, "messages")
+		delete(body, "input")
 
 		if err := CanonicalizeAndValidateMessages(body, messages, path); err != nil {
 			writeMultimodalOrBadRequest(w, err)
@@ -1434,11 +1443,18 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						if retryAfter {
 							extra = map[string]string{"Retry-After": raHdr}
 						}
-						if isChildAccountWorker() && isLocalWorkerSlotError(statusCode, errType, errMsg, nil) {
-							if extra == nil {
-								extra = map[string]string{}
+						if isChildAccountWorker() {
+							if isGlobalWorkerSlotError(statusCode, errType, errMsg, nil) {
+								if extra == nil {
+									extra = map[string]string{}
+								}
+								extra[internalGlobalSlotFullHeader] = "1"
+							} else if isLocalWorkerSlotError(statusCode, errType, errMsg, nil) {
+								if extra == nil {
+									extra = map[string]string{}
+								}
+								extra[internalLocalSlotFullHeader] = "1"
 							}
-							extra[internalLocalSlotFullHeader] = "1"
 						}
 						sw.CommitErrorStatus(statusCode, extra, "")
 					}
@@ -1572,11 +1588,18 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						if retryAfter {
 							extra = map[string]string{"Retry-After": raHdr}
 						}
-						if isChildAccountWorker() && isLocalWorkerSlotError(statusCode, errType, errMsg, nil) {
-							if extra == nil {
-								extra = map[string]string{}
+						if isChildAccountWorker() {
+							if isGlobalWorkerSlotError(statusCode, errType, errMsg, nil) {
+								if extra == nil {
+									extra = map[string]string{}
+								}
+								extra[internalGlobalSlotFullHeader] = "1"
+							} else if isLocalWorkerSlotError(statusCode, errType, errMsg, nil) {
+								if extra == nil {
+									extra = map[string]string{}
+								}
+								extra[internalLocalSlotFullHeader] = "1"
 							}
-							extra[internalLocalSlotFullHeader] = "1"
 						}
 						sw.CommitErrorStatus(statusCode, extra, "")
 					}
@@ -1776,11 +1799,18 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						if retryAfter {
 							extra = map[string]string{"Retry-After": extractRetryAfterHeaderValue(errMsg)}
 						}
-						if isChildAccountWorker() && isLocalWorkerSlotError(statusCode, errType, errMsg, nil) {
-							if extra == nil {
-								extra = map[string]string{}
+						if isChildAccountWorker() {
+							if isGlobalWorkerSlotError(statusCode, errType, errMsg, nil) {
+								if extra == nil {
+									extra = map[string]string{}
+								}
+								extra[internalGlobalSlotFullHeader] = "1"
+							} else if isLocalWorkerSlotError(statusCode, errType, errMsg, nil) {
+								if extra == nil {
+									extra = map[string]string{}
+								}
+								extra[internalLocalSlotFullHeader] = "1"
 							}
-							extra[internalLocalSlotFullHeader] = "1"
 						}
 						sw.CommitErrorStatus(statusCode, extra, "application/json")
 						b, _ := json.Marshal(map[string]any{
@@ -1916,8 +1946,12 @@ func (gs *GatewayServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if retryAfter {
 				w.Header().Set("Retry-After", extractRetryAfterHeaderValue(errMsg))
 			}
-			if isChildAccountWorker() && isLocalWorkerSlotError(statusCode, errType, errMsg, nil) {
-				w.Header().Set(internalLocalSlotFullHeader, "1")
+			if isChildAccountWorker() {
+				if isGlobalWorkerSlotError(statusCode, errType, errMsg, nil) {
+					w.Header().Set(internalGlobalSlotFullHeader, "1")
+				} else if isLocalWorkerSlotError(statusCode, errType, errMsg, nil) {
+					w.Header().Set(internalLocalSlotFullHeader, "1")
+				}
 			}
 			w.WriteHeader(statusCode)
 			_ = json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]any{"type": errType, "message": errMsg}})

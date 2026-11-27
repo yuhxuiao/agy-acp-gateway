@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import socket
@@ -23,6 +24,77 @@ SCHEMA = 2
 FILES = {"upstream": "agy-acp-900k", "gateway": "agy-acp-gateway"}
 # Must match agy_upgrade_e2e.FAKE_SCENARIOS; a fake gate without them is a plain-text smoke only.
 FAKE_E2E_SCENARIOS = ("text", "tool_roundtrip", "model_switch", "protocols", "thinking_tiers")
+DEFAULT_BLOCKED_AGY_VERSIONS = {
+    "1.5.17": "agy#1890 (--agent 4x Gemini quota burn) & agy#1872",
+    "1.5.18": "agy#1890 (--agent 4x Gemini quota burn) & agy#1872",
+}
+
+
+def normalize_agy_version(raw):
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    first = s.splitlines()[0].strip()
+    m = re.search(r"(\d+\.\d+\.\d+)", first)
+    return m.group(1) if m else first
+
+
+def blocked_agy_versions():
+    """Return {version: reason} for agy releases blocked from local download/build/install.
+
+    - AGY_BLOCKED_VERSIONS unset: returns DEFAULT_BLOCKED_AGY_VERSIONS.
+    - AGY_BLOCKED_VERSIONS set to "" or "none" (case-insensitive): returns {} (operator override).
+    - Otherwise parses comma-separated "<ver>" or "<ver>:<reason>" entries.
+    """
+    raw = os.environ.get("AGY_BLOCKED_VERSIONS")
+    if raw is None:
+        return dict(DEFAULT_BLOCKED_AGY_VERSIONS)
+    s = raw.strip()
+    if not s or s.lower() == "none":
+        return {}
+    out = {}
+    for item in s.split(","):
+        part = item.strip()
+        if not part:
+            continue
+        if ":" in part:
+            ver_raw, reason = part.split(":", 1)
+            ver = normalize_agy_version(ver_raw)
+            reason = reason.strip()
+        else:
+            ver = normalize_agy_version(part)
+            reason = ""
+        if not ver:
+            continue
+        if not reason:
+            reason = DEFAULT_BLOCKED_AGY_VERSIONS.get(ver, "blocked by AGY_BLOCKED_VERSIONS")
+        out[ver] = reason
+    return out
+
+
+def blocked_agy_reason(ver, blocked=None):
+    norm = normalize_agy_version(ver)
+    if not norm:
+        return None
+    table = blocked_agy_versions() if blocked is None else blocked
+    return table.get(norm)
+
+
+def allow_blocked_env():
+    return os.environ.get("AGY_ALLOW_BLOCKED_VERSION", "").strip() == "1"
+
+
+def ensure_version_not_blocked(ver, *, allow_blocked=False, context="agy"):
+    if allow_blocked or allow_blocked_env():
+        return None
+    norm = normalize_agy_version(ver)
+    reason = blocked_agy_reason(norm)
+    if reason:
+        raise ValueError(
+            f"{context} version {norm} is blocked: {reason} "
+            "(override with --allow-blocked, AGY_ALLOW_BLOCKED_VERSION=1, or AGY_BLOCKED_VERSIONS=none)"
+        )
+    return None
 
 
 def sha(path):
@@ -284,11 +356,14 @@ def gateway_instance(stage, mode, binary, port):
 gateway_instance = contextlib.contextmanager(gateway_instance)
 
 
-def validate_manifest(stage, *, require_live=True, root=None):
+def validate_manifest(stage, *, require_live=True, root=None, allow_blocked=False):
     stage = checked_path(stage)
     m = json.loads((stage/"manifest.json").read_text())
     if m.get("schema") != SCHEMA or m.get("source_digest") != source_digest(root):
         raise ValueError("candidate source/manifest mismatch; rebuild required")
+    for ver_key in ("official_version", "patched_version"):
+        if m.get(ver_key):
+            ensure_version_not_blocked(m.get(ver_key), allow_blocked=allow_blocked, context="candidate agy")
     for key, name in FILES.items():
         if m.get("artifacts", {}).get(key) != sha(stage/name):
             raise ValueError("candidate artifact hash mismatch")
@@ -357,7 +432,8 @@ def patch_candidate(official, stage, dry=False):
     check_media_strict_g5(staged, stage)
 
 
-def build_candidate(official, *, contract=False, live=False, port=18892, dry=False):
+def build_candidate(official, *, contract=False, live=False, port=18892, dry=False, allow_blocked=False):
+    ensure_version_not_blocked(version(official), allow_blocked=allow_blocked, context="official agy")
     stage = checked_path(STATE)/"candidates"/(dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")+"-"+uuid.uuid4().hex[:8])
     stage.mkdir(parents=True, mode=0o700)
     print("candidate:", stage, flush=True)
@@ -451,10 +527,10 @@ def production_env():
     return env
 
 
-def install(stage):
+def install(stage, *, allow_blocked=False):
     from agy_upgrade_e2e import run_probe
     # A fully qualified candidate is required; install never builds implicitly.
-    manifest = validate_manifest(stage)
+    manifest = validate_manifest(stage, allow_blocked=allow_blocked)
     backup = backup_release()
     write_json(STATE/"last-backup.json", {"path": str(backup)})
     env = production_env()
@@ -490,11 +566,17 @@ def main():
     ap.add_argument("--contract", action="store_true")
     ap.add_argument("--live-flash", action="store_true")
     ap.add_argument("--restart", action="store_true", help="compatibility flag; install always restarts safely")
+    ap.add_argument("--allow-blocked", action="store_true", help="override DEFAULT_BLOCKED_AGY_VERSIONS guard")
     ap.add_argument("--port", type=int, default=18892)
     args = ap.parse_args()
     if args.status:
         for label, p in [("global", args.official), ("gateway-upstream", ROOT/"bin/agy-acp-900k")]:
-            print(json.dumps({"component": label, "version": version(p), "sha256": sha(p)}))
+            ver = version(p)
+            reason = blocked_agy_reason(ver)
+            info = {"component": label, "version": ver, "sha256": sha(p), "blocked": bool(reason)}
+            if reason:
+                info["blocked_reason"] = reason
+            print(json.dumps(info))
         return 0
     with upgrade_lock():
         if args.rollback:
@@ -506,9 +588,9 @@ def main():
         elif args.install:
             if not args.candidate:
                 raise ValueError("--install requires --candidate; no implicit builds or model calls")
-            install(args.candidate.resolve())
+            install(args.candidate.resolve(), allow_blocked=args.allow_blocked)
         else:
-            build_candidate(args.official.resolve(), contract=args.contract, live=args.live_flash, port=args.port, dry=args.dry_run)
+            build_candidate(args.official.resolve(), contract=args.contract, live=args.live_flash, port=args.port, dry=args.dry_run, allow_blocked=args.allow_blocked)
     return 0
 
 

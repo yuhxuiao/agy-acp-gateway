@@ -385,17 +385,6 @@ func (s *AcpProjectSession) snapshotHibernatedParkedCalls() map[string]Hibernate
 	return out
 }
 
-// HasHibernatedParkedCalls reports whether this session holds hibernated parked tool metadata
-// eligible for secondary rebinding (e.g. Gemini /v1beta functionResponse without native IDs).
-func (s *AcpProjectSession) HasHibernatedParkedCalls() bool {
-	if s == nil {
-		return false
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.HibernatedParkedCalls) > 0 || len(s.HibernatedParkedCallIDs) > 0
-}
-
 // MatchHibernatedParkedCallID performs deterministic secondary rebinding for protocols without
 // native tool_use_id (such as Gemini /v1beta functionResponse) after Elastic Parked Offload.
 // Matches unused hibernated calls in (Seq ASC, CallID ASC) order by exact ToolName (or first unused
@@ -2346,6 +2335,8 @@ func (s *AcpProjectSession) HandleSessionTextChunk(updType, text string) {
 				s.touchPromptActivity()
 			}
 			turn.pushDelta(DeltaChunk{Type: "text", Text: text})
+		} else if droppedInfo && !turn.IsResolved() {
+			s.touchPromptActivity()
 		}
 	} else if updType == "agent_thought_chunk" {
 		turn.mu.Lock()

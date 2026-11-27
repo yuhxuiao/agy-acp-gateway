@@ -2333,17 +2333,33 @@ function collectActiveAgyVersions(list, rootData = null) {
   return vers;
 }
 
+const DEFAULT_BLOCKED_AGY_VERSIONS = new Set(['1.5.17', '1.5.18']);
+function isBlockedAgyVersion(ver) {
+  const v = String(ver || '').trim();
+  if (!v) return false;
+  if (typeof up !== 'undefined' && up && up.data && up.data.currentVersionBlocked !== undefined) {
+    if (up.data.currentAgyVersion && v === String(up.data.currentAgyVersion).trim()) {
+      return !!up.data.currentVersionBlocked;
+    }
+    if (!up.data.currentVersionBlocked) return false;
+  }
+  return DEFAULT_BLOCKED_AGY_VERSIONS.has(v);
+}
+
 function buildAgyVersionBadgeHTML(gwInfo, isMixed = false, opts = {}) {
   if (!gwInfo || !gwInfo.agyVersion) return '';
   const pending = !!gwInfo.binarySwitchPending;
   const mixed = !!isMixed && !opts.isDisabled;
-  const warn = pending || mixed;
+  const blocked = !opts.isDisabled && isBlockedAgyVersion(gwInfo.agyVersion);
+  const warn = pending || mixed || blocked;
   if (!warn && !opts.alwaysShow) return '';
   const tags = [];
+  if (blocked) tags.push('受限版本');
   if (pending) tags.push('待切换');
   if (mixed) tags.push('混跑');
   const label = 'agy ' + gwInfo.agyVersion + (tags.length ? ' · ' + tags.join('/') : '');
   const tipParts = ['agy 二进制版本: ' + gwInfo.agyVersion];
+  if (blocked) tipParts.push('已知受限版本 (agy#1890 4x 扣额 / agy#1872), 建议回退至 1.5.16');
   if (gwInfo.engineAlive === true) tipParts.push('引擎运行中');
   else if (gwInfo.engineAlive === false) tipParts.push('引擎空闲待命');
   if (pending) tipParts.push('新版本已就绪, 待当前引擎空闲后热切换');
@@ -2378,13 +2394,18 @@ function computeWorkerMemBudget(poolStats, candidates) {
       }
     }
   }
-  const idleTarget = Number(ps.globalIdleTarget) || Number(ps.globalMaxLiveWorkers) || 0;
+  const rawIdleTarget = Number(ps.globalIdleTarget) || 0;
   const burstMax = Number(ps.globalBurstMaxLiveWorkers) || 0;
+  const hasExplicitGlobalPolicy = ps.globalIdleTarget !== undefined || ps.globalBurstMaxLiveWorkers !== undefined;
+  const idleTarget = (rawIdleTarget > 0 || burstMax > 0)
+    ? (rawIdleTarget || Number(ps.globalMaxLiveWorkers) || 0)
+    : (hasExplicitGlobalPolicy ? 0 : (Number(ps.globalMaxLiveWorkers) || 0));
   const effWorkers = Number(ps.effectiveMaxLiveWorkers) > 0
     ? Number(ps.effectiveMaxLiveWorkers)
     : (idleTarget > 0 && totalWorkers > 0 ? Math.min(totalWorkers, idleTarget) : (idleTarget > 0 ? idleTarget : totalWorkers));
   const governed = idleTarget > 0 && (totalWorkers > idleTarget || burstMax > 0);
   const liveWorkers = Math.max(0, Number(ps.globalLiveWorkers) || 0);
+  const hibernatedSessions = Math.max(0, Number(ps.globalHibernatedSessions) || 0);
   const estPeakRssMB = Number(ps.estPeakRssMB) > 0
     ? Number(ps.estPeakRssMB)
     : (governed ? Math.round(effWorkers * WORKER_RSS_DEFAULT_MB + childCount * 80 + 256)
@@ -2400,10 +2421,12 @@ function computeWorkerMemBudget(poolStats, candidates) {
     : (hostMemLimitMB > 0 && liveMemMB > 0 ? (liveMemMB / hostMemLimitMB) * 100 : 0);
   const perWorkerMB = WORKER_RSS_DEFAULT_MB;
   const hasData = totalWorkers > 0 || effWorkers > 0 || burstMax > 0 || estPeakRssMB > 0 || hostMemLimitMB > 0 || liveMemMB > 0;
-  const warn = (liveMemPct >= 70) || (hostMemLimitMB > 0 && estPeakRssMB > hostMemLimitMB * 0.75);
-  const overLimit = (liveMemPct >= 80) || (hostMemLimitMB > 0 && estPeakRssMB > hostMemLimitMB);
+  const warnPct = Number(ps.memPressureWarnPct) || 70;
+  const highPct = Number(ps.memPressureHighPct) || 80;
+  const warn = (liveMemPct >= warnPct) || (hostMemLimitMB > 0 && estPeakRssMB > hostMemLimitMB * 0.75);
+  const overLimit = (liveMemPct >= highPct) || (hostMemLimitMB > 0 && estPeakRssMB > hostMemLimitMB);
   return {
-    hasData, totalWorkers, effWorkers, idleTarget, burstMax, globalMax: idleTarget, governed, liveWorkers,
+    hasData, totalWorkers, effWorkers, idleTarget, burstMax, globalMax: idleTarget, governed, liveWorkers, hibernatedSessions,
     estPeakRssMB, hostMemLimitMB, liveMemMB, liveMemPct, perWorkerMB, childCount, warn, overLimit,
   };
 }
@@ -2440,9 +2463,12 @@ function buildWorkerMemBudgetBadgeHTML(poolStats, candidates) {
   if (b.burstMax > 0) {
     tipParts.push('全池最多同跑 ' + fmt(b.burstMax) + ' 路突发并发, 忙完自动缩回 ' + fmt(b.idleTarget || b.effWorkers) + ' 个热进程省内存 (唤醒不断上下文)');
   } else if (b.governed) {
-    tipParts.push('全池空闲保留 ' + fmt(b.effWorkers) + ' 个热进程 (各号配置合计 ' + fmt(b.totalWorkers) + ' 路, 空闲 180 秒自动休眠, 下次对话无损唤醒)');
+    tipParts.push('全池空闲保留 ' + fmt(b.effWorkers) + ' 个热进程 (各号配置合计 ' + fmt(b.totalWorkers) + ' 路, 空闲自动休眠, 下次对话无损唤醒)');
   } else {
     tipParts.push('启用账号并发进程上限合计 ' + fmt(b.totalWorkers));
+  }
+  if (b.hibernatedSessions > 0) {
+    tipParts.push('当前休眠会话 ' + fmt(b.hibernatedSessions) + ' 个 (唤醒不断上下文)');
   }
   if (b.estPeakRssMB > 0) {
     tipParts.push('预计常驻内存 ~' + fmtMemMB(b.estPeakRssMB) + (b.hostMemLimitMB > 0 ? ' (' + peakPct + '%)' : ''));
@@ -3310,6 +3336,17 @@ function renderBanners(d, rootData = d) {
     parts.push('<div class="alert-strip bad"><div class="lhs">' + svg('triangle-alert') +
       '<span><b>上游安全熔断已触发</b> · 新请求已暂停放行' + (gw.tosTrippedReason ? '（' + esc(gw.tosTrippedReason) + '）' : '') + '</span></div></div>');
   }
+  const upData = (typeof up !== 'undefined' && up && up.data) ? up.data : null;
+  const runningAgyVer = String((upData && upData.currentAgyVersion) || gw.agyVersion || '').trim();
+  const isCurrentBlocked = (upData && upData.currentVersionBlocked === true)
+    || (!(upData && upData.currentVersionBlocked === false) && isBlockedAgyVersion(runningAgyVer));
+  if (isCurrentBlocked) {
+    const warnText = String((upData && upData.blockedVersionWarning) || '').trim()
+      || ('当前运行 agy ' + runningAgyVer + ' 属于已知受限版本 (agy#1890 4x 扣额 / agy#1872), 建议回退至 1.5.16 或等待 1.5.19+');
+    parts.push('<div class="alert-strip canary" data-blocked-agy="1"><div class="lhs"><span class="ic-badge">' + svg('triangle-alert') + '</span>' +
+      '<b>agy 受限版本告警</b>' + (runningAgyVer ? '<span class="route-chip">agy ' + esc(runningAgyVer) + '</span>' : '') +
+      '<span class="dim">' + esc(warnText) + '</span></div></div>');
+  }
   const burnAnomalies = Array.isArray(d.quotaBurnAnomalies) ? d.quotaBurnAnomalies.filter(Boolean) : [];
   if (burnAnomalies.length > 0) {
     const hasCritical = burnAnomalies.some(a => String(a.severity || '').trim().toLowerCase() === 'critical');
@@ -3437,6 +3474,35 @@ function renderBanners(d, rootData = d) {
   setHTML('sys-banners', parts.join(''));
 }
 
+function resolveDisplayWorkerBudget(d) {
+  const isAllView = isMultiInstances(d) && state.inst === 'ALL';
+  const rawMaxW = (d.gateway && d.gateway.maxLiveWorkers) || 8;
+  const ps = mergePoolStats(accState.poolStats, d.poolRouting && d.poolRouting.poolStats);
+  if (!isAllView) {
+    return {
+      cap: rawMaxW,
+      idleTarget: 0,
+      burstMax: 0,
+      hibernated: 0,
+      governed: false,
+    };
+  }
+  const rawIdleTarget = Number(ps.globalIdleTarget) || 0;
+  const burstMax = Number(ps.globalBurstMaxLiveWorkers) || 0;
+  const hasExplicitGlobalPolicy = ps.globalIdleTarget !== undefined || ps.globalBurstMaxLiveWorkers !== undefined;
+  const idleTarget = (rawIdleTarget > 0 || burstMax > 0)
+    ? (rawIdleTarget || Number(ps.globalMaxLiveWorkers) || 0)
+    : (hasExplicitGlobalPolicy ? 0 : (Number(ps.globalMaxLiveWorkers) || 0));
+  const hibernated = Math.max(0, Number(ps.globalHibernatedSessions) || 0);
+  if (burstMax > 0) {
+    return { cap: burstMax, idleTarget, burstMax, hibernated, governed: true };
+  }
+  if (idleTarget > 0) {
+    return { cap: idleTarget, idleTarget, burstMax: 0, hibernated, governed: true };
+  }
+  return { cap: rawMaxW, idleTarget: 0, burstMax: 0, hibernated, governed: false };
+}
+
 /* ---------- Hero & Token River ---------- */
 function renderHero(d) {
   const w = d.windows[state.win] || {};
@@ -3467,12 +3533,23 @@ function renderHero(d) {
   const sessList = d.liveSessions || [];
   const busyCnt = sessList.filter(s => s.status === 'BUSY').length;
   const parkedCnt = sessList.filter(s => s.status === 'PARKED').length;
-  const maxW = (d.gateway && d.gateway.maxLiveWorkers) || 8;
+  const wb = resolveDisplayWorkerBudget(d);
   document.getElementById('st-sess').textContent = String(sessList.length);
-  document.getElementById('st-sess-cap').textContent = '/ ' + maxW;
-  document.getElementById('st-sess-s').textContent = busyCnt || parkedCnt
-    ? busyCnt + ' 推理中 · ' + parkedCnt + ' 等待工具'
-    : sessList.length ? '全部空闲待命' : '暂无驻留进程';
+  const sessCapEl = document.getElementById('st-sess-cap');
+  sessCapEl.textContent = '/ ' + wb.cap;
+  sessCapEl.title = wb.burstMax > 0 && wb.idleTarget > 0 && wb.idleTarget < wb.burstMax
+    ? '全池突发上限 ' + wb.burstMax + ' 路 · 空闲保留目标 ' + wb.idleTarget + ' 路'
+    : (wb.governed ? '全池热进程目标 ' + wb.cap + ' 路' : '');
+  const sessSubParts = [];
+  if (busyCnt || parkedCnt) sessSubParts.push(busyCnt + ' 推理中 · ' + parkedCnt + ' 等待工具');
+  else sessSubParts.push(sessList.length ? '全部空闲待命' : '暂无驻留进程');
+  if (wb.burstMax > 0 && wb.idleTarget > 0 && wb.idleTarget < wb.burstMax) {
+    sessSubParts.push('空闲目标 ' + wb.idleTarget);
+  }
+  if (wb.hibernated > 0) {
+    sessSubParts.push('休眠 ' + fmt(wb.hibernated));
+  }
+  document.getElementById('st-sess-s').textContent = sessSubParts.join(' · ');
 
   const parts = [
     ['命中缓存', w.alignedCr || 0, 'var(--c-cache)'],
@@ -3664,8 +3741,15 @@ function calcWireStreamTps(outTok, ttftMs, elapsedMs) {
 
 function renderSessions(d) {
   const list = d.liveSessions || [];
-  const maxW = (d.gateway && d.gateway.maxLiveWorkers) || 8;
-  document.getElementById('sess-note').textContent = list.length + ' / ' + maxW + ' 驻留';
+  const wb = resolveDisplayWorkerBudget(d);
+  const noteParts = [list.length + ' / ' + wb.cap + ' 驻留'];
+  if (wb.burstMax > 0 && wb.idleTarget > 0 && wb.idleTarget < wb.burstMax) {
+    noteParts.push('空闲目标 ' + wb.idleTarget);
+  }
+  if (wb.hibernated > 0) {
+    noteParts.push('休眠 ' + fmt(wb.hibernated));
+  }
+  document.getElementById('sess-note').textContent = noteParts.join(' · ');
   if (!list.length) {
     setHTML('sessions', '<div class="empty">' + svg('moon') + '<span>当前无活跃驻留会话，新请求到达时自动拉起</span></div>');
     return;
@@ -4434,6 +4518,7 @@ async function loadUpgrade() {
     if (!r.ok) return;
     up.data = await r.json();
     renderUpgrade();
+    if (state.data) renderBanners(projectInstanceView(state.data), state.data);
   } catch (e) {}
 }
 function upRow(k, v, sub) { return '<div class="k">' + k + '</div><div class="v">' + v + (sub ? '<em>' + sub + '</em>' : '') + '</div>'; }
@@ -4441,16 +4526,22 @@ function renderUpgrade() {
   const u = up.data || {};
   const st = u.status;
   const checkErr = String(u.lastCheckError || '').trim();
+  const curBlocked = !!u.currentVersionBlocked;
+  const blockedWarn = String(u.blockedVersionWarning || '').trim();
+  const curVer = String(u.currentAgyVersion || '').trim();
   const wrap = document.getElementById('up');
-  wrap.hidden = !st && !checkErr;
+  wrap.hidden = !st && !checkErr && !curBlocked;
   if (!st) {
-    if (!checkErr) return;
+    if (!checkErr && !curBlocked) return;
     const btn = document.getElementById('up-btn');
     btn.classList.remove('has');
     document.getElementById('up-dot').hidden = false;
-    document.getElementById('up-txt').textContent = '版本';
-    document.getElementById('up-note').textContent = '状态异常';
-    let errHTML = '<div class="up-state">' + esc(checkErr) + '</div>';
+    document.getElementById('up-txt').textContent = curBlocked ? '版本告警' : '版本';
+    document.getElementById('up-note').textContent = curBlocked ? '受限版本' : '状态异常';
+    let errHTML = '';
+    if (curVer) errHTML += '<div class="up-rows">' + upRow('agy', esc(curVer), curBlocked ? '受限版本' : '') + '</div>';
+    if (curBlocked) errHTML += '<div class="up-msg bad">' + esc(blockedWarn || ('当前 agy ' + curVer + ' 属于受限版本，建议回退至 1.5.16')) + '</div>';
+    if (checkErr) errHTML += '<div class="up-state">' + esc(checkErr) + '</div>';
     if (up.msg) errHTML += '<div class="up-msg ' + up.msg.cls + '">' + esc(up.msg.text) + '</div>';
     document.getElementById('up-body').innerHTML = errHTML;
     return;
@@ -4461,15 +4552,18 @@ function renderUpgrade() {
   const ready = !!(c && effState === 'ready' && u.enabled);
   const btn = document.getElementById('up-btn');
   btn.classList.toggle('has', ready);
-  document.getElementById('up-dot').hidden = !ready && !(c && ['approved', 'applying', 'waiting_idle', 'verify_deferred'].includes(effState)) && !checkErr;
-  document.getElementById('up-txt').textContent = ready ? '有更新' : '版本';
+  document.getElementById('up-dot').hidden = !ready && !curBlocked && !(c && ['approved', 'applying', 'waiting_idle', 'verify_deferred'].includes(effState)) && !checkErr;
+  document.getElementById('up-txt').textContent = ready ? '有更新' : (curBlocked ? '版本告警' : '版本');
   const deferrals = Number((c && c.verifyDeferrals) || 0) || 0;
   const isVerifyDeferred = !!(c && (effState === 'verify_deferred' || (effState === 'waiting_idle' && deferrals > 0)));
   document.getElementById('up-note').textContent = (st.updatedAt ? '检查于 ' + hhmm(st.updatedAt) : '') +
-    (u.pendingSwitch ? ' · 待空闲切换' : (isVerifyDeferred ? ' · 待额度恢复验收' : ''));
+    (u.pendingSwitch ? ' · 待空闲切换' : (isVerifyDeferred ? ' · 待额度恢复验收' : (curBlocked ? ' · 当前版本受限' : '')));
   const cur = st.current || {};
   const running = ((u.engine || {}).running || '').split('/').slice(-2, -1)[0] || '';
-  let html = '<div class="up-rows">' + upRow('agy', esc(cur.agy || '--'), esc(running)) + upRow('网关', esc((cur.gateway || '--').slice(0, 12))) + '</div>';
+  let html = '<div class="up-rows">' + upRow('agy', esc(cur.agy || curVer || '--'), esc(running)) + upRow('网关', esc((cur.gateway || '--').slice(0, 12))) + '</div>';
+  if (curBlocked) {
+    html += '<div class="up-msg bad">' + esc(blockedWarn || ('当前 agy ' + (curVer || cur.agy || '') + ' 属于受限版本，建议回退至 1.5.16')) + '</div>';
+  }
   if (c && effState !== 'applied') {
     const kindTxt = c.kind && Object.hasOwn(UP_KIND, c.kind) ? UP_KIND[c.kind] : (c.kind || '');
     let stateTxt = effState && Object.hasOwn(UP_STATE, effState) ? UP_STATE[effState] : (effState || '--');

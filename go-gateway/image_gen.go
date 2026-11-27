@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -13,7 +14,6 @@ import (
 	"image/png"
 	"io"
 	"math"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -228,12 +228,12 @@ func currentResolvedAgyBin() string {
 	return resolved
 }
 
-func (m *imageGenManager) binaryChangedLocked() bool {
+func (m *imageGenManager) binaryChangedLocked(resolvedBin string) bool {
 	startedBin, startedHome, alive := m.eng.StartedBinaryAndHome()
 	if !alive {
 		return false
 	}
-	if startedBin != "" && currentResolvedAgyBin() != startedBin {
+	if startedBin != "" && resolvedBin != "" && resolvedBin != startedBin {
 		return true
 	}
 	if startedHome != "" && PureApiHome != "" && startedHome != PureApiHome {
@@ -371,6 +371,7 @@ func (m *imageGenManager) acquire(ctx context.Context) (*SharedAcpEngine, func(b
 		return nil, nil, err
 	}
 	maxConc := m.effectiveMaxConcurrency()
+	resolvedBin := currentResolvedAgyBin()
 	m.mu.Lock()
 	for {
 		for {
@@ -383,7 +384,7 @@ func (m *imageGenManager) acquire(ctx context.Context) (*SharedAcpEngine, func(b
 				waitNeeded = true
 			} else if m.inFlight > 0 {
 				needRecycle, _ := m.shouldRecycleLocked()
-				if needRecycle || m.binaryChangedLocked() || m.inFlight >= maxConc {
+				if needRecycle || m.binaryChangedLocked(resolvedBin) || m.inFlight >= maxConc {
 					waitNeeded = true
 				}
 			}
@@ -398,6 +399,7 @@ func (m *imageGenManager) acquire(ctx context.Context) (*SharedAcpEngine, func(b
 				return nil, nil, ctx.Err()
 			}
 			maxConc = m.effectiveMaxConcurrency()
+			resolvedBin = currentResolvedAgyBin()
 			m.mu.Lock()
 		}
 		if err := ctx.Err(); err != nil {
@@ -412,9 +414,10 @@ func (m *imageGenManager) acquire(ctx context.Context) (*SharedAcpEngine, func(b
 			m.idleTimer.Stop()
 			m.idleTimer = nil
 		}
-		if m.inFlight == 0 && m.binaryChangedLocked() {
+		if m.inFlight == 0 && m.binaryChangedLocked(resolvedBin) {
 			m.stopEngineLocked("ACP_IMAGEGEN_BINARY_SWITCH", "Restarting ws-imagegen engine for updated agy binary", nil)
 			maxConc = m.effectiveMaxConcurrency()
+			resolvedBin = currentResolvedAgyBin()
 			m.mu.Lock()
 			continue
 		}
@@ -428,6 +431,7 @@ func (m *imageGenManager) acquire(ctx context.Context) (*SharedAcpEngine, func(b
 					}
 					m.stopEngineLocked("ACP_IMAGEGEN_RECYCLE_STOP", "Recycling ws-imagegen engine before next generation", meta)
 					maxConc = m.effectiveMaxConcurrency()
+					resolvedBin = currentResolvedAgyBin()
 					m.mu.Lock()
 					continue
 				}
@@ -466,6 +470,8 @@ func (m *imageGenManager) acquire(ctx context.Context) (*SharedAcpEngine, func(b
 }
 
 func (m *imageGenManager) release(succeeded bool, ranAttempt bool) {
+	resolvedBin := currentResolvedAgyBin()
+	ttl := effectiveImageGenIdleTTL()
 	m.mu.Lock()
 	if m.inFlight > 0 {
 		m.inFlight--
@@ -479,7 +485,7 @@ func (m *imageGenManager) release(succeeded bool, ranAttempt bool) {
 		}
 	}
 	if m.inFlight == 0 {
-		if !m.transitioning && m.binaryChangedLocked() {
+		if !m.transitioning && m.binaryChangedLocked(resolvedBin) {
 			m.stopEngineLocked("ACP_IMAGEGEN_BINARY_SWITCH", "Stopped drained ws-imagegen engine for new agy binary", nil)
 			return
 		}
@@ -501,7 +507,6 @@ func (m *imageGenManager) release(succeeded bool, ranAttempt bool) {
 			}
 		}
 		if !m.transitioning && m.eng.IsAlive() {
-			ttl := effectiveImageGenIdleTTL()
 			if ttl <= 0 {
 				m.stopEngineLocked("ACP_IMAGEGEN_PRESSURE_STOP", "Stopped ws-imagegen engine immediately under cgroup memory pressure", nil)
 				return
@@ -541,8 +546,9 @@ func (m *imageGenManager) StopIfBinaryChanged() {
 	if m == nil {
 		return
 	}
+	resolvedBin := currentResolvedAgyBin()
 	m.mu.Lock()
-	if m.transitioning || m.inFlight > 0 || !m.binaryChangedLocked() {
+	if m.transitioning || m.inFlight > 0 || !m.binaryChangedLocked(resolvedBin) {
 		m.mu.Unlock()
 		return
 	}
@@ -707,6 +713,20 @@ type imageGenError struct {
 func (e *imageGenError) Error() string { return e.Message }
 
 func classifyImageGenError(rpcErr error, toolErrors []string, agentText string) *imageGenError {
+	var se *SoftError
+	if rpcErr != nil && errors.As(rpcErr, &se) && se != nil && se.ErrorType == "tos_circuit_breaker" {
+		msg := strings.TrimSpace(redactSecretsInString(se.Message))
+		if msg == "" {
+			msg = "Antigravity ToS circuit breaker is tripped"
+		}
+		return &imageGenError{
+			StatusCode: http.StatusServiceUnavailable,
+			ErrType:    "tos_circuit_breaker",
+			ErrCode:    "tos_circuit_breaker",
+			Message:    msg,
+		}
+	}
+
 	var parts []string
 	if rpcErr != nil {
 		parts = append(parts, redactSecretsInString(rpcErr.Error()))
@@ -944,9 +964,29 @@ func readVerifiedBrainImageFile(resolvedPath string) ([]byte, error) {
 	if fi.Size() > maxGeneratedImageBytes {
 		return nil, fmt.Errorf("generated image (%d bytes) exceeds %d byte limit", fi.Size(), maxGeneratedImageBytes)
 	}
-	raw, err := io.ReadAll(io.LimitReader(f, maxGeneratedImageBytes+1))
-	if err != nil {
+	size := int(fi.Size())
+	raw := make([]byte, size)
+	n, err := io.ReadFull(f, raw)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		return nil, err
+	}
+	raw = raw[:n]
+	if n == size {
+		var probe [1]byte
+		pn, perr := f.Read(probe[:])
+		if pn > 0 {
+			if size+pn > maxGeneratedImageBytes {
+				return nil, errors.New("generated image artifact has invalid size")
+			}
+			raw = append(raw, probe[:pn]...)
+			extra, errE := io.ReadAll(io.LimitReader(f, int64(maxGeneratedImageBytes-len(raw))+1))
+			if errE != nil {
+				return nil, errE
+			}
+			raw = append(raw, extra...)
+		} else if perr != nil && !errors.Is(perr, io.EOF) {
+			return nil, perr
+		}
 	}
 	if len(raw) == 0 || len(raw) > maxGeneratedImageBytes {
 		return nil, errors.New("generated image artifact has invalid size")
@@ -1039,8 +1079,28 @@ func buildImageGenPrompt(prompt, imageName, aspectRatio string, inputPaths []str
 }
 
 type generatedImageResult struct {
-	B64  string
+	Raw  []byte
 	Mime string
+}
+
+type pngEncoderBufferPool struct {
+	pool sync.Pool
+}
+
+func (p *pngEncoderBufferPool) Get() *png.EncoderBuffer {
+	if v := p.pool.Get(); v != nil {
+		return v.(*png.EncoderBuffer)
+	}
+	return nil
+}
+
+func (p *pngEncoderBufferPool) Put(b *png.EncoderBuffer) {
+	p.pool.Put(b)
+}
+
+var fastPNGEncoder = png.Encoder{
+	CompressionLevel: png.BestSpeed,
+	BufferPool:       &pngEncoderBufferPool{},
 }
 
 func normalizeImageOutputFormat(raw string) (string, error) {
@@ -1075,7 +1135,20 @@ func transcodeToPNGSerial(raw []byte, sniffedMime string) ([]byte, error) {
 		return nil, fmt.Errorf("failed to decode generated %s for png transcode: %w", sniffedMime, err)
 	}
 	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
+	est := int64(len(raw)) * 2
+	if bounds := img.Bounds(); bounds.Dx() > 0 && bounds.Dy() > 0 {
+		pxEst := int64(bounds.Dx()) * int64(bounds.Dy()) * 2
+		if pxEst > est {
+			est = pxEst
+		}
+	}
+	if est > maxGeneratedImageBytes {
+		est = maxGeneratedImageBytes
+	}
+	if est > 0 {
+		buf.Grow(int(est))
+	}
+	if err := fastPNGEncoder.Encode(&buf, img); err != nil {
 		img = nil
 		return nil, fmt.Errorf("failed to encode generated image as png: %w", err)
 	}
@@ -1218,10 +1291,8 @@ func (m *imageGenManager) generateOne(ctx context.Context, prompt, imageName, as
 		rawBytes = pngBytes
 		sniffedMime = "image/png"
 	}
-	b64 := base64.StdEncoding.EncodeToString(rawBytes)
-	rawBytes = nil
 	genOK = true
-	return generatedImageResult{B64: b64, Mime: sniffedMime}, nil
+	return generatedImageResult{Raw: rawBytes, Mime: sniffedMime}, nil
 }
 
 func writeImageAPIError(w http.ResponseWriter, r *http.Request, statusCode int, errType, errCode, msg string) {
@@ -1465,6 +1536,27 @@ func generateImageBatch(ctx context.Context, reqID int64, params validatedImageG
 	return results, nil
 }
 
+func writeOpenAIImagesJSONResponse(w http.ResponseWriter, outputFormat string, results []generatedImageResult) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Agy-Served-Model", imageGenServedModel)
+	bw := bufio.NewWriterSize(w, 32*1024)
+	outFmtJSON, _ := json.Marshal(outputFormat)
+	_, _ = fmt.Fprintf(bw, `{"created":%d,"output_format":%s,"data":[`, time.Now().Unix(), outFmtJSON)
+	for i := range results {
+		if i > 0 {
+			_ = bw.WriteByte(',')
+		}
+		_, _ = bw.WriteString(`{"b64_json":"`)
+		enc := base64.NewEncoder(base64.StdEncoding, bw)
+		_, _ = enc.Write(results[i].Raw)
+		_ = enc.Close()
+		results[i].Raw = nil
+		_, _ = bw.WriteString(`"}`)
+	}
+	_, _ = bw.WriteString("]}\n")
+	_ = bw.Flush()
+}
+
 func (gs *GatewayServer) executeImageGenerationRequest(w http.ResponseWriter, r *http.Request, reqID int64, params validatedImageGenParams, inputPaths []string) {
 	results, imgErr := generateImageBatch(r.Context(), reqID, params, inputPaths)
 	if imgErr != nil {
@@ -1472,23 +1564,8 @@ func (gs *GatewayServer) executeImageGenerationRequest(w http.ResponseWriter, r 
 		return
 	}
 
-	data := make([]map[string]any, len(results))
-	for i, res := range results {
-		data[i] = map[string]any{
-			"b64_json": res.B64,
-		}
-		results[i].B64 = ""
-	}
+	writeOpenAIImagesJSONResponse(w, params.OutputFormat, results)
 	results = nil
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Agy-Served-Model", imageGenServedModel)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"created":       time.Now().Unix(),
-		"output_format": params.OutputFormat,
-		"data":          data,
-	})
-	clear(data)
 }
 
 func (gs *GatewayServer) handleImagesGenerations(w http.ResponseWriter, r *http.Request, reqID int64) {
@@ -1579,86 +1656,192 @@ func decodeEditImageString(rawStr, fieldPath string) (validatedEditImage, error)
 	return validatedEditImage{raw: raw, mime: sniffed}, nil
 }
 
-func parseImageEditsMultipart(w http.ResponseWriter, r *http.Request) (validatedImageGenParams, []validatedEditImage, int, string) {
+func parseImageEditsMultipart(w http.ResponseWriter, r *http.Request, reqID int64) (validatedImageGenParams, string, []string, int, string) {
 	if _, hasPre := preReadBodyFromContext(r); !hasPre {
 		r.Body = http.MaxBytesReader(w, r.Body, MaxBodyBytes)
 	}
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		clearPreReadBody(r)
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			return validatedImageGenParams{}, nil, http.StatusRequestEntityTooLarge, "Request body exceeds maximum size"
-		}
-		return validatedImageGenParams{}, nil, http.StatusBadRequest, "Failed to parse multipart form: " + err.Error()
-	}
-	clearPreReadBody(r)
-	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
-	}
+	defer clearPreReadBody(r)
 
-	prompt := r.FormValue("prompt")
-	model := r.FormValue("model")
-	size := r.FormValue("size")
-	aspectRatio := r.FormValue("aspect_ratio")
-	responseFormat := r.FormValue("response_format")
-	outputFormat := r.FormValue("output_format")
-	nStr := strings.TrimSpace(r.FormValue("n"))
-	nVal := 1
-	hasN := false
-	if nStr != "" {
-		v, err := strconv.Atoi(nStr)
-		if err != nil {
-			return validatedImageGenParams{}, nil, http.StatusBadRequest, "n must be an integer"
-		}
-		nVal = v
-		hasN = true
-	}
-	params, err := parseAndValidateCommonImageParams(prompt, model, size, aspectRatio, responseFormat, outputFormat, nVal, hasN)
+	mr, err := r.MultipartReader()
 	if err != nil {
-		return validatedImageGenParams{}, nil, http.StatusBadRequest, err.Error()
-	}
-
-	var fhs []*multipart.FileHeader
-	if r.MultipartForm != nil {
-		for _, key := range []string{"image", "image[]"} {
-			fhs = append(fhs, r.MultipartForm.File[key]...)
-		}
-	}
-	if len(fhs) == 0 {
-		return validatedImageGenParams{}, nil, http.StatusBadRequest, "at least one image file is required in 'image' or 'image[]'"
-	}
-	if len(fhs) > maxImageEditInputs {
-		return validatedImageGenParams{}, nil, http.StatusBadRequest, fmt.Sprintf("at most %d input images are supported", maxImageEditInputs)
+		return validatedImageGenParams{}, "", nil, http.StatusBadRequest, "Failed to parse multipart form: " + err.Error()
 	}
 
 	limit := MaxImageBytes
 	if limit <= 0 {
 		limit = 10 * 1024 * 1024
 	}
-	imgs := make([]validatedEditImage, 0, len(fhs))
-	for i, fh := range fhs {
-		f, errO := fh.Open()
-		if errO != nil {
-			return validatedImageGenParams{}, nil, http.StatusBadRequest, fmt.Sprintf("failed to open uploaded image[%d]", i)
+
+	var (
+		tmpDir   string
+		absPaths []string
+		fields   = make(map[string]string, 8)
+		copyBuf  []byte
+	)
+	cleanupErr := func(code int, msg string) (validatedImageGenParams, string, []string, int, string) {
+		if tmpDir != "" {
+			_ = os.RemoveAll(tmpDir)
 		}
-		raw, errR := io.ReadAll(io.LimitReader(f, int64(limit)+1))
-		_ = f.Close()
-		if errR != nil {
-			return validatedImageGenParams{}, nil, http.StatusBadRequest, fmt.Sprintf("failed to read uploaded image[%d]", i)
-		}
-		if len(raw) == 0 {
-			return validatedImageGenParams{}, nil, http.StatusBadRequest, fmt.Sprintf("uploaded image[%d] is empty", i)
-		}
-		if len(raw) > limit {
-			return validatedImageGenParams{}, nil, http.StatusRequestEntityTooLarge, fmt.Sprintf("uploaded image[%d] exceeds %d byte limit", i, limit)
-		}
-		sniffed, ok := sniffAllowedImageMime(raw)
-		if !ok || !allowedImageMimeMap[sniffed] {
-			return validatedImageGenParams{}, nil, http.StatusBadRequest, fmt.Sprintf("uploaded image[%d] failed PNG/JPEG/WEBP/GIF/HEIC/HEIF magic header verification", i)
-		}
-		imgs = append(imgs, validatedEditImage{raw: raw, mime: sniffed})
+		return validatedImageGenParams{}, "", nil, code, msg
 	}
-	return params, imgs, 0, ""
+
+	for {
+		part, pErr := mr.NextPart()
+		if errors.Is(pErr, io.EOF) {
+			break
+		}
+		if pErr != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(pErr, &maxBytesErr) {
+				return cleanupErr(http.StatusRequestEntityTooLarge, "Request body exceeds maximum size")
+			}
+			return cleanupErr(http.StatusBadRequest, "Failed to parse multipart form: "+pErr.Error())
+		}
+
+		formName := part.FormName()
+		if formName == "image" || formName == "image[]" {
+			imgIdx := len(absPaths)
+			if imgIdx >= maxImageEditInputs {
+				_ = part.Close()
+				return cleanupErr(http.StatusBadRequest, fmt.Sprintf("at most %d input images are supported", maxImageEditInputs))
+			}
+
+			var head [32]byte
+			hn, hErr := io.ReadFull(part, head[:])
+			if hErr != nil && !errors.Is(hErr, io.EOF) && !errors.Is(hErr, io.ErrUnexpectedEOF) {
+				_ = part.Close()
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(hErr, &maxBytesErr) {
+					return cleanupErr(http.StatusRequestEntityTooLarge, "Request body exceeds maximum size")
+				}
+				return cleanupErr(http.StatusBadRequest, fmt.Sprintf("failed to read uploaded image[%d]", imgIdx))
+			}
+			if hn == 0 {
+				_ = part.Close()
+				return cleanupErr(http.StatusBadRequest, fmt.Sprintf("uploaded image[%d] is empty", imgIdx))
+			}
+			if hn > limit {
+				_ = part.Close()
+				return cleanupErr(http.StatusRequestEntityTooLarge, fmt.Sprintf("uploaded image[%d] exceeds %d byte limit", imgIdx, limit))
+			}
+			sniffed, ok := sniffAllowedImageMime(head[:hn])
+			if !ok || !allowedImageMimeMap[sniffed] {
+				_ = part.Close()
+				return cleanupErr(http.StatusBadRequest, fmt.Sprintf("uploaded image[%d] failed PNG/JPEG/WEBP/GIF/HEIC/HEIF magic header verification", imgIdx))
+			}
+
+			if tmpDir == "" {
+				if PureApiHome == "" || isWindowsCDrivePath(PureApiHome) {
+					_ = part.Close()
+					return cleanupErr(http.StatusInternalServerError, "PureApiHome is unset or points to restricted path")
+				}
+				tmpDir = filepath.Join(PureApiHome, "tmp", fmt.Sprintf("imagegen-%d-%s", reqID, randomHex(4)))
+				if isWindowsCDrivePath(tmpDir) {
+					_ = part.Close()
+					return cleanupErr(http.StatusInternalServerError, "restricted temp path")
+				}
+				if mkErr := os.MkdirAll(tmpDir, 0700); mkErr != nil {
+					_ = part.Close()
+					return cleanupErr(http.StatusInternalServerError, fmt.Sprintf("failed to prepare image edit workspace: %v", mkErr))
+				}
+			}
+
+			ext := imageExtForSniffedMime(sniffed)
+			p := filepath.Join(tmpDir, fmt.Sprintf("input_%d%s", imgIdx+1, ext))
+			f, fErr := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+			if fErr != nil {
+				_ = part.Close()
+				return cleanupErr(http.StatusInternalServerError, fmt.Sprintf("failed to stage input image: %v", fErr))
+			}
+			if _, wErr := f.Write(head[:hn]); wErr != nil {
+				_ = f.Close()
+				_ = part.Close()
+				return cleanupErr(http.StatusInternalServerError, fmt.Sprintf("failed to stage input image: %v", wErr))
+			}
+			if hErr == nil {
+				if copyBuf == nil {
+					copyBuf = make([]byte, 32*1024)
+				}
+				remLimit := int64(limit - hn)
+				written, cErr := io.CopyBuffer(f, io.LimitReader(part, remLimit+1), copyBuf)
+				if cErr != nil {
+					_ = f.Close()
+					_ = part.Close()
+					var maxBytesErr *http.MaxBytesError
+					if errors.As(cErr, &maxBytesErr) {
+						return cleanupErr(http.StatusRequestEntityTooLarge, "Request body exceeds maximum size")
+					}
+					return cleanupErr(http.StatusBadRequest, fmt.Sprintf("failed to read uploaded image[%d]", imgIdx))
+				}
+				if written > remLimit {
+					_ = f.Close()
+					_ = part.Close()
+					return cleanupErr(http.StatusRequestEntityTooLarge, fmt.Sprintf("uploaded image[%d] exceeds %d byte limit", imgIdx, limit))
+				}
+			}
+			if cErr := f.Close(); cErr != nil {
+				_ = part.Close()
+				return cleanupErr(http.StatusInternalServerError, fmt.Sprintf("failed to stage input image: %v", cErr))
+			}
+			_ = part.Close()
+
+			absP, errA := filepath.Abs(p)
+			if errA != nil {
+				absP = p
+			}
+			absPaths = append(absPaths, absP)
+			continue
+		}
+
+		if part.FileName() == "" {
+			switch formName {
+			case "prompt", "model", "size", "aspect_ratio", "response_format", "output_format", "n":
+				if _, exists := fields[formName]; !exists {
+					fieldCap := int64(1024)
+					if formName == "prompt" {
+						fieldCap = maxImageGenPromptChars + 1024
+					}
+					valBytes, rErr := io.ReadAll(io.LimitReader(part, fieldCap+1))
+					if rErr != nil {
+						_ = part.Close()
+						var maxBytesErr *http.MaxBytesError
+						if errors.As(rErr, &maxBytesErr) {
+							return cleanupErr(http.StatusRequestEntityTooLarge, "Request body exceeds maximum size")
+						}
+						return cleanupErr(http.StatusBadRequest, "Failed to parse multipart form: "+rErr.Error())
+					}
+					fields[formName] = string(valBytes)
+				}
+			}
+		}
+		_ = part.Close()
+	}
+
+	prompt := fields["prompt"]
+	model := fields["model"]
+	size := fields["size"]
+	aspectRatio := fields["aspect_ratio"]
+	responseFormat := fields["response_format"]
+	outputFormat := fields["output_format"]
+	nStr := strings.TrimSpace(fields["n"])
+	nVal := 1
+	hasN := false
+	if nStr != "" {
+		v, err := strconv.Atoi(nStr)
+		if err != nil {
+			return cleanupErr(http.StatusBadRequest, "n must be an integer")
+		}
+		nVal = v
+		hasN = true
+	}
+	params, err := parseAndValidateCommonImageParams(prompt, model, size, aspectRatio, responseFormat, outputFormat, nVal, hasN)
+	if err != nil {
+		return cleanupErr(http.StatusBadRequest, err.Error())
+	}
+	if len(absPaths) == 0 {
+		return cleanupErr(http.StatusBadRequest, "at least one image file is required in 'image' or 'image[]'")
+	}
+	return params, tmpDir, absPaths, 0, ""
 }
 
 func parseImageEditsJSON(w http.ResponseWriter, r *http.Request) (validatedImageGenParams, []validatedEditImage, int, string) {
@@ -1789,33 +1972,43 @@ func (gs *GatewayServer) handleImagesEdits(w http.ResponseWriter, r *http.Reques
 	}
 	ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
 	var (
-		params  validatedImageGenParams
-		imgs    []validatedEditImage
-		errCode int
-		errMsg  string
+		params   validatedImageGenParams
+		tmpDir   string
+		absPaths []string
+		errCode  int
+		errMsg   string
 	)
 	if strings.HasPrefix(ct, "multipart/form-data") {
-		params, imgs, errCode, errMsg = parseImageEditsMultipart(w, r)
+		params, tmpDir, absPaths, errCode, errMsg = parseImageEditsMultipart(w, r, reqID)
+		if errCode != 0 {
+			if errCode == http.StatusInternalServerError {
+				writeImageAPIError(w, r, errCode, "api_error", "temp_write_error", errMsg)
+			} else {
+				writeImageAPIError(w, r, errCode, "invalid_request_error", "invalid_request", errMsg)
+			}
+			return
+		}
 	} else {
+		var imgs []validatedEditImage
 		params, imgs, errCode, errMsg = parseImageEditsJSON(w, r)
-	}
-	if errCode != 0 {
+		if errCode != 0 {
+			for i := range imgs {
+				imgs[i].raw = nil
+			}
+			imgs = nil
+			writeImageAPIError(w, r, errCode, "invalid_request_error", "invalid_request", errMsg)
+			return
+		}
+		var stageErr error
+		tmpDir, absPaths, stageErr = stageValidatedEditImages(reqID, imgs)
 		for i := range imgs {
 			imgs[i].raw = nil
 		}
 		imgs = nil
-		writeImageAPIError(w, r, errCode, "invalid_request_error", "invalid_request", errMsg)
-		return
-	}
-
-	tmpDir, absPaths, stageErr := stageValidatedEditImages(reqID, imgs)
-	for i := range imgs {
-		imgs[i].raw = nil
-	}
-	imgs = nil
-	if stageErr != nil {
-		writeImageAPIError(w, r, http.StatusInternalServerError, "api_error", "temp_write_error", stageErr.Error())
-		return
+		if stageErr != nil {
+			writeImageAPIError(w, r, http.StatusInternalServerError, "api_error", "temp_write_error", stageErr.Error())
+			return
+		}
 	}
 	if tmpDir != "" {
 		defer func() {
@@ -1831,21 +2024,74 @@ type imagePromptTurn struct {
 	Text string
 }
 
-var markdownDataImageRe = regexp.MustCompile(`!\[[^\]]*\]\((data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+)\)`)
+func isValidImageMimeSubtypeChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '.' || b == '+' || b == '-'
+}
+
+func isValidBase64OrSpaceChar(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') ||
+		b == '+' || b == '/' || b == '=' || b == ' ' || b == '\t' || b == '\r' || b == '\n' || b == '\f' || b == '\v'
+}
 
 // extractAndStripMarkdownDataImages pulls embedded Markdown data:image/... URIs into refs
-// and replaces them with a compact placeholder so multi-turn chat echoes don't flood the text prompt.
+// using a single-pass strings.Index scan and replaces them with a compact placeholder so
+// multi-turn chat echoes don't flood the text prompt or trigger multi-MB regex rescans.
 func extractAndStripMarkdownDataImages(text string, fieldPath string, refs *[]chatImageRef) string {
-	if !strings.Contains(text, "data:image/") || !strings.Contains(text, "![") {
+	if !strings.Contains(text, "](data:image/") || !strings.Contains(text, "![") {
 		return text
 	}
-	return markdownDataImageRe.ReplaceAllStringFunc(text, func(match string) string {
-		sub := markdownDataImageRe.FindStringSubmatch(match)
-		if len(sub) == 2 {
-			*refs = append(*refs, chatImageRef{url: strings.TrimSpace(sub[1]), fieldPath: fieldPath})
+	const (
+		dataPrefix = "(data:image/"
+		b64Marker  = ";base64,"
+	)
+	var out strings.Builder
+	lastWrite := 0
+	searchPos := 0
+	for searchPos < len(text) {
+		rel := strings.Index(text[searchPos:], "![")
+		if rel < 0 {
+			break
 		}
-		return "[image]"
-	})
+		start := searchPos + rel
+		closeRel := strings.IndexByte(text[start+2:], ']')
+		if closeRel < 0 {
+			break
+		}
+		closeBracket := start + 2 + closeRel
+		if closeBracket+1 >= len(text) || !strings.HasPrefix(text[closeBracket+1:], dataPrefix) {
+			searchPos = start + 2
+			continue
+		}
+		uriStart := closeBracket + 2
+		p := uriStart + len("data:image/")
+		subStart := p
+		for p < len(text) && isValidImageMimeSubtypeChar(text[p]) {
+			p++
+		}
+		if p == subStart || !strings.HasPrefix(text[p:], b64Marker) {
+			searchPos = start + 2
+			continue
+		}
+		p += len(b64Marker)
+		b64Start := p
+		for p < len(text) && isValidBase64OrSpaceChar(text[p]) {
+			p++
+		}
+		if p == b64Start || p >= len(text) || text[p] != ')' {
+			searchPos = start + 2
+			continue
+		}
+		*refs = append(*refs, chatImageRef{url: strings.TrimSpace(text[uriStart:p]), fieldPath: fieldPath})
+		out.WriteString(text[lastWrite:start])
+		out.WriteString("[image]")
+		lastWrite = p + 1
+		searchPos = p + 1
+	}
+	if lastWrite == 0 {
+		return text
+	}
+	out.WriteString(text[lastWrite:])
+	return out.String()
 }
 
 func buildMultiTurnImagePrompt(sysText string, turns []imagePromptTurn) string {
@@ -1962,9 +2208,13 @@ func resolveChatImageRef(ctx context.Context, ref chatImageRef) (validatedEditIm
 	if decErr != nil {
 		return validatedEditImage{}, newMMError(http.StatusBadRequest, ref.fieldPath, "failed to decode fetched remote image")
 	}
-	sniffed, ok := sniffAllowedImageMime(raw)
-	if !ok || !allowedImageMimeMap[sniffed] {
-		return validatedEditImage{}, newMMError(http.StatusBadRequest, ref.fieldPath, "remote image failed PNG/JPEG/WEBP/GIF/HEIC/HEIF magic header verification")
+	sniffed := cached.mime
+	if sniffed == "" || !allowedImageMimeMap[sniffed] {
+		var ok bool
+		sniffed, ok = sniffAllowedImageMime(raw)
+		if !ok || !allowedImageMimeMap[sniffed] {
+			return validatedEditImage{}, newMMError(http.StatusBadRequest, ref.fieldPath, "remote image failed PNG/JPEG/WEBP/GIF/HEIC/HEIF magic header verification")
+		}
 	}
 	return validatedEditImage{raw: raw, mime: sniffed}, nil
 }
@@ -1985,7 +2235,7 @@ func extractChatImageURLFromPart(part map[string]any) string {
 }
 
 func writeChatImageSSEChunks(sw *protocol.StreamWriter, cmplID string, createdTs int64, model string, results []generatedImageResult, promptTok int) {
-	writeChunk := func(delta map[string]any, finish any, usage map[string]any) {
+	writeChunk := func(delta map[string]any, finish any, usage map[string]any) bool {
 		payload := map[string]any{
 			"id":      cmplID,
 			"object":  "chat.completion.chunk",
@@ -1996,37 +2246,108 @@ func writeChatImageSSEChunks(sw *protocol.StreamWriter, cmplID string, createdTs
 		if usage != nil {
 			payload["usage"] = usage
 		}
-		sw.WriteSSEData(payload)
+		return sw.WriteSSEData(payload)
 	}
 
 	writeChunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
 
-	const chunkSize = 64 * 1024
+	// Encode 48KB raw bytes (exact multiple of 3 -> 64KB base64 without intermediate '=')
+	// directly into one reusable SSE frame buffer to avoid multi-MB allocations.
+	const rawChunkSize = 48 * 1024
+	const b64ChunkSize = 64 * 1024
+	idJSON, _ := json.Marshal(cmplID)
+	modelJSON, _ := json.Marshal(model)
+	framePrefix := fmt.Sprintf(`data: {"id":%s,"object":"chat.completion.chunk","created":%d,"model":%s,"choices":[{"index":0,"delta":{"content":"`, idJSON, createdTs, modelJSON)
+	const frameSuffix = "\"},\"finish_reason\":null}]}\n\n"
+	frameBuf := make([]byte, len(framePrefix)+b64ChunkSize+len(frameSuffix))
+	copy(frameBuf, framePrefix)
+
+	writeOK := true
 	for i := range results {
+		raw := results[i].Raw
+		if !writeOK {
+			results[i].Raw = nil
+			continue
+		}
 		prefix := fmt.Sprintf("![image](data:%s;base64,", results[i].Mime)
 		if i > 0 {
 			prefix = "\n\n" + prefix
 		}
-		writeChunk(map[string]any{"content": prefix}, nil, nil)
-		b64 := results[i].B64
-		for off := 0; off < len(b64); off += chunkSize {
-			end := off + chunkSize
-			if end > len(b64) {
-				end = len(b64)
-			}
-			writeChunk(map[string]any{"content": b64[off:end]}, nil, nil)
+		if !writeChunk(map[string]any{"content": prefix}, nil, nil) {
+			writeOK = false
+			results[i].Raw = nil
+			continue
 		}
-		writeChunk(map[string]any{"content": ")"}, nil, nil)
-		results[i].B64 = ""
+		for off := 0; off < len(raw); off += rawChunkSize {
+			end := off + rawChunkSize
+			if end > len(raw) {
+				end = len(raw)
+			}
+			nEnc := base64.StdEncoding.EncodedLen(end - off)
+			base64.StdEncoding.Encode(frameBuf[len(framePrefix):len(framePrefix)+nEnc], raw[off:end])
+			copy(frameBuf[len(framePrefix)+nEnc:], frameSuffix)
+			if !sw.WriteRawBytes(frameBuf[:len(framePrefix)+nEnc+len(frameSuffix)]) {
+				writeOK = false
+				break
+			}
+		}
+		results[i].Raw = nil
+		if writeOK {
+			writeOK = writeChunk(map[string]any{"content": ")"}, nil, nil)
+		}
 	}
 
+	if writeOK {
+		compTok := len(results) * 256
+		writeChunk(map[string]any{}, "stop", map[string]any{
+			"prompt_tokens":     promptTok,
+			"completion_tokens": compTok,
+			"total_tokens":      promptTok + compTok,
+		})
+		sw.WriteRaw("data: [DONE]\n\n")
+	}
+}
+
+func writeChatImageJSONResponse(w http.ResponseWriter, cmplID string, createdTs int64, model string, results []generatedImageResult, promptTok int) {
 	compTok := len(results) * 256
-	writeChunk(map[string]any{}, "stop", map[string]any{
-		"prompt_tokens":     promptTok,
-		"completion_tokens": compTok,
-		"total_tokens":      promptTok + compTok,
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Agy-Served-Model", model)
+	bw := bufio.NewWriterSize(w, 32*1024)
+	idJSON, _ := json.Marshal(cmplID)
+	modelJSON, _ := json.Marshal(model)
+	_, _ = fmt.Fprintf(bw, `{"id":%s,"object":"chat.completion","created":%d,"model":%s,"choices":[{"index":0,"message":{"role":"assistant","content":"`,
+		idJSON, createdTs, modelJSON)
+	for i := range results {
+		if i > 0 {
+			_, _ = bw.WriteString(`\n\n`)
+		}
+		mimeJSON, _ := json.Marshal(results[i].Mime)
+		_, _ = bw.WriteString(`![image](data:`)
+		if len(mimeJSON) >= 2 {
+			_, _ = bw.Write(mimeJSON[1 : len(mimeJSON)-1])
+		}
+		_, _ = bw.WriteString(`;base64,`)
+		enc := base64.NewEncoder(base64.StdEncoding, bw)
+		_, _ = enc.Write(results[i].Raw)
+		_ = enc.Close()
+		results[i].Raw = nil
+		_ = bw.WriteByte(')')
+	}
+	_, _ = fmt.Fprintf(bw, `"},"finish_reason":"stop"}],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}`+"\n",
+		promptTok, compTok, promptTok+compTok)
+	_ = bw.Flush()
+}
+
+func writeChatImageErrorSSE(sw *protocol.StreamWriter, imgErr *imageGenError) {
+	b, _ := json.Marshal(map[string]any{
+		"error": map[string]any{"type": imgErr.ErrType, "code": imgErr.ErrCode, "message": imgErr.Message},
 	})
-	sw.WriteRaw("data: [DONE]\n\n")
+	if !sw.HeadersCommitted() {
+		sw.CommitErrorStatus(imgErr.StatusCode, nil, "application/json")
+		sw.WriteRawBytes(append(b, '\n'))
+		return
+	}
+	sw.WriteRaw(fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", string(b)))
 }
 
 func (gs *GatewayServer) handleChatCompletionsImageGen(w http.ResponseWriter, r *http.Request, reqID int64, reqModel string, body map[string]any) {
@@ -2202,46 +2523,8 @@ func (gs *GatewayServer) handleChatCompletionsImageGen(w http.ResponseWriter, r 
 			writeImageAPIError(w, r, imgErr.StatusCode, imgErr.ErrType, imgErr.ErrCode, imgErr.Message)
 			return
 		}
-		var sb strings.Builder
-		for i := range results {
-			if i > 0 {
-				sb.WriteString("\n\n")
-			}
-			sb.WriteString("![image](data:")
-			sb.WriteString(results[i].Mime)
-			sb.WriteString(";base64,")
-			sb.WriteString(results[i].B64)
-			sb.WriteByte(')')
-			results[i].B64 = ""
-		}
-		compTok := len(results) * 256
+		writeChatImageJSONResponse(w, cmplID, createdTs, imageGenServedModel, results, promptTok)
 		results = nil
-		contentStr := sb.String()
-		sb.Reset()
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Agy-Served-Model", imageGenServedModel)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":      cmplID,
-			"object":  "chat.completion",
-			"created": createdTs,
-			"model":   imageGenServedModel,
-			"choices": []map[string]any{
-				{
-					"index": 0,
-					"message": map[string]any{
-						"role":    "assistant",
-						"content": contentStr,
-					},
-					"finish_reason": "stop",
-				},
-			},
-			"usage": map[string]any{
-				"prompt_tokens":     promptTok,
-				"completion_tokens": compTok,
-				"total_tokens":      promptTok + compTok,
-			},
-		})
 		return
 	}
 
@@ -2254,6 +2537,7 @@ func (gs *GatewayServer) handleChatCompletionsImageGen(w http.ResponseWriter, r 
 	stream.StartHeartbeat(func(sw *protocol.StreamWriter) {
 		sw.WriteRaw(": ping\n\n")
 	})
+	defer stream.StopHeartbeat()
 
 	results, imgErr := generateImageBatch(r.Context(), reqID, params, absPaths)
 	stream.StopHeartbeat()
@@ -2263,15 +2547,7 @@ func (gs *GatewayServer) handleChatCompletionsImageGen(w http.ResponseWriter, r 
 			return
 		}
 		stream.DoLocked(func(sw *protocol.StreamWriter) {
-			b, _ := json.Marshal(map[string]any{
-				"error": map[string]any{"type": imgErr.ErrType, "code": imgErr.ErrCode, "message": imgErr.Message},
-			})
-			if !sw.HeadersCommitted() {
-				sw.CommitErrorStatus(imgErr.StatusCode, nil, "application/json")
-				sw.WriteRaw(string(b) + "\n")
-				return
-			}
-			sw.WriteRaw(fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", string(b)))
+			writeChatImageErrorSSE(sw, imgErr)
 		})
 		return
 	}

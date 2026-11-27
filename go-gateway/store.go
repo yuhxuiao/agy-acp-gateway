@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -139,10 +140,12 @@ func (st *StateStore) Init(dbPath string) {
 	}
 	_ = os.MkdirAll(filepath.Dir(st.dbPath), 0755)
 	writeCacheKB := -1000
+	journalSizeLimit := 67108864 // 64 MiB
 	if isChildAccountWorker() {
 		writeCacheKB = -500
+		journalSizeLimit = 8388608 // 8 MiB
 	}
-	dsn := sqliteFileURI(st.dbPath, fmt.Sprintf("_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=journal_size_limit(67108864)&_pragma=cache_size(%d)", writeCacheKB))
+	dsn := sqliteFileURI(st.dbPath, fmt.Sprintf("_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=journal_size_limit(%d)&_pragma=cache_size(%d)", journalSizeLimit, writeCacheKB))
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		st.mu.Unlock()
@@ -195,7 +198,7 @@ CREATE TABLE IF NOT EXISTS conversation_hot (
 );
 
 CREATE TABLE IF NOT EXISTS turns (
-	id               INTEGER PRIMARY KEY AUTOINCREMENT,
+	id               INTEGER PRIMARY KEY,
 	conv_key         TEXT NOT NULL,
 	agy_session_id   TEXT NOT NULL,
 	turn_idx         INTEGER NOT NULL,
@@ -285,33 +288,56 @@ CREATE TABLE IF NOT EXISTS known_gateway_sids (
 		st.resetCachesOnInit()
 		return
 	}
-	for _, col := range []struct{ table, name, decl string }{
-		{"conversations", "init_tools_json", "TEXT NOT NULL DEFAULT ''"},
-		{"conversations", "cur_tools_json", "TEXT NOT NULL DEFAULT ''"},
-		{"conversations", "init_system_text", "TEXT NOT NULL DEFAULT ''"},
-		{"conversations", "init_append_prompt", "TEXT NOT NULL DEFAULT ''"},
-		{"conversations", "hibernated_parked_json", "TEXT NOT NULL DEFAULT ''"},
-		{"conversations", "last_gen_meta_idx", "INTEGER NOT NULL DEFAULT -1"},
-		{"conversations", "client_id", "TEXT NOT NULL DEFAULT ''"},
-		{"conversations", "client_label", "TEXT NOT NULL DEFAULT ''"},
-		{"conversations", "protocol", "TEXT NOT NULL DEFAULT ''"},
-		{"turns", "served_model", "TEXT NOT NULL DEFAULT ''"},
-		{"turns", "cache_miss", "TEXT NOT NULL DEFAULT ''"},
-		{"turns", "stream_ms", "INTEGER NOT NULL DEFAULT 0"},
-		{"turns", "decode_tps", "REAL NOT NULL DEFAULT 0"},
-		{"turns", "upstream_ttft_ms", "INTEGER NOT NULL DEFAULT 0"},
-		{"turns", "thinking_ms", "INTEGER NOT NULL DEFAULT 0"},
-		{"turns", "retry_count", "INTEGER NOT NULL DEFAULT 0"},
-		{"turns", "client_id", "TEXT NOT NULL DEFAULT ''"},
-		{"turns", "client_label", "TEXT NOT NULL DEFAULT ''"},
-		{"turns", "protocol", "TEXT NOT NULL DEFAULT ''"},
-		{"usage_steps", "served_model", "TEXT NOT NULL DEFAULT ''"},
-		{"usage_steps", "stream_ms", "INTEGER NOT NULL DEFAULT 0"},
-		{"usage_steps", "decode_tps", "REAL NOT NULL DEFAULT 0"},
-		{"ingest_cursor", "fork_dedup_ver", "INTEGER NOT NULL DEFAULT 0"},
+	for _, tbl := range []struct {
+		table string
+		cols  []tableColumnMigration
+	}{
+		{
+			table: "conversations",
+			cols: []tableColumnMigration{
+				{"init_tools_json", "TEXT NOT NULL DEFAULT ''"},
+				{"cur_tools_json", "TEXT NOT NULL DEFAULT ''"},
+				{"init_system_text", "TEXT NOT NULL DEFAULT ''"},
+				{"init_append_prompt", "TEXT NOT NULL DEFAULT ''"},
+				{"hibernated_parked_json", "TEXT NOT NULL DEFAULT ''"},
+				{"last_gen_meta_idx", "INTEGER NOT NULL DEFAULT -1"},
+				{"client_id", "TEXT NOT NULL DEFAULT ''"},
+				{"client_label", "TEXT NOT NULL DEFAULT ''"},
+				{"protocol", "TEXT NOT NULL DEFAULT ''"},
+			},
+		},
+		{
+			table: "turns",
+			cols: []tableColumnMigration{
+				{"served_model", "TEXT NOT NULL DEFAULT ''"},
+				{"cache_miss", "TEXT NOT NULL DEFAULT ''"},
+				{"stream_ms", "INTEGER NOT NULL DEFAULT 0"},
+				{"decode_tps", "REAL NOT NULL DEFAULT 0"},
+				{"upstream_ttft_ms", "INTEGER NOT NULL DEFAULT 0"},
+				{"thinking_ms", "INTEGER NOT NULL DEFAULT 0"},
+				{"retry_count", "INTEGER NOT NULL DEFAULT 0"},
+				{"client_id", "TEXT NOT NULL DEFAULT ''"},
+				{"client_label", "TEXT NOT NULL DEFAULT ''"},
+				{"protocol", "TEXT NOT NULL DEFAULT ''"},
+			},
+		},
+		{
+			table: "usage_steps",
+			cols: []tableColumnMigration{
+				{"served_model", "TEXT NOT NULL DEFAULT ''"},
+				{"stream_ms", "INTEGER NOT NULL DEFAULT 0"},
+				{"decode_tps", "REAL NOT NULL DEFAULT 0"},
+			},
+		},
+		{
+			table: "ingest_cursor",
+			cols: []tableColumnMigration{
+				{"fork_dedup_ver", "INTEGER NOT NULL DEFAULT 0"},
+			},
+		},
 	} {
-		if err := addColumnIfMissing(db, col.table, col.name, col.decl); err != nil {
-			LogEvent("STORE_INIT_ERR", "failed to migrate gateway state column", map[string]any{"path": st.dbPath, "table": col.table, "column": col.name, "error": err.Error()})
+		if err := ensureTableColumns(db, tbl.table, tbl.cols); err != nil {
+			LogEvent("STORE_INIT_ERR", "failed to migrate gateway state table", map[string]any{"path": st.dbPath, "table": tbl.table, "error": err.Error()})
 			_ = db.Close()
 			st.mu.Unlock()
 			st.resetCachesOnInit()
@@ -431,27 +457,36 @@ func (st *StateStore) acquireReadDB() (*sql.DB, func()) {
 	return nil, func() {}
 }
 
-// addColumnIfMissing is the schema migration for columns added after the first release.
-func addColumnIfMissing(db *sql.DB, table, column, decl string) error {
+type tableColumnMigration struct {
+	name string
+	decl string
+}
+
+// ensureTableColumns checks all migrated columns for a table with a single PRAGMA table_info query.
+func ensureTableColumns(db *sql.DB, table string, cols []tableColumnMigration) error {
 	rows, err := db.Query("PRAGMA table_info(" + table + ")")
 	if err != nil {
 		return err
 	}
-	found := false
+	existing := make(map[string]bool)
 	for rows.Next() {
 		var cid, notNull, pk int
 		var name, typ string
 		var dflt sql.NullString
-		if rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk) == nil && name == column {
-			found = true
+		if rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk) == nil {
+			existing[name] = true
 		}
 	}
 	_ = rows.Close()
-	if found {
-		return nil
+	for _, col := range cols {
+		if existing[col.name] {
+			continue
+		}
+		if _, err := db.Exec("ALTER TABLE " + table + " ADD COLUMN " + col.name + " " + col.decl); err != nil {
+			return fmt.Errorf("column %s: %w", col.name, err)
+		}
 	}
-	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + decl)
-	return err
+	return nil
 }
 
 func (st *StateStore) IsReady() bool {
@@ -486,6 +521,40 @@ func (s *AcpProjectSession) sessionStateLabelLocked() string {
 	default:
 		return "LiveIdle"
 	}
+}
+
+func toolCatalogsIdentical(a, b []ToolDef) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	if toolSliceDataPtr(a) == toolSliceDataPtr(b) {
+		return true
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name ||
+			a[i].OutboundAlias != b[i].OutboundAlias ||
+			a[i].McpName != b[i].McpName ||
+			a[i].Description != b[i].Description {
+			return false
+		}
+		ap, bp := a[i].Parameters, b[i].Parameters
+		if len(ap) != len(bp) {
+			return false
+		}
+		if len(ap) == 0 && (ap == nil) == (bp == nil) {
+			continue
+		}
+		if ap != nil && bp != nil && reflect.ValueOf(ap).Pointer() == reflect.ValueOf(bp).Pointer() {
+			continue
+		}
+		if !reflect.DeepEqual(ap, bp) {
+			return false
+		}
+	}
+	return true
 }
 
 func captureSessionSnapshot(s *AcpProjectSession) (SessionSnapshot, bool) {
@@ -526,10 +595,17 @@ func captureSessionSnapshot(s *AcpProjectSession) (SessionSnapshot, bool) {
 
 	curPtr := toolSliceDataPtr(s.ToolsCatalog)
 	curLen := len(s.ToolsCatalog)
+	var curToolsJSON string
 	if curLen == 0 {
 		s.cachedCurToolsPtr = nil
 		s.cachedCurToolsLen = 0
 		s.cachedCurToolsFp = ""
+		s.cachedCurToolsJSON = ""
+	} else if initLen > 0 && toolCatalogsIdentical(s.InitialToolsCatalog, s.ToolsCatalog) {
+		// Identical to InitialToolsCatalog: store once in init_tools_json and clear cur_tools_json.
+		s.cachedCurToolsPtr = curPtr
+		s.cachedCurToolsLen = curLen
+		s.cachedCurToolsFp = toolFp
 		s.cachedCurToolsJSON = ""
 	} else if s.cachedCurToolsPtr != curPtr || s.cachedCurToolsLen != curLen || s.cachedCurToolsFp != toolFp || s.cachedCurToolsJSON == "" {
 		if b, err := json.Marshal(s.ToolsCatalog); err == nil {
@@ -540,8 +616,13 @@ func captureSessionSnapshot(s *AcpProjectSession) (SessionSnapshot, bool) {
 		s.cachedCurToolsPtr = curPtr
 		s.cachedCurToolsLen = curLen
 		s.cachedCurToolsFp = toolFp
+		curToolsJSON = s.cachedCurToolsJSON
+	} else {
+		curToolsJSON = s.cachedCurToolsJSON
 	}
-	curToolsJSON := s.cachedCurToolsJSON
+	if initToolsJSON != "" && curToolsJSON == initToolsJSON {
+		curToolsJSON = ""
+	}
 
 	sysText := s.SystemText
 	initSysText := s.InitialSystemText
@@ -653,7 +734,7 @@ ON CONFLICT(conv_key) DO UPDATE SET
 	thought_level = excluded.thought_level,
 	tool_fp = excluded.tool_fp,
 	init_tools_json = CASE WHEN excluded.init_tools_json != '' OR excluded.agy_session_id != conversations.agy_session_id THEN excluded.init_tools_json ELSE conversations.init_tools_json END,
-	cur_tools_json = CASE WHEN excluded.cur_tools_json != '' OR excluded.agy_session_id != conversations.agy_session_id THEN excluded.cur_tools_json ELSE conversations.cur_tools_json END,
+	cur_tools_json = CASE WHEN excluded.cur_tools_json != '' OR excluded.init_tools_json != '' OR excluded.agy_session_id != conversations.agy_session_id THEN excluded.cur_tools_json ELSE conversations.cur_tools_json END,
 	system_text = excluded.system_text,
 	init_system_text = CASE WHEN excluded.init_system_text != '' OR excluded.agy_session_id != conversations.agy_session_id THEN excluded.init_system_text ELSE conversations.init_system_text END,
 	init_append_prompt = CASE WHEN excluded.init_append_prompt != '' OR excluded.agy_session_id != conversations.agy_session_id THEN excluded.init_append_prompt ELSE conversations.init_append_prompt END,
@@ -1255,7 +1336,7 @@ func buildSessionFromRow(rDB *sql.DB, r restoredConvRow, backfills *[]genMetaBac
 			sess.InitialToolsCatalog = initCat
 		}
 	}
-	if r.curToolsJSON != "" {
+	if r.curToolsJSON != "" && r.curToolsJSON != r.initToolsJSON {
 		var curCat []ToolDef
 		if unmarshalJSONPreserveNumbers([]byte(r.curToolsJSON), &curCat) == nil && len(curCat) > 0 {
 			for i := range curCat {
@@ -1267,7 +1348,7 @@ func buildSessionFromRow(rDB *sql.DB, r restoredConvRow, backfills *[]genMetaBac
 			sess.ToolsCatalog = curCat
 		}
 	} else if len(sess.InitialToolsCatalog) > 0 {
-		sess.ToolsCatalog = append([]ToolDef(nil), sess.InitialToolsCatalog...)
+		sess.ToolsCatalog = sess.InitialToolsCatalog
 	}
 	sess.MessageCount = r.msgCnt
 	sess.lastTurnAssistant = r.msgCnt > 0
@@ -1305,7 +1386,8 @@ func buildSessionFromRow(rDB *sql.DB, r restoredConvRow, backfills *[]genMetaBac
 	}
 	sess.TotalTurns = totalCnt
 
-	// Load up to 150 most recent turns for this conversation in chronological order
+	// Load up to 16 most recent turns for this conversation in chronological order
+	// (matching hibernated retention to keep restored session RAM bounded).
 	tRows, err := rDB.Query(`
 SELECT turn_idx, completed_at_ms, agy_session_id, mode, elapsed_ms, ttft_ms, upstream_ttft_ms, stream_ms, tps, decode_tps,
        thinking_tok, thinking_ms, retry_count, in_tok, cached_tok, out_tok, raw_in_tok, raw_cr_tok,
@@ -1319,7 +1401,7 @@ FROM (
 	FROM turns
 	WHERE conv_key = ?
 	ORDER BY id DESC
-	LIMIT 150
+	LIMIT 16
 )
 ORDER BY id ASC
 `, r.convKey)
@@ -1399,9 +1481,30 @@ func (st *StateStore) applyGenMetaBackfills(backfills []genMetaBackfill) {
 	if st.db == nil {
 		return
 	}
+	tx, err := st.db.Begin()
+	if err != nil {
+		return
+	}
+	stmtConv, err1 := tx.Prepare(`UPDATE conversations SET last_gen_meta_idx = ? WHERE conv_key = ?`)
+	stmtHot, err2 := tx.Prepare(`UPDATE conversation_hot SET last_gen_meta_idx = ? WHERE conv_key = ?`)
+	if err1 != nil || err2 != nil {
+		if stmtConv != nil {
+			_ = stmtConv.Close()
+		}
+		if stmtHot != nil {
+			_ = stmtHot.Close()
+		}
+		_ = tx.Rollback()
+		return
+	}
 	for _, b := range backfills {
-		_, _ = st.db.Exec(`UPDATE conversations SET last_gen_meta_idx = ? WHERE conv_key = ?`, b.maxGen, b.convKey)
-		_, _ = st.db.Exec(`UPDATE conversation_hot SET last_gen_meta_idx = ? WHERE conv_key = ?`, b.maxGen, b.convKey)
+		_, _ = stmtConv.Exec(b.maxGen, b.convKey)
+		_, _ = stmtHot.Exec(b.maxGen, b.convKey)
+	}
+	_ = stmtConv.Close()
+	_ = stmtHot.Close()
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
 	}
 }
 
@@ -1847,10 +1950,13 @@ func (st *StateStore) syncUsageStepsFromSourceDirInternal(convDir, defaultSource
 		maxForkIdx := -1
 		var ok bool
 		var liveRO *sql.DB
+		var preGenStep map[int]genStepMeta
+		var preGenTok map[[3]int]genStepMeta
+		preGenLoaded := false
 		if item.isPB {
 			steps, ok = ReadModelStepsFromProtobuf(item.filePath, defaultSourceSide, defaultSourceCat, defaultSourceLabel, gwSids, item.meta.lastStepIdx, item.meta.dbMtimeNs/1e9)
 		} else if isAppSource {
-			steps, maxForkIdx, ok = readModelStepsFromSQLiteAfterInternal(item.filePath, defaultSourceSide, gwSids, item.meta.lastStepIdx)
+			steps, maxForkIdx, preGenStep, preGenTok, preGenLoaded, ok = gwstore.ReadModelStepsAndGenMetaFromSQLiteAfter(item.filePath, defaultSourceSide, gwSids, item.meta.lastStepIdx)
 		} else {
 			if roDBLookup != nil {
 				liveRO = roDBLookup(item.sid)
@@ -1904,7 +2010,7 @@ func (st *StateStore) syncUsageStepsFromSourceDirInternal(convDir, defaultSource
 			continue
 		}
 		if !item.isPB {
-			st.backfillEmptyServedModels(item.sid, item.filePath, isAppSource, liveRO)
+			st.backfillEmptyServedModels(item.sid, item.filePath, isAppSource, liveRO, preGenStep, preGenTok, preGenLoaded)
 		}
 		ingested += n
 	}
@@ -1914,7 +2020,7 @@ func (st *StateStore) syncUsageStepsFromSourceDirInternal(convDir, defaultSource
 // backfillEmptyServedModels fills served_model on rows ingested before gen_metadata landed in WAL.
 // When pureImageOnly is true (e.g. AppConversationsDir()), openReadOnlySQLite is bypassed completely
 // so modernc.org/sqlite VFS never creates/unlinks -shm/-wal files in writable host directories.
-func (st *StateStore) backfillEmptyServedModels(sid, dbPath string, pureImageOnly bool, liveRO *sql.DB) {
+func (st *StateStore) backfillEmptyServedModels(sid, dbPath string, pureImageOnly bool, liveRO *sql.DB, preStep map[int]genStepMeta, preTok map[[3]int]genStepMeta, preLoaded bool) {
 	rDB, relRead := st.acquireReadDB()
 	if rDB == nil {
 		return
@@ -1927,31 +2033,49 @@ func (st *StateStore) backfillEmptyServedModels(sid, dbPath string, pureImageOnl
 	}
 	var byStep map[int]string
 	var byTok map[[3]int]string
-	if !pureImageOnly {
-		if liveRO != nil {
-			byStep, byTok = readSessionServedModels(liveRO)
-		}
-		if len(byStep) == 0 && len(byTok) == 0 {
-			if srcDB, err := openReadOnlySQLite(dbPath); err == nil {
-				byStep, byTok = readSessionServedModels(srcDB)
-				_ = srcDB.Close()
+	if preLoaded {
+		if len(preStep) > 0 || len(preTok) > 0 {
+			byStep = make(map[int]string, len(preStep))
+			byTok = make(map[[3]int]string, len(preTok))
+			for k, v := range preStep {
+				if v.ServedModel != "" {
+					byStep[k] = v.ServedModel
+				}
+			}
+			for k, v := range preTok {
+				if v.ServedModel != "" {
+					byTok[k] = v.ServedModel
+				}
 			}
 		}
-	}
-	if len(byStep) == 0 && len(byTok) == 0 {
-		if img, errI := openSQLiteImage(dbPath); errI == nil {
-			mStep, mTok := readGenMetaIndexFromImage(img)
-			if len(mStep) > 0 || len(mTok) > 0 {
-				byStep = map[int]string{}
-				byTok = map[[3]int]string{}
-				for k, v := range mStep {
-					if v.ServedModel != "" {
-						byStep[k] = v.ServedModel
-					}
+	} else {
+		if !pureImageOnly {
+			if liveRO != nil {
+				byStep, byTok = readSessionServedModels(liveRO)
+			}
+			if len(byStep) == 0 && len(byTok) == 0 {
+				if srcDB, err := openReadOnlySQLite(dbPath); err == nil {
+					byStep, byTok = readSessionServedModels(srcDB)
+					_ = srcDB.Close()
 				}
-				for k, v := range mTok {
-					if v.ServedModel != "" {
-						byTok[k] = v.ServedModel
+			}
+		}
+		if len(byStep) == 0 && len(byTok) == 0 {
+			if img, errI := openSQLiteImage(dbPath); errI == nil {
+				mStep, mTok := readGenMetaIndexFromImage(img)
+				_ = img.Close()
+				if len(mStep) > 0 || len(mTok) > 0 {
+					byStep = make(map[int]string, len(mStep))
+					byTok = make(map[[3]int]string, len(mTok))
+					for k, v := range mStep {
+						if v.ServedModel != "" {
+							byStep[k] = v.ServedModel
+						}
+					}
+					for k, v := range mTok {
+						if v.ServedModel != "" {
+							byTok[k] = v.ServedModel
+						}
 					}
 				}
 			}
@@ -1965,7 +2089,8 @@ func (st *StateStore) backfillEmptyServedModels(sid, dbPath string, pureImageOnl
 	if st.db == nil {
 		return
 	}
-	rows, err := st.db.Query(`SELECT step_idx, raw_in, raw_cr, out_tok FROM usage_steps WHERE session_id = ? AND served_model = ''`, strings.ToLower(sid))
+	sidLower := strings.ToLower(sid)
+	rows, err := st.db.Query(`SELECT step_idx, raw_in, raw_cr, out_tok FROM usage_steps WHERE session_id = ? AND served_model = ''`, sidLower)
 	if err != nil {
 		return
 	}
@@ -1985,10 +2110,20 @@ func (st *StateStore) backfillEmptyServedModels(sid, dbPath string, pureImageOnl
 		}
 	}
 	_ = rows.Close()
-	for _, p := range patches {
-		_, _ = st.db.Exec(`UPDATE usage_steps SET served_model = ? WHERE session_id = ? AND step_idx = ? AND served_model = ''`, p.model, strings.ToLower(sid), p.idx)
-	}
 	if len(patches) > 0 {
+		if tx, errTx := st.db.Begin(); errTx == nil {
+			if stmt, errP := tx.Prepare(`UPDATE usage_steps SET served_model = ? WHERE session_id = ? AND step_idx = ? AND served_model = ''`); errP == nil {
+				for _, p := range patches {
+					_, _ = stmt.Exec(p.model, sidLower, p.idx)
+				}
+				_ = stmt.Close()
+				if errC := tx.Commit(); errC != nil {
+					_ = tx.Rollback()
+				}
+			} else {
+				_ = tx.Rollback()
+			}
+		}
 		st.coldEpoch.Add(1)
 		st.version.Add(1)
 	}

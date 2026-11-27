@@ -160,10 +160,10 @@ start() {
   if port_busy "$GW_PORT" || port_busy "$DASH_PORT"; then echo 'Instance port already occupied' >&2; return 1; fi
   cd "$ROOT"
   if command -v setsid >/dev/null 2>&1; then
-    AGY_UPSTREAM_PROXY="${AGY_UPSTREAM_PROXY-http://127.0.0.1:7890}" \
+    AGY_UPSTREAM_PROXY="${AGY_UPSTREAM_PROXY-}" \
       setsid nohup "$BIN" >>"$LOGS/go-gateway.out" 2>&1 < /dev/null 9>&- &
   else
-    AGY_UPSTREAM_PROXY="${AGY_UPSTREAM_PROXY-http://127.0.0.1:7890}" \
+    AGY_UPSTREAM_PROXY="${AGY_UPSTREAM_PROXY-}" \
       nohup python3 -c 'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' "$BIN" >>"$LOGS/go-gateway.out" 2>&1 < /dev/null 9>&- &
   fi
   gw_pid="$!"

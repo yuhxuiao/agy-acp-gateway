@@ -2532,6 +2532,106 @@ class UpgraderTest(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertTrue(any("unrecognised binary container" in e for e in payload["errors"]))
 
+    def test_audit04_skips_verification_required_and_rotates_on_validation_required(self):
+        # 1. parse_pool_view flags verification_required via state, boolean, or quota.error
+        dash = {
+            "instances": [
+                {"id": "tr20x", "health": {"state": "verification_required"}, "quota": {"groups": []}},
+                {"id": "uspro", "health": {"state": "healthy", "verificationRequired": True}, "quota": {"groups": []}},
+                {"id": "acc3", "health": {"state": "healthy"}, "quota": {"error": "HTTP 403 VALIDATION_REQUIRED: verify your account", "groups": []}},
+                {"id": "ok4", "health": {"state": "healthy"}, "quota": {"groups": [{"name": "Gemini Models", "buckets": [{"window": "5h", "remainingFraction": 0.7}]}]}},
+            ],
+        }
+        parsed = self.m.parse_pool_view(dash)
+        self.assertTrue(parsed["tr20x"]["verificationRequired"])
+        self.assertEqual(parsed["tr20x"]["health"], "verification_required")
+        self.assertTrue(parsed["uspro"]["verificationRequired"])
+        self.assertTrue(parsed["acc3"]["verificationRequired"])
+        self.assertFalse(parsed["ok4"]["verificationRequired"])
+
+        # 2. Single-account primary in verification_required is skipped by probe_auth_candidates
+        self.m.TOKEN.parent.mkdir(parents=True, exist_ok=True)
+        self.m.TOKEN.write_text('{"access_token":"x"}', encoding="utf-8")
+        with mock.patch.object(self.m, "upstream_proxy", return_value=""):
+            self.assertEqual(self.m.probe_auth_candidates({"primary": {"health": "verification_required"}}), [])
+            self.assertEqual(self.m.probe_auth_candidates({"primary": {"health": "healthy", "verificationRequired": True}}), [])
+
+        # 3. Multi-account probe_auth_candidates skips verification_required accounts
+        self._multi_accounts()
+        view_skip = {
+            "tr20x": {"rem5h": 0.95, "health": "verification_required", "verificationRequired": True},
+            "uspro": {"rem5h": 0.85, "health": "healthy", "verificationRequired": True},
+            "acc3": {"rem5h": 0.40, "health": "healthy", "verificationRequired": False},
+        }
+        with mock.patch.object(self.m, "gateway_env", return_value=""), \
+                mock.patch.object(self.m, "resin_settings", return_value={"token": "r", "host": "resin:2260"}):
+            ids_g4 = [c[0] for c in self.m.probe_auth_candidates(view_skip, from_host=False)]
+            ids_g3 = [c[0] for c in self.m.probe_auth_candidates(view_skip, from_host=True, allow_monitor_tripped=True)]
+        self.assertEqual(ids_g4, ["acc3"])
+        self.assertEqual(ids_g3, ["acc3"])
+
+        # 4. contract_g3 rotates past VALIDATION_REQUIRED even on a post-session/new check
+        stage = self.root / "stage-g3-verify"
+        stage.mkdir()
+        (stage / "agy-acp-900k").write_text("bin")
+        report = stage / "contract.json"
+        g3_calls = []
+
+        def fake_g3_validation(cmd, **kw):
+            g3_calls.append(1)
+            if len(g3_calls) == 1:
+                report.write_text(json.dumps({
+                    "ok": False,
+                    "checks": [
+                        {"check": "initialize", "ok": True, "detail": ""},
+                        {"check": "session/new", "ok": True, "detail": ""},
+                        {"check": "models", "ok": False, "detail": "VALIDATION_REQUIRED: Please verify your account"},
+                    ],
+                }))
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            report.write_text(json.dumps({"ok": True, "checks": [{"check": "initialize", "ok": True}], "info": {}}))
+            return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        view_live = {"tr20x": {"rem5h": 0.9}, "uspro": {"rem5h": 0.8}, "acc3": {"rem5h": 0.7}}
+        with mock.patch.object(self.m, "gateway_env", return_value=""), \
+                mock.patch.object(self.m, "resin_settings", return_value={"token": "r", "host": "resin:2260"}), \
+                mock.patch.object(self.m, "run", side_effect=fake_g3_validation), \
+                mock.patch.object(self.m, "log"):
+            note = self.m.contract_g3(stage, view_live)
+        self.assertEqual(len(g3_calls), 2)
+        self.assertIn("via uspro", note)
+
+        # 5. live_g4 rotates on both structured tuple and raised VALIDATION_REQUIRED errors
+        g4_calls = []
+
+        def fake_g4_verify(stage_arg, binary_arg, auth):
+            acct = auth[0].parent.parent.parent.name if "accounts" in str(auth[0]) else "tr20x"
+            g4_calls.append(acct)
+            if len(g4_calls) == 1:
+                return False, 403, "account_verification_required", "HTTP 403 VALIDATION_REQUIRED: verify your account"
+            if len(g4_calls) == 2:
+                raise RuntimeError("text probe: HTTP 403 VALIDATION_REQUIRED")
+            return True, 200, "", "200 end_turn 'OK' 1.2s"
+
+        with mock.patch.object(self.m, "resin_settings", return_value={"token": "r", "host": "resin:2260"}), \
+                mock.patch.object(self.m, "_live_g4_on", side_effect=fake_g4_verify), \
+                mock.patch.object(self.m, "log"):
+            detail = self.m.live_g4(self.root, self.root / "bin", view_live)
+        self.assertEqual(g4_calls, ["tr20x", "uspro", "acc3"])
+        self.assertIn("via acc3", detail)
+        self.assertIn("tr20x: verification_required", detail)
+        self.assertIn("uspro: verification_required", detail)
+
+        # 6. live_g4 fails cleanly if every candidate hits verification_required
+        def all_verify(stage_arg, binary_arg, auth):
+            return False, 403, "validation_required", "HTTP 403 VALIDATION_REQUIRED"
+
+        with mock.patch.object(self.m, "resin_settings", return_value={"token": "r", "host": "resin:2260"}), \
+                mock.patch.object(self.m, "_live_g4_on", side_effect=all_verify), \
+                mock.patch.object(self.m, "log"):
+            with self.assertRaisesRegex(RuntimeError, "verification required"):
+                self.m.live_g4(self.root, self.root / "bin", view_live)
+
 
 if __name__ == "__main__":
     sys.exit(unittest.main())

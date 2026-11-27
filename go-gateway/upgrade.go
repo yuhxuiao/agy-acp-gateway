@@ -362,6 +362,91 @@ func federatedUpgradeEngineInfo() (map[string]any, bool) {
 	return aggregateUpgradeEngineInfo(self, selfPending, primaryEnabled, reached)
 }
 
+var defaultBlockedAgyVersions = map[string]string{
+	"1.5.17": "agy#1890 (--agent 4x Gemini quota burn) & agy#1872",
+	"1.5.18": "agy#1890 (--agent 4x Gemini quota burn) & agy#1872",
+}
+
+func blockedAgyVersionReason(ver string) string {
+	v := strings.TrimSpace(ver)
+	if v == "" {
+		return ""
+	}
+	if m := acpSemverRe.FindStringSubmatch(v); len(m) == 2 {
+		v = m[1]
+	}
+	cfg := gwcfg.Current()
+	if cfg.BlockedAgyVersionsEnvSet {
+		s := strings.TrimSpace(cfg.BlockedAgyVersionsRaw)
+		if s == "" || strings.EqualFold(s, "none") {
+			return ""
+		}
+		for _, item := range strings.Split(s, ",") {
+			part := strings.TrimSpace(item)
+			if part == "" {
+				continue
+			}
+			bv, reason, hasColon := strings.Cut(part, ":")
+			bv = strings.TrimSpace(bv)
+			if m := acpSemverRe.FindStringSubmatch(bv); len(m) == 2 {
+				bv = m[1]
+			}
+			if bv == v {
+				if hasColon && strings.TrimSpace(reason) != "" {
+					return strings.TrimSpace(reason)
+				}
+				if def, ok := defaultBlockedAgyVersions[bv]; ok {
+					return def
+				}
+				return "blocked by AGY_BLOCKED_VERSIONS"
+			}
+		}
+		return ""
+	}
+	return defaultBlockedAgyVersions[v]
+}
+
+func detectRunningAgyVersion(engInfo map[string]any, raw map[string]any) string {
+	binPath := ""
+	if alive, _ := engInfo["alive"].(bool); alive {
+		if r, _ := engInfo["running"].(string); r != "" {
+			binPath = r
+		}
+	}
+	if binPath == "" {
+		if c, _ := engInfo["current"].(string); c != "" {
+			binPath = c
+		}
+	}
+	if binPath == "" {
+		if cfg, _ := engInfo["configured"].(string); cfg != "" {
+			binPath = cfg
+		}
+	}
+	if binPath != "" {
+		if _, err := os.Stat(binPath); err == nil {
+			if ver := detectAgySemver(binPath); ver != "" {
+				return ver
+			}
+		}
+		if parent := filepath.Base(filepath.Dir(binPath)); parent != "" {
+			if m := acpSemverRe.FindStringSubmatch(parent); len(m) == 2 {
+				return m[1]
+			}
+		}
+	}
+	if raw != nil {
+		if cur, ok := raw["current"].(map[string]any); ok {
+			if s, _ := cur["agy"].(string); strings.TrimSpace(s) != "" {
+				if m := acpSemverRe.FindStringSubmatch(s); len(m) == 2 {
+					return m[1]
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // BuildUpgradePayload is what GET /api/upgrade returns.
 func BuildUpgradePayload() map[string]any {
 	engInfo, pendingSwitch := federatedUpgradeEngineInfo()
@@ -385,6 +470,15 @@ func BuildUpgradePayload() map[string]any {
 		out["statusError"] = "status.json unreadable"
 	}
 	out["lastCheckError"] = extractUpgradeLastCheckError(raw, st, err)
+	runningVer := detectRunningAgyVersion(engInfo, raw)
+	blockedReason := blockedAgyVersionReason(runningVer)
+	out["currentAgyVersion"] = runningVer
+	out["currentVersionBlocked"] = blockedReason != ""
+	if blockedReason != "" {
+		out["blockedVersionWarning"] = fmt.Sprintf("当前运行 agy %s 属于已知受限版本 (%s)，建议回退至 1.5.16 或等待 1.5.19+", runningVer, blockedReason)
+	} else {
+		out["blockedVersionWarning"] = ""
+	}
 	return out
 }
 

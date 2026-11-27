@@ -914,6 +914,38 @@ def is_quota_failure(detail=None, *, http_status=None, err_code=None):
     return any(p in low for p in EXPLICIT_UPSTREAM_QUOTA_PHRASES)
 
 
+VERIFICATION_ERROR_CODES = frozenset({
+    "verification_required",
+    "account_verification_required",
+    "validation_required",
+})
+VERIFICATION_FAILURE_PHRASES = (
+    "validation_required",
+    "verification_required",
+    "account_verification_required",
+    "verify your account",
+    "account verification required",
+    "verification required",
+)
+
+
+def is_verification_required_failure(detail=None, *, err_code=None):
+    """True when a probe failed because Google requires interactive account verification (VALIDATION_REQUIRED)."""
+    code = err_code
+    if isinstance(detail, ProbeError) and code is None and detail.err_code:
+        code = detail.err_code
+    text = str(detail or "")
+    low = text.lower()
+    code_norm = str(code or "").strip().lower()
+    if code_norm in VERIFICATION_ERROR_CODES:
+        return True
+    if not code_norm and "{" in text:
+        parsed_code, _ = _parse_http_error_body(text[text.find("{"):])
+        if parsed_code in VERIFICATION_ERROR_CODES:
+            return True
+    return any(p in low for p in VERIFICATION_FAILURE_PHRASES)
+
+
 def gateway_env(name):
     """Read one variable from the running gateway container (same trust path as gateway_key);
     the value is only passed on, never logged."""
@@ -1124,6 +1156,14 @@ def parse_pool_view(d, now_dt=None):
         aid = str(inst["id"]).strip().lower()
         health_obj = inst.get("health") if isinstance(inst.get("health"), dict) else {}
         health_state = str(health_obj.get("state") or "").strip().lower()
+        quota_err = str((inst.get("quota") or {}).get("error") or "")
+        verification_required = (
+            health_state == "verification_required"
+            or bool(health_obj.get("verificationRequired"))
+            or is_verification_required_failure(quota_err)
+        )
+        if verification_required and not health_state:
+            health_state = "verification_required"
         budget = budgets.get(aid, {})
         mon_tripped = (
             health_state == "monitor_tripped"
@@ -1166,6 +1206,7 @@ def parse_pool_view(d, now_dt=None):
             "rem5h": min_rem,
             "exhausted": exhausted,
             "health": health_state,
+            "verificationRequired": verification_required,
             "monitorTripped": mon_tripped,
             "monitorZone": mon_zone,
             "cooldown": in_cooldown,
@@ -1225,7 +1266,7 @@ def probe_auth_candidates(pool_view=None, from_host=True, allow_monitor_tripped=
             default_proxy = clean_def
         info = view.get("primary", {})
         health = str(info.get("health") or "").strip().lower()
-        if health in ("tos_tripped", "auth_error", "unauthenticated", "disabled"):
+        if health in ("tos_tripped", "auth_error", "unauthenticated", "disabled", "verification_required") or bool(info.get("verificationRequired")):
             return []
         mon_tripped = bool(info.get("monitorTripped")) or health == "monitor_tripped"
         mon_zone = str(info.get("monitorZone") or "").strip().lower()
@@ -1266,7 +1307,7 @@ def probe_auth_candidates(pool_view=None, from_host=True, allow_monitor_tripped=
             continue
         info = view.get(acc_id.lower(), {})
         health = str(info.get("health") or "").strip().lower()
-        if health in ("tos_tripped", "auth_error", "unauthenticated", "disabled"):
+        if health in ("tos_tripped", "auth_error", "unauthenticated", "disabled", "verification_required") or bool(info.get("verificationRequired")):
             continue
         mon_tripped = bool(info.get("monitorTripped")) or health == "monitor_tripped"
         mon_zone = str(info.get("monitorZone") or "").strip().lower()
@@ -1397,6 +1438,8 @@ _G3_PROXY_AUTH_HINTS = (
     "econnreset", "timed out", "timeout", "network", "dns", "lookup", "tls",
     "ssl", "eof", "unreachable", "502", "503", "504", "429",
     "resource_exhausted", "rate_limit",
+    "validation_required", "verification_required", "account_verification_required",
+    "verify your account", "verification required",
 )
 
 
@@ -1405,17 +1448,23 @@ def _is_g3_proxy_or_auth_failure(rep, r):
     init_failed = False
     new_failed = False
     early_details = []
+    all_failed_details = []
     if isinstance(checks, list) and checks:
         for c in checks:
             if not isinstance(c, dict) or c.get("ok"):
                 continue
+            detail = str(c.get("detail") or "")
+            all_failed_details.append(detail)
             cname = str(c.get("check") or "")
             if cname == "initialize":
                 init_failed = True
-                early_details.append(str(c.get("detail") or ""))
+                early_details.append(detail)
             elif cname == "session/new":
                 new_failed = True
-                early_details.append(str(c.get("detail") or ""))
+                early_details.append(detail)
+        all_combined = " ".join(all_failed_details + [str(r.stdout or ""), str(r.stderr or "")])
+        if is_verification_required_failure(all_combined):
+            return True
         if not init_failed and not new_failed:
             return False
     combined = " ".join(early_details + [str(r.stdout or ""), str(r.stderr or "")]).lower()
@@ -1620,6 +1669,10 @@ def live_g4(stage, agy_binary, pool_view=None):
                 tried.append(f"{acc_id}: quota")
                 log(f"G4 account {acc_id} is quota-limited, routing to the next account")
                 continue
+            if is_verification_required_failure(exc):
+                tried.append(f"{acc_id}: verification_required")
+                log(f"G4 account {acc_id} requires verification, routing to the next account")
+                continue
             raise RuntimeError(redact_secrets(f"[{acc_id}] {exc}")) from exc
         finally:
             _G4_ATTEMPT_IDX.reset(tok_ctx)
@@ -1632,9 +1685,15 @@ def live_g4(stage, agy_binary, pool_view=None):
                 tried.append(f"{acc_id}: quota")
                 log(f"G4 account {acc_id} is quota-limited, routing to the next account")
                 continue
+            if is_verification_required_failure(detail, err_code=err_code):
+                tried.append(f"{acc_id}: verification_required")
+                log(f"G4 account {acc_id} requires verification, routing to the next account")
+                continue
             raise RuntimeError(redact_secrets(f"[{acc_id}] {detail}"))
         via = f" via {acc_id}" + (f" (skipped {', '.join(tried)})" if tried else "")
         return f"text {detail}; tool round trip ok; 3 Flash generations (budget ${LIVE_BUDGET_USD}){via}"
+    if tried and not all(t.endswith(": quota") for t in tried):
+        raise RuntimeError("all accounts unavailable (quota-limited or verification required): " + ", ".join(tried))
     raise RuntimeError("all accounts quota-limited: " + ", ".join(tried or ["no eligible account"]))
 
 

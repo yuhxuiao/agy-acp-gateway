@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -268,8 +269,16 @@ func TestV2322_GlobalCrossAccountLRUHibernationAndInternalEndpoints(t *testing.T
 	checkLive("pIdleOld", pIdleOld, false)
 	checkLive("cIdleMed", cIdleMed, false)
 
-	// Pre-spawn admission check when already at GlobalMaxLiveWorkers=4: evicts remaining IDLE (pIdleFresh) to make room!
-	am.TryPreSpawnGlobalCapCheck("sid:incoming-new")
+	// Synchronous global admission when already at GlobalBurstMaxLiveWorkers=4: evicts remaining IDLE (pIdleFresh) to make room!
+	t.Setenv("AGY_GLOBAL_BURST_MAX_LIVE_WORKERS", "4")
+	initConfig()
+	leaseID, admitErr := am.AcquireGlobalWorkerSlotExcluding(context.Background(), "primary", "sid:incoming-new", "")
+	if admitErr != nil || leaseID == "" {
+		t.Fatalf("expected global admission to evict pIdleFresh and grant lease, got lease=%q err=%v", leaseID, admitErr)
+	}
+	am.ReleaseGlobalWorkerSlot(leaseID)
+	t.Setenv("AGY_GLOBAL_BURST_MAX_LIVE_WORKERS", "")
+	initConfig()
 	checkLive("pIdleFresh after pre-spawn", pIdleFresh, false)
 	checkLive("pBusy after pre-spawn", pBusy, true)
 	checkLive("cBusy after pre-spawn", cBusy, true)

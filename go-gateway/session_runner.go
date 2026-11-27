@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -700,103 +703,180 @@ func isThinkingBlockMap(m map[string]any) bool {
 	return t == "thinking" || t == "redacted_thinking"
 }
 
-func valueHasCacheControl(v any) bool {
-	switch x := v.(type) {
-	case map[string]any:
-		if _, ok := x["cache_control"]; ok {
-			return true
-		}
-		if _, ok := x["reasoning_content"]; ok {
-			return true
-		}
-		if _, ok := x["reasoning"]; ok {
-			return true
-		}
-		if isThinkingBlockMap(x) {
-			return true
-		}
-		if bc, ok := x["content"]; ok && bc != nil {
-			return valueHasCacheControl(bc)
-		}
-	case []any:
-		for _, it := range x {
-			if valueHasCacheControl(it) {
-				return true
-			}
-		}
-	case []map[string]any:
-		for _, it := range x {
-			if valueHasCacheControl(it) {
-				return true
-			}
-		}
-	}
-	return false
+type canonicalFpWriter struct {
+	h      hash.Hash
+	hdr    [9]byte
+	numBuf [64]byte
+	strBuf [512]byte
 }
 
-func stripCacheControlValue(v any) any {
+func newCanonicalFpWriter() *canonicalFpWriter {
+	return &canonicalFpWriter{h: sha256.New()}
+}
+
+func (cw *canonicalFpWriter) writeByte(b byte) {
+	cw.hdr[0] = b
+	_, _ = cw.h.Write(cw.hdr[:1])
+}
+
+func (cw *canonicalFpWriter) writeString(tag byte, s string) {
+	cw.hdr[0] = tag
+	binary.LittleEndian.PutUint64(cw.hdr[1:], uint64(len(s)))
+	_, _ = cw.h.Write(cw.hdr[:])
+	for off := 0; off < len(s); {
+		n := copy(cw.strBuf[:], s[off:])
+		_, _ = cw.h.Write(cw.strBuf[:n])
+		off += n
+	}
+}
+
+func (cw *canonicalFpWriter) writeBytes(tag byte, b []byte) {
+	cw.hdr[0] = tag
+	binary.LittleEndian.PutUint64(cw.hdr[1:], uint64(len(b)))
+	_, _ = cw.h.Write(cw.hdr[:])
+	_, _ = cw.h.Write(b)
+}
+
+func normalizeHistoryFpString(s string) string {
+	trimmed := s
+	if strings.Contains(s, "<") {
+		trimmed = volatileFirstTurnTagRe.ReplaceAllString(s, "")
+	}
+	if core := strings.TrimSpace(trimmed); core != "" {
+		return core
+	}
+	return s
+}
+
+func (cw *canonicalFpWriter) writeValue(v any, filterVolatile, normalizeHistory bool) {
 	switch x := v.(type) {
+	case nil:
+		cw.writeByte('N')
+	case bool:
+		if x {
+			cw.writeByte('T')
+		} else {
+			cw.writeByte('F')
+		}
+	case string:
+		cw.writeString('S', x)
+	case float64:
+		var b []byte
+		if x == 0 {
+			b = append(cw.numBuf[:0], '0')
+		} else if x == math.Trunc(x) && x >= -1e15 && x <= 1e15 {
+			b = strconv.AppendInt(cw.numBuf[:0], int64(x), 10)
+		} else {
+			b = strconv.AppendFloat(cw.numBuf[:0], x, 'g', -1, 64)
+		}
+		cw.writeBytes('#', b)
+	case float32:
+		cw.writeValue(float64(x), false, false)
+	case int:
+		cw.writeBytes('#', strconv.AppendInt(cw.numBuf[:0], int64(x), 10))
+	case int64:
+		cw.writeBytes('#', strconv.AppendInt(cw.numBuf[:0], x, 10))
+	case int32:
+		cw.writeBytes('#', strconv.AppendInt(cw.numBuf[:0], int64(x), 10))
+	case uint:
+		cw.writeBytes('#', strconv.AppendUint(cw.numBuf[:0], uint64(x), 10))
+	case uint64:
+		cw.writeBytes('#', strconv.AppendUint(cw.numBuf[:0], x, 10))
+	case json.Number:
+		cw.writeString('#', string(x))
+	case json.RawMessage:
+		cw.writeBytes('R', x)
+	case []byte:
+		cw.writeBytes('B', x)
 	case map[string]any:
-		if !valueHasCacheControl(x) {
-			return x
+		if x == nil {
+			cw.writeByte('N')
+			return
 		}
-		cp := make(map[string]any, len(x))
-		for k, val := range x {
-			if k == "cache_control" || k == "reasoning_content" || k == "reasoning" {
+		cw.writeByte('{')
+		var keyArr [16]string
+		var keys []string
+		if len(x) <= len(keyArr) {
+			keys = keyArr[:0]
+		} else {
+			keys = make([]string, 0, len(x))
+		}
+		for k := range x {
+			if filterVolatile && (k == "cache_control" || k == "reasoning_content" || k == "reasoning") {
 				continue
 			}
-			if k == "content" && val != nil {
-				cp[k] = stripCacheControlValue(val)
-			} else {
-				cp[k] = val
-			}
+			keys = append(keys, k)
 		}
-		return cp
+		slices.Sort(keys)
+		for _, k := range keys {
+			cw.writeString('K', k)
+			val := x[k]
+			if filterVolatile && val != nil {
+				if normalizeHistory && (k == "text" || k == "content") {
+					if s, okS := val.(string); okS {
+						cw.writeString('S', normalizeHistoryFpString(s))
+						continue
+					}
+					cw.writeValue(val, true, true)
+					continue
+				}
+				if k == "content" {
+					cw.writeValue(val, true, normalizeHistory)
+					continue
+				}
+			}
+			cw.writeValue(val, false, false)
+		}
+		cw.writeByte('}')
 	case []any:
-		if !valueHasCacheControl(x) {
-			return x
+		if x == nil {
+			cw.writeByte('N')
+			return
 		}
-		out := make([]any, 0, len(x))
+		cw.writeByte('[')
 		for _, it := range x {
-			if m, ok := it.(map[string]any); ok && isThinkingBlockMap(m) {
-				continue
+			if filterVolatile {
+				if m, ok := it.(map[string]any); ok && isThinkingBlockMap(m) {
+					continue
+				}
 			}
-			out = append(out, stripCacheControlValue(it))
+			cw.writeValue(it, filterVolatile, normalizeHistory)
 		}
-		return out
+		cw.writeByte(']')
 	case []map[string]any:
-		if !valueHasCacheControl(x) {
-			return x
+		if x == nil {
+			cw.writeByte('N')
+			return
 		}
-		out := make([]map[string]any, 0, len(x))
+		cw.writeByte('[')
 		for _, it := range x {
-			if isThinkingBlockMap(it) {
+			if filterVolatile && isThinkingBlockMap(it) {
 				continue
 			}
-			if m, ok := stripCacheControlValue(it).(map[string]any); ok {
-				out = append(out, m)
-			} else {
-				out = append(out, it)
-			}
+			cw.writeValue(it, filterVolatile, normalizeHistory)
 		}
-		return out
+		cw.writeByte(']')
+	case []string:
+		if x == nil {
+			cw.writeByte('N')
+			return
+		}
+		cw.writeByte('[')
+		for _, s := range x {
+			cw.writeString('S', s)
+		}
+		cw.writeByte(']')
 	default:
-		return v
+		cw.writeByte('J')
+		enc := json.NewEncoder(cw.h)
+		enc.SetEscapeHTML(false)
+		_ = enc.Encode(v)
 	}
 }
 
-func canonicalizeRequestFpMessages(messages []map[string]any) []map[string]any {
-	if len(messages) == 0 || !valueHasCacheControl(messages) {
-		return messages
-	}
-	if cleaned, ok := stripCacheControlValue(messages).([]map[string]any); ok {
-		return cleaned
-	}
-	return messages
-}
-
-func stripCacheControlFromMessages(messages []map[string]any) []map[string]any {
-	return canonicalizeRequestFpMessages(messages)
+func (cw *canonicalFpWriter) sumHex() string {
+	var sum [sha256.Size]byte
+	return hex.EncodeToString(cw.h.Sum(sum[:0]))
 }
 
 func computeTurnRequestFingerprint(modelID, tier, sysText string, tools []ToolDef, messages []map[string]any) string {
@@ -808,100 +888,36 @@ func computeTurnRequestFingerprintWithDirective(modelID, tier, sysText string, t
 	if len(tools) > 0 {
 		_, toolDigests = toolCatalogFingerprintAndDigests(tools)
 	}
-	cleanMsgs := canonicalizeRequestFpMessages(messages)
-	cwd := extractCwdFromSystem(sysText, cleanMsgs)
-	return computeTurnRequestFingerprintPrecomputedClean(modelID, tier, cwd, toolDigests, cleanMsgs, directiveToken)
+	cwd := extractCwdFromSystem(sysText, messages)
+	return computeTurnRequestFingerprintPrecomputedClean(modelID, tier, cwd, toolDigests, messages, directiveToken)
 }
 
 func computeTurnRequestFingerprintPrecomputed(modelID, tier, cwd string, toolDigests []string, messages []map[string]any, directiveToken string) string {
-	return computeTurnRequestFingerprintPrecomputedClean(modelID, tier, cwd, toolDigests, canonicalizeRequestFpMessages(messages), directiveToken)
+	return computeTurnRequestFingerprintPrecomputedClean(modelID, tier, cwd, toolDigests, messages, directiveToken)
 }
 
 func computeTurnRequestFingerprintPrecomputedClean(modelID, tier, cwd string, toolDigests []string, cleanMsgs []map[string]any, directiveToken string) string {
-	type fpPayload struct {
-		Model       string           `json:"m"`
-		Tier        string           `json:"t"`
-		Cwd         string           `json:"c,omitempty"`
-		Directive   string           `json:"d,omitempty"`
-		ToolDigests []string         `json:"td,omitempty"`
-		Messages    []map[string]any `json:"ms"`
+	cw := newCanonicalFpWriter()
+	cw.writeString('M', modelID)
+	cw.writeString('T', tier)
+	cw.writeString('C', cwd)
+	cw.writeString('D', directiveToken)
+	cw.writeByte('[')
+	for _, td := range toolDigests {
+		cw.writeString('S', td)
 	}
-	h := sha256.New()
-	enc := json.NewEncoder(h)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(fpPayload{
-		Model:       modelID,
-		Tier:        tier,
-		Cwd:         cwd,
-		Directive:   directiveToken,
-		ToolDigests: toolDigests,
-		Messages:    cleanMsgs,
-	}); err != nil {
-		return ""
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-func canonicalizeHistoryFpValue(v any) any {
-	switch x := v.(type) {
-	case map[string]any:
-		cp := make(map[string]any, len(x))
-		for k, val := range x {
-			if k == "cache_control" || k == "reasoning_content" || k == "reasoning" {
-				continue
-			}
-			if (k == "text" || k == "content") && val != nil {
-				if s, okS := val.(string); okS {
-					if core := strings.TrimSpace(volatileFirstTurnTagRe.ReplaceAllString(s, "")); core != "" {
-						cp[k] = core
-						continue
-					}
-				}
-				cp[k] = canonicalizeHistoryFpValue(val)
-			} else {
-				cp[k] = val
-			}
-		}
-		return cp
-	case []any:
-		out := make([]any, 0, len(x))
-		for _, it := range x {
-			if m, ok := it.(map[string]any); ok && isThinkingBlockMap(m) {
-				continue
-			}
-			out = append(out, canonicalizeHistoryFpValue(it))
-		}
-		return out
-	case []map[string]any:
-		out := make([]map[string]any, 0, len(x))
-		for _, it := range x {
-			if isThinkingBlockMap(it) {
-				continue
-			}
-			if m, ok := canonicalizeHistoryFpValue(it).(map[string]any); ok {
-				out = append(out, m)
-			} else {
-				out = append(out, it)
-			}
-		}
-		return out
-	default:
-		return v
-	}
+	cw.writeByte(']')
+	cw.writeValue(cleanMsgs, true, false)
+	return cw.sumHex()
 }
 
 func computeMessagesSliceFingerprint(messages []map[string]any) string {
 	if len(messages) == 0 {
 		return ""
 	}
-	normMsgs := canonicalizeHistoryFpValue(messages)
-	h := sha256.New()
-	enc := json.NewEncoder(h)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(normMsgs); err != nil {
-		return ""
-	}
-	return hex.EncodeToString(h.Sum(nil))
+	cw := newCanonicalFpWriter()
+	cw.writeValue(messages, true, true)
+	return cw.sumHex()
 }
 
 func cancelledHistoryDiverged(messages []map[string]any, msgCnt int, lastTurnAsst bool, cancelledFp string) bool {
@@ -2708,7 +2724,7 @@ func (s *AcpProjectSession) executePromptOrPark(ctx context.Context, promptBlock
 			phaseFn := func() promptIdlePhase {
 				s.mu.Lock()
 				curTurn := s.activeTurn
-				hasParked := len(s.ParkedCalls) > 0
+				hasParked := len(s.ParkedCalls) > 0 || len(s.RelayedCalls) > 0
 				s.mu.Unlock()
 				if hasParked || curTurn == nil {
 					return promptIdlePhase{
@@ -3419,7 +3435,7 @@ func (s *AcpProjectSession) resumeParkedTurnInternal(ctx context.Context, matche
 		if len(blocks) == 0 {
 			var textLines []string
 			for _, tr := range matched {
-				cleanTxt := formatParkedToolResultText(tr, codec, "")
+				cleanTxt := formatParkedToolResultText(tr, nil, "")
 				textLines = append(textLines, formatToolResultHeaderAndText(tr.ToolCallID, tr.IsError, cleanTxt, resumeCallMeta))
 				for _, img := range tr.Images {
 					blocks = append(blocks, img)
@@ -3427,6 +3443,9 @@ func (s *AcpProjectSession) resumeParkedTurnInternal(ctx context.Context, matche
 			}
 			textLines = append(textLines, "\nContinue the task with these tool results.")
 			blocks = append(blocks, map[string]any{"type": "text", "text": strings.Join(textLines, "\n\n")})
+			if codec != nil {
+				blocks = codec.EncodePromptBlocks(blocks)
+			}
 		}
 		val, err := s.executePromptOrParkWithRetry(ctx, blocks, onDelta, 0)
 		if err != nil {

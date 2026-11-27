@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -134,9 +135,10 @@ type GatewayServer struct {
 	sessions            map[string]*AcpProjectSession
 	tenants             map[string]*AcpProjectSession
 	reqCounter          atomic.Int64
-	lastConvCleanupUnix atomic.Int64
-	lastDbCompactUnix   atomic.Int64
-	engineIdleSinceNs   atomic.Int64
+	lastConvCleanupUnix   atomic.Int64
+	lastDbCompactUnix     atomic.Int64
+	lastWalCheckpointUnix atomic.Int64
+	engineIdleSinceNs     atomic.Int64
 	shuttingDown        atomic.Bool
 }
 
@@ -968,6 +970,39 @@ func (gs *GatewayServer) HibernateLRU(req HibernateLRURequest) HibernateLRURespo
 	return resp
 }
 
+func acquireGlobalSlotLease(admitCtx context.Context, excl, priorityHint string) (func(), error) {
+	if !isChildAccountWorker() && GlobalAccountManager != nil {
+		primID := "primary"
+		if prim, ok := GlobalAccountManager.GetPrimaryAccount(); ok && prim.ID != "" {
+			primID = prim.ID
+		}
+		leaseID, admitErr := GlobalAccountManager.AcquireGlobalWorkerSlotExcluding(admitCtx, primID, excl, priorityHint)
+		if admitErr != nil {
+			return nil, admitErr
+		}
+		if leaseID != "" {
+			amRef := GlobalAccountManager
+			return func() { amRef.ReleaseGlobalWorkerSlot(leaseID) }, nil
+		}
+		return nil, nil
+	}
+	if isChildAccountWorker() {
+		cfgSnap := gwcfg.Current()
+		if cfgSnap.ParentDashPort > 0 {
+			apiKey := defaultPeerAPIKey(cfgSnap)
+			leaseID, admitErr := acquireGlobalWorkerSlotFromParent(admitCtx, cfgSnap.ParentDashPort, apiKey, cfgSnap.InstanceID, excl, priorityHint)
+			if admitErr != nil {
+				return nil, admitErr
+			}
+			if leaseID != "" {
+				pPort := cfgSnap.ParentDashPort
+				return func() { releaseGlobalWorkerSlotToParent(pPort, apiKey, leaseID) }, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
 // Lock order: global admit gate (admitExecMu) -> workerAdmitMu -> gs.mu -> s.mu. Never enter with s.mu held.
 func (gs *GatewayServer) reserveWorkerSlot(s *AcpProjectSession) error {
 	nonPreemptive := isNonPreemptiveSession(s)
@@ -983,41 +1018,15 @@ func (gs *GatewayServer) reserveWorkerSlot(s *AcpProjectSession) error {
 			priorityHint = "probe"
 		}
 	}
-	var releaseGlobalLease func()
-	if !isChildAccountWorker() && GlobalAccountManager != nil {
-		primID := "primary"
-		if prim, ok := GlobalAccountManager.GetPrimaryAccount(); ok && prim.ID != "" {
-			primID = prim.ID
-		}
-		leaseID, admitErr := GlobalAccountManager.AcquireGlobalWorkerSlotExcluding(admitCtx, primID, excl, priorityHint)
-		if admitErr != nil {
+	releaseGlobalLease, admitErr := acquireGlobalSlotLease(admitCtx, excl, priorityHint)
+	if admitErr != nil {
+		if !errors.Is(admitErr, context.Canceled) {
 			workerCapRejectionsTotal.Add(1)
 			if nonPreemptive {
 				probeSlotRejectionsTotal.Add(1)
 			}
-			return admitErr
 		}
-		if leaseID != "" {
-			amRef := GlobalAccountManager
-			releaseGlobalLease = func() { amRef.ReleaseGlobalWorkerSlot(leaseID) }
-		}
-	} else if isChildAccountWorker() {
-		cfgSnap := gwcfg.Current()
-		if cfgSnap.ParentDashPort > 0 {
-			apiKey := defaultPeerAPIKey(cfgSnap)
-			leaseID, admitErr := acquireGlobalWorkerSlotFromParent(admitCtx, cfgSnap.ParentDashPort, apiKey, cfgSnap.InstanceID, excl, priorityHint)
-			if admitErr != nil {
-				workerCapRejectionsTotal.Add(1)
-				if nonPreemptive {
-					probeSlotRejectionsTotal.Add(1)
-				}
-				return admitErr
-			}
-			if leaseID != "" {
-				pPort := cfgSnap.ParentDashPort
-				releaseGlobalLease = func() { releaseGlobalWorkerSlotToParent(pPort, apiKey, leaseID) }
-			}
-		}
+		return admitErr
 	}
 	if releaseGlobalLease != nil {
 		// Deferred before workerAdmitMu.Lock() so workerAdmitMu.Unlock() runs first (LIFO).
@@ -1061,37 +1070,13 @@ func (gs *GatewayServer) reserveProbeWorkerSlot(s *AcpProjectSession) (func(), e
 		excl = s.ConvKey
 		admitCtx = s.getAdmitContext()
 	}
-	var releaseGlobalLease func()
-	if !isChildAccountWorker() && GlobalAccountManager != nil {
-		primID := "primary"
-		if prim, ok := GlobalAccountManager.GetPrimaryAccount(); ok && prim.ID != "" {
-			primID = prim.ID
-		}
-		leaseID, admitErr := GlobalAccountManager.AcquireGlobalWorkerSlotExcluding(admitCtx, primID, excl, "probe")
-		if admitErr != nil {
+	releaseGlobalLease, admitErr := acquireGlobalSlotLease(admitCtx, excl, "probe")
+	if admitErr != nil {
+		if !errors.Is(admitErr, context.Canceled) {
 			probeSlotRejectionsTotal.Add(1)
 			workerCapRejectionsTotal.Add(1)
-			return nil, admitErr
 		}
-		if leaseID != "" {
-			amRef := GlobalAccountManager
-			releaseGlobalLease = func() { amRef.ReleaseGlobalWorkerSlot(leaseID) }
-		}
-	} else if isChildAccountWorker() {
-		cfgSnap := gwcfg.Current()
-		if cfgSnap.ParentDashPort > 0 {
-			apiKey := defaultPeerAPIKey(cfgSnap)
-			leaseID, admitErr := acquireGlobalWorkerSlotFromParent(admitCtx, cfgSnap.ParentDashPort, apiKey, cfgSnap.InstanceID, excl, "probe")
-			if admitErr != nil {
-				probeSlotRejectionsTotal.Add(1)
-				workerCapRejectionsTotal.Add(1)
-				return nil, admitErr
-			}
-			if leaseID != "" {
-				pPort := cfgSnap.ParentDashPort
-				releaseGlobalLease = func() { releaseGlobalWorkerSlotToParent(pPort, apiKey, leaseID) }
-			}
-		}
+		return nil, admitErr
 	}
 	var leaseOnce sync.Once
 	releaseLease := func() {
@@ -1411,8 +1396,12 @@ func (gs *GatewayServer) reapIdleWorkers() {
 		s.mu.Unlock()
 		if sid == "" {
 			evictTTL := 7200 * time.Second
-			if isChildAccountWorker() && persistedInDB && parkedCnt == 0 && hibParkedCnt == 0 {
-				evictTTL = 10 * time.Minute
+			if persistedInDB && parkedCnt == 0 && hibParkedCnt == 0 {
+				if isChildAccountWorker() {
+					evictTTL = 10 * time.Minute
+				} else {
+					evictTTL = 15 * time.Minute
+				}
 			}
 			if !busy && !turnClaimed && parkedCnt == 0 && idleDur >= evictTTL {
 				delete(gs.sessions, k)
@@ -1533,6 +1522,18 @@ func (gs *GatewayServer) reapIdleWorkers() {
 				go func(st *StateStore, ts time.Time, keep int) {
 					_, _ = st.CompactExpiredData(ts, keep)
 				}(stateSt, now, ConvKeepDays)
+			}
+			prevCkpt := gs.lastWalCheckpointUnix.Load()
+			if prevCkpt == 0 {
+				gs.lastWalCheckpointUnix.CompareAndSwap(0, now.Unix())
+			} else if now.Unix()-prevCkpt >= 900 && gs.lastWalCheckpointUnix.CompareAndSwap(prevCkpt, now.Unix()) {
+				go func(st *StateStore) {
+					st.mu.Lock()
+					defer st.mu.Unlock()
+					if st.db != nil {
+						_, _ = st.db.Exec(`PRAGMA wal_checkpoint(PASSIVE);`)
+					}
+				}(stateSt)
 			}
 		}
 	}
@@ -2296,11 +2297,14 @@ func (gs *GatewayServer) findSessionWithParkedToolResult(baseKey string, message
 				}
 			}
 		}
+		if matched {
+			closingCand.claimTurnLocked()
+		}
 		closingCand.mu.Unlock()
 		if !matched {
 			return nil
 		}
-		return markSessionClaimedIfRequested(closingCand, true)
+		return closingCand
 	}
 
 	gs.mu.Lock()

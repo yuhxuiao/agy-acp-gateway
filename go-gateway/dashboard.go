@@ -2320,7 +2320,9 @@ func (gs *GatewayServer) HandleInternalV2326Routes(w http.ResponseWriter, r *htt
 		if admitErr != nil {
 			statusCode := 529
 			var se *SoftError
-			if errors.As(admitErr, &se) && se.StatusCode > 0 {
+			if errors.Is(admitErr, context.Canceled) {
+				statusCode = 499
+			} else if errors.As(admitErr, &se) && se.StatusCode > 0 {
 				statusCode = se.StatusCode
 			}
 			w.WriteHeader(statusCode)

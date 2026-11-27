@@ -8,13 +8,14 @@ import (
 	"time"
 )
 
-// configureQuotaSubprocess isolates quota/credits CLI probes into their own process group
-// so context cancellation kills orphaned grandchildren holding stdout/stderr pipes open.
+// configureQuotaSubprocess isolates quota/credits/models CLI probes into their own session and
+// process group (Setsid: true detaches any controlling /dev/tty per agy#1954 while making the
+// child its own process-group leader so context cancellation kills orphaned grandchildren via -pid).
 func configureQuotaSubprocess(cmd *exec.Cmd) {
 	if cmd == nil {
 		return
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
